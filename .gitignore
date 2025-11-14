@@ -1,0 +1,6 @@
+# Output directories
+bin/
+build/
+
+# vcpkg dependencies
+vcpkg_installed/

@@ -1,0 +1,12 @@
+{
+  "name": "acg-project",
+  "version-string": "0.1.0",
+  "dependencies": [
+    "sdl2",
+    "glm",
+    "imgui",
+    "stb",
+    "assimp",
+    "nlohmann-json"
+  ]
+}
