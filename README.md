@@ -70,6 +70,11 @@ acg_project/
 │   ├── Texture.cpp
 │   └── main.cpp         # Main program entry point
 │
+├── shaders/             # Shader files directory
+│   ├── PathTracing.hlsl # HLSL shader for path tracing
+│   ├── Random.hlsli     # HLSL shader for random number generation
+│   └── Structures.hlsli # HLSL shader structures
+│
 ├── docs/                # Documentation directory
 ├── tests/               # Test code directory
 ├── CMakeLists.txt       # CMake build configuration
@@ -104,3 +109,13 @@ To build the project, follow these steps:
     cmake -B build -S . -DCMAKE_TOOLCHAIN_FILE=$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake
     cmake --build build --config Release
     ```
+
+### Running tests
+
+The test scenes are downloaded from https://casual-effects.com/data/ by the script.
+```bash
+python -m venv .venv
+.venv\Scripts\activate # On Windows
+pip install -r requirements.txt
+python tests/download.py
+```

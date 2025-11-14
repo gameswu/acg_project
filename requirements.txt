@@ -1,0 +1,2 @@
+# Optional dependencies for auxiliary scripts
+requests>=2.31.0

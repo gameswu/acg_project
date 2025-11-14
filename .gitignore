@@ -4,3 +4,13 @@ build/
 
 # vcpkg dependencies
 vcpkg_installed/
+
+# Python
+__pycache__/
+.venv/
+
+# Test scenes
+tests/scenes/
+
+# Output files
+*.ppm

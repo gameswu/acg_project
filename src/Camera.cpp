@@ -49,13 +49,69 @@ void Camera::SetFocusDistance(float distance) {
 }
 
 void Camera::GenerateRay(float u, float v, glm::vec3& origin, glm::vec3& direction) const {
-    // TODO: Generate ray with depth of field
-    origin = m_position;
-    direction = m_direction;  // Simplified
+    // Calculate viewport dimensions at focus distance
+    float theta = glm::radians(m_fov);
+    float h = std::tan(theta / 2.0f);
+    float viewportHeight = 2.0f * h * m_focusDistance;
+    float viewportWidth = viewportHeight * m_aspectRatio;
+    
+    // Calculate basis vectors
+    glm::vec3 w = -m_direction;  // Camera looks in -z
+    glm::vec3 u_vec = m_right;
+    glm::vec3 v_vec = m_up;
+    
+    // Calculate viewport corner
+    glm::vec3 horizontal = viewportWidth * u_vec;
+    glm::vec3 vertical = viewportHeight * v_vec;
+    glm::vec3 lowerLeftCorner = m_position - horizontal/2.0f - vertical/2.0f + m_focusDistance * m_direction;
+    
+    // Calculate ray direction
+    glm::vec3 target = lowerLeftCorner + u * horizontal + v * vertical;
+    
+    // Apply depth of field if aperture > 0
+    if (m_aperture > 0.0f) {
+        // Random point on lens (would need random numbers in practice)
+        // For now, use center of lens (no DOF effect in placeholder)
+        origin = m_position;
+        direction = glm::normalize(target - origin);
+    } else {
+        origin = m_position;
+        direction = glm::normalize(target - origin);
+    }
 }
 
 void Camera::Rotate(float yaw, float pitch) {
-    // TODO: Implement camera rotation
+    // Yaw rotation (around world up)
+    glm::vec3 worldUp(0.0f, 1.0f, 0.0f);
+    glm::mat3 yawRotation = glm::mat3(
+        std::cos(yaw), 0.0f, std::sin(yaw),
+        0.0f, 1.0f, 0.0f,
+        -std::sin(yaw), 0.0f, std::cos(yaw)
+    );
+    m_direction = glm::normalize(yawRotation * m_direction);
+    
+    // Pitch rotation (around right vector)
+    // Clamp pitch to avoid gimbal lock
+    float currentPitch = std::asin(-m_direction.y);
+    float newPitch = glm::clamp(currentPitch + pitch, -glm::pi<float>() * 0.49f, glm::pi<float>() * 0.49f);
+    pitch = newPitch - currentPitch;
+    
+    glm::mat3 pitchRotation = glm::mat3(
+        std::cos(pitch) + m_right.x * m_right.x * (1 - std::cos(pitch)),
+        m_right.x * m_right.y * (1 - std::cos(pitch)) - m_right.z * std::sin(pitch),
+        m_right.x * m_right.z * (1 - std::cos(pitch)) + m_right.y * std::sin(pitch),
+        
+        m_right.y * m_right.x * (1 - std::cos(pitch)) + m_right.z * std::sin(pitch),
+        std::cos(pitch) + m_right.y * m_right.y * (1 - std::cos(pitch)),
+        m_right.y * m_right.z * (1 - std::cos(pitch)) - m_right.x * std::sin(pitch),
+        
+        m_right.z * m_right.x * (1 - std::cos(pitch)) - m_right.y * std::sin(pitch),
+        m_right.z * m_right.y * (1 - std::cos(pitch)) + m_right.x * std::sin(pitch),
+        std::cos(pitch) + m_right.z * m_right.z * (1 - std::cos(pitch))
+    );
+    m_direction = glm::normalize(pitchRotation * m_direction);
+    
+    UpdateVectors();
 }
 
 void Camera::Move(const glm::vec3& offset) {

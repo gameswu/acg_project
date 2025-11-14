@@ -37,12 +37,18 @@ public:
     // Color properties
     void SetAlbedo(const glm::vec3& albedo) { m_albedo = albedo; }
     void SetEmission(const glm::vec3& emission) { m_emission = emission; }
+    glm::vec3 GetAlbedo() const { return m_albedo; }
+    glm::vec3 GetEmission() const { return m_emission; }
     
     // Physical properties
     void SetMetallic(float metallic) { m_metallic = metallic; }
     void SetRoughness(float roughness) { m_roughness = roughness; }
     void SetIOR(float ior) { m_ior = ior; }  // Index of refraction
     void SetTransmission(float transmission) { m_transmission = transmission; }
+    float GetMetallic() const { return m_metallic; }
+    float GetRoughness() const { return m_roughness; }
+    float GetIOR() const { return m_ior; }
+    float GetTransmission() const { return m_transmission; }
     
     // Subsurface scattering
     void SetSubsurfaceRadius(const glm::vec3& radius) { m_subsurfaceRadius = radius; }

@@ -50,6 +50,19 @@ private:
     ID3D11Texture2D* m_renderTarget;
     ID3D11UnorderedAccessView* m_renderTargetUAV;
     
+    // Scene data buffers
+    ID3D11Buffer* m_triangleBuffer;
+    ID3D11ShaderResourceView* m_triangleSRV;
+    ID3D11Buffer* m_materialBuffer;
+    ID3D11ShaderResourceView* m_materialSRV;
+    ID3D11Buffer* m_lightBuffer;
+    ID3D11ShaderResourceView* m_lightSRV;
+    ID3D11Buffer* m_constantBuffer;
+    
+    uint32_t m_numTriangles;
+    uint32_t m_numMaterials;
+    uint32_t m_numLights;
+    
     // 渲染参数
     int m_width;
     int m_height;
@@ -61,7 +74,9 @@ private:
     bool InitializeD3D();
     bool CreateShaders();
     bool CreateBuffers();
+    bool UploadSceneData(const Scene& scene);
     void Cleanup();
+    void CleanupSceneBuffers();
 };
 
 } // namespace ACG
