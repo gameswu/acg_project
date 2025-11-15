@@ -76,25 +76,31 @@ void Renderer::Render(const Scene& scene, const Camera& camera) {
         }
     }
     
-    // Update constant buffer
+    // Update constant buffer - Must match HLSL structure exactly
     D3D11_MAPPED_SUBRESOURCE mappedResource;
     HRESULT hr = m_context->Map(m_constantBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mappedResource);
     if (SUCCEEDED(hr)) {
-        struct RenderParams {
-            float camPos[3]; float pad0;
-            float camDir[3]; float pad1;
-            float camRight[3]; float pad2;
-            float camUp[3]; float pad3;
-            float camFov; float camAspect; float camAperture; float camFocus;
-            uint32_t frameIndex;
-            uint32_t samplesPerPixel;
-            uint32_t maxBounces;
-            uint32_t numTriangles;
-            uint32_t numLights;
-            uint32_t numMaterials;
-            uint32_t resX;
-            uint32_t resY;
+        struct GPUCamera {
+            float position[3]; float _pad0;
+            float direction[3]; float _pad1;
+            float right[3]; float _pad2;
+            float up[3]; float _pad3;
+            float fov; float aspectRatio; float aperture; float focusDistance;
         };
+        struct RenderParams {
+            GPUCamera camera;           // 80 bytes
+            uint32_t frameIndex;        // 4
+            uint32_t samplesPerPixel;   // 4
+            uint32_t maxBounces;        // 4
+            uint32_t numTriangles;      // 4
+            uint32_t numMaterials;      // 4
+            uint32_t _pad0;             // 4
+            uint32_t _pad1;             // 4
+            uint32_t _pad2;             // 4
+            uint32_t resX;              // 4
+            uint32_t resY;              // 4
+            uint32_t _pad3[2];          // 8
+        };  // Total: 128 bytes
         
         RenderParams* params = static_cast<RenderParams*>(mappedResource.pData);
         glm::vec3 pos = camera.GetPosition();
@@ -102,22 +108,43 @@ void Renderer::Render(const Scene& scene, const Camera& camera) {
         glm::vec3 right = camera.GetRight();
         glm::vec3 up = camera.GetUp();
         
-        params->camPos[0] = pos.x; params->camPos[1] = pos.y; params->camPos[2] = pos.z;
-        params->camDir[0] = dir.x; params->camDir[1] = dir.y; params->camDir[2] = dir.z;
-        params->camRight[0] = right.x; params->camRight[1] = right.y; params->camRight[2] = right.z;
-        params->camUp[0] = up.x; params->camUp[1] = up.y; params->camUp[2] = up.z;
-        params->camFov = camera.GetFOV();
-        params->camAspect = static_cast<float>(m_width) / m_height;
-        params->camAperture = camera.GetAperture();
-        params->camFocus = camera.GetFocusDistance();
+        params->camera.position[0] = pos.x;
+        params->camera.position[1] = pos.y;
+        params->camera.position[2] = pos.z;
+        params->camera._pad0 = 0.0f;
+        
+        params->camera.direction[0] = dir.x;
+        params->camera.direction[1] = dir.y;
+        params->camera.direction[2] = dir.z;
+        params->camera._pad1 = 0.0f;
+        
+        params->camera.right[0] = right.x;
+        params->camera.right[1] = right.y;
+        params->camera.right[2] = right.z;
+        params->camera._pad2 = 0.0f;
+        
+        params->camera.up[0] = up.x;
+        params->camera.up[1] = up.y;
+        params->camera.up[2] = up.z;
+        params->camera._pad3 = 0.0f;
+        
+        params->camera.fov = camera.GetFOV();
+        params->camera.aspectRatio = static_cast<float>(m_width) / m_height;
+        params->camera.aperture = camera.GetAperture();
+        params->camera.focusDistance = camera.GetFocusDistance();
+        
         params->frameIndex = m_frameCount;
         params->samplesPerPixel = m_samplesPerPixel;
         params->maxBounces = m_maxBounces;
         params->numTriangles = m_numTriangles;
-        params->numLights = m_numLights;
         params->numMaterials = m_numMaterials;
+        params->_pad0 = 0;
+        params->_pad1 = 0;
+        params->_pad2 = 0;
         params->resX = m_width;
         params->resY = m_height;
+        params->_pad3[0] = 0;
+        params->_pad3[1] = 0;
         
         m_context->Unmap(m_constantBuffer, 0);
     }
@@ -126,8 +153,9 @@ void Renderer::Render(const Scene& scene, const Camera& camera) {
     m_context->CSSetShader(m_pathTracingShader, nullptr, 0);
     m_context->CSSetConstantBuffers(0, 1, &m_constantBuffer);
     
-    ID3D11ShaderResourceView* srvs[] = { m_triangleSRV, m_materialSRV, m_lightSRV };
-    m_context->CSSetShaderResources(0, 3, srvs);
+    // Bind shader resources (only bind valid ones)
+    ID3D11ShaderResourceView* srvs[3] = { m_triangleSRV, m_materialSRV, nullptr };
+    m_context->CSSetShaderResources(0, 2, srvs);  // Only bind 2 resources
     
     m_context->CSSetUnorderedAccessViews(0, 1, &m_renderTargetUAV, nullptr);
     
@@ -137,10 +165,13 @@ void Renderer::Render(const Scene& scene, const Camera& camera) {
     
     glm::vec3 pos = camera.GetPosition();
     glm::vec3 dir = camera.GetDirection();
-    std::cout << "Dispatching compute shader: " << groupsX << "x" << groupsY << " groups" << std::endl;
-    std::cout << "  Camera: pos=[" << pos.x << "," << pos.y << "," << pos.z 
-              << "] dir=[" << dir.x << "," << dir.y << "," << dir.z << "]" << std::endl;
-    std::cout << "  Triangles: " << m_numTriangles << ", Materials: " << m_numMaterials << std::endl;
+    glm::vec3 right = camera.GetRight();
+    glm::vec3 up = camera.GetUp();
+    
+    std::cout << "Camera vectors - Pos:[" << pos.x << "," << pos.y << "," << pos.z << "]" << std::endl;
+    std::cout << "                Dir:[" << dir.x << "," << dir.y << "," << dir.z << "]" << std::endl;
+    std::cout << "                Right:[" << right.x << "," << right.y << "," << right.z << "]" << std::endl;
+    std::cout << "                Up:[" << up.x << "," << up.y << "," << up.z << "]" << std::endl;
     
     m_context->Dispatch(groupsX, groupsY, 1);
     
@@ -316,7 +347,7 @@ bool Renderer::CreateShaders() {
 #endif
     
     hr = D3DCompileFromFile(
-        L"shaders/PathTracing.hlsl",
+        L"..\\shaders\\PathTracing.hlsl",
         nullptr,
         D3D_COMPILE_STANDARD_FILE_INCLUDE,
         "main",
@@ -329,11 +360,16 @@ bool Renderer::CreateShaders() {
     
     if (FAILED(hr)) {
         if (errorBlob) {
-            std::cerr << "Shader compilation error: " 
-                     << static_cast<char*>(errorBlob->GetBufferPointer()) << std::endl;
+            std::string error(static_cast<char*>(errorBlob->GetBufferPointer()), errorBlob->GetBufferSize());
+            std::ofstream errorFile("shader_error.txt");
+            errorFile << error;
+            errorFile.close();
+            std::cerr << "Shader compilation error (see shader_error.txt): " << std::endl;
+            std::cerr << error << std::endl;
             errorBlob->Release();
+        } else {
+            std::cerr << "Shader compilation failed with HRESULT: 0x" << std::hex << hr << std::dec << std::endl;
         }
-        std::cerr << "Failed to compile shader" << std::endl;
         return false;
     }
     
@@ -395,8 +431,10 @@ bool Renderer::CreateBuffers() {
     }
     
     // Create constant buffer
+    // RenderParams structure: Camera (80) + 6 uints (24) + padding (8) + 2 uints (8) = 120 bytes
+    // Must be aligned to 16 bytes for D3D11
     D3D11_BUFFER_DESC cbDesc = {};
-    cbDesc.ByteWidth = ((sizeof(float) * 32 + sizeof(uint32_t) * 8 + 255) / 256) * 256; // Align to 256 bytes
+    cbDesc.ByteWidth = 128;  // Next multiple of 16 after 120
     cbDesc.Usage = D3D11_USAGE_DYNAMIC;
     cbDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     cbDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
@@ -425,13 +463,17 @@ bool Renderer::UploadSceneData(const Scene& scene) {
     
     HRESULT hr;
     
-    // Prepare triangle data
+    // Prepare triangle data (must match HLSL struct Triangle layout exactly)
     struct GPUTriangle {
-        float v0[3], v1[3], v2[3];
-        float n0[3], n1[3], n2[3];
+        float v0[3]; float _pad_v0;
+        float v1[3]; float _pad_v1;
+        float v2[3]; float _pad_v2;
+        float n0[3]; float _pad_n0;
+        float n1[3]; float _pad_n1;
+        float n2[3]; float _pad_n2;
         uint32_t materialIndex;
-        uint32_t padding[3];
-    };
+        uint32_t _pad_mat[3];
+    }; // Total size: 112 bytes
     
     std::vector<GPUTriangle> triangles;
     for (const auto& mesh : scene.GetMeshes()) {
@@ -445,13 +487,14 @@ bool Renderer::UploadSceneData(const Scene& scene) {
             const auto& v1 = vertices[indices[i + 1]];
             const auto& v2 = vertices[indices[i + 2]];
             
-            tri.v0[0] = v0.position.x; tri.v0[1] = v0.position.y; tri.v0[2] = v0.position.z;
-            tri.v1[0] = v1.position.x; tri.v1[1] = v1.position.y; tri.v1[2] = v1.position.z;
-            tri.v2[0] = v2.position.x; tri.v2[1] = v2.position.y; tri.v2[2] = v2.position.z;
-            tri.n0[0] = v0.normal.x; tri.n0[1] = v0.normal.y; tri.n0[2] = v0.normal.z;
-            tri.n1[0] = v1.normal.x; tri.n1[1] = v1.normal.y; tri.n1[2] = v1.normal.z;
-            tri.n2[0] = v2.normal.x; tri.n2[1] = v2.normal.y; tri.n2[2] = v2.normal.z;
+            tri.v0[0] = v0.position.x; tri.v0[1] = v0.position.y; tri.v0[2] = v0.position.z; tri._pad_v0 = 0.0f;
+            tri.v1[0] = v1.position.x; tri.v1[1] = v1.position.y; tri.v1[2] = v1.position.z; tri._pad_v1 = 0.0f;
+            tri.v2[0] = v2.position.x; tri.v2[1] = v2.position.y; tri.v2[2] = v2.position.z; tri._pad_v2 = 0.0f;
+            tri.n0[0] = v0.normal.x; tri.n0[1] = v0.normal.y; tri.n0[2] = v0.normal.z; tri._pad_n0 = 0.0f;
+            tri.n1[0] = v1.normal.x; tri.n1[1] = v1.normal.y; tri.n1[2] = v1.normal.z; tri._pad_n1 = 0.0f;
+            tri.n2[0] = v2.normal.x; tri.n2[1] = v2.normal.y; tri.n2[2] = v2.normal.z; tri._pad_n2 = 0.0f;
             tri.materialIndex = matIdx;
+            tri._pad_mat[0] = tri._pad_mat[1] = tri._pad_mat[2] = 0;
             
             triangles.push_back(tri);
         }

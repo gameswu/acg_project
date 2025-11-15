@@ -106,7 +106,7 @@ To build the project, follow these steps:
     ```
 3. Configure and build the project using CMake:
     ```bash
-    cmake -B build -S . -DCMAKE_TOOLCHAIN_FILE=$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake
+    cmake -B build -S . -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
     cmake --build build --config Release
     ```
 

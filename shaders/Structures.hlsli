@@ -11,8 +11,8 @@ struct Vertex {
 
 struct Material {
     uint type;          // 0=Diffuse, 1=Specular, 2=Transmissive, 3=PrincipledBSDF, 4=Emissive
-    float3 albedo;
-    float3 emission;
+    float albedo[3];
+    float emission[3];
     float metallic;
     float roughness;
     float ior;
@@ -40,13 +40,14 @@ struct BVHNode {
 };
 
 struct Triangle {
-    float3 v0;
-    float3 v1;
-    float3 v2;
-    float3 n0;
-    float3 n1;
-    float3 n2;
+    float3 v0; float _pad_v0;
+    float3 v1; float _pad_v1;
+    float3 v2; float _pad_v2;
+    float3 n0; float _pad_n0;
+    float3 n1; float _pad_n1;
+    float3 n2; float _pad_n2;
     uint materialIndex;
+    uint _pad_mat[3];
 };
 
 struct Ray {
@@ -67,9 +68,13 @@ struct HitInfo {
 
 struct Camera {
     float3 position;
+    float _pad0;
     float3 direction;
+    float _pad1;
     float3 right;
+    float _pad2;
     float3 up;
+    float _pad3;
     float fov;
     float aspectRatio;
     float aperture;

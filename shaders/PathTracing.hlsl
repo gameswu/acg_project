@@ -1,42 +1,43 @@
 #include "Structures.hlsli"
 #include "Random.hlsli"
 
-// Constant buffer
 cbuffer RenderParams : register(b0) {
-    Camera camera;
-    uint frameIndex;
-    uint samplesPerPixel;
-    uint maxBounces;
-    uint numTriangles;
-    uint numLights;
-    uint numMaterials;
-    uint2 resolution;
+    Camera camera;              // 80 bytes (5 float4)
+    uint frameIndex;            // 4
+    uint samplesPerPixel;       // 4
+    uint maxBounces;            // 4
+    uint numTriangles;          // 4
+    uint numMaterials;          // 4
+    uint _pad0;                 // 4
+    uint _pad1;                 // 4
+    uint _pad2;                 // 4
+    uint resolutionX;           // 4
+    uint resolutionY;           // 4
+    uint2 _pad3;                // 8 (for 16-byte alignment)
 };
 
-// Structured buffers
 StructuredBuffer<Triangle> g_triangles : register(t0);
 StructuredBuffer<Material> g_materials : register(t1);
-StructuredBuffer<Light> g_lights : register(t2);
-
-// Output texture
 RWTexture2D<float4> g_output : register(u0);
 
-// Ray-triangle intersection (Möller-Trumbore)
 bool RayTriangleIntersect(Ray ray, Triangle tri, out float t, out float u, out float v) {
-    // Initialize out parameters
     t = 1e30;
     u = 0;
     v = 0;
     
-    float3 edge1 = tri.v1 - tri.v0;
-    float3 edge2 = tri.v2 - tri.v0;
+    float3 v0 = tri.v0;
+    float3 v1 = tri.v1;
+    float3 v2 = tri.v2;
+    
+    float3 edge1 = v1 - v0;
+    float3 edge2 = v2 - v0;
     float3 h = cross(ray.direction, edge2);
     float a = dot(edge1, h);
     
     if (abs(a) < 0.0001) return false;
     
     float f = 1.0 / a;
-    float3 s = ray.origin - tri.v0;
+    float3 s = ray.origin - v0;
     u = f * dot(s, h);
     
     if (u < 0.0 || u > 1.0) return false;
@@ -51,7 +52,6 @@ bool RayTriangleIntersect(Ray ray, Triangle tri, out float t, out float u, out f
     return t > ray.tMin && t < ray.tMax;
 }
 
-// Scene intersection (brute force for now)
 HitInfo Intersect(Ray ray) {
     HitInfo hit;
     hit.hit = false;
@@ -67,9 +67,11 @@ HitInfo Intersect(Ray ray) {
                 hit.t = t;
                 hit.position = ray.origin + ray.direction * t;
                 
-                // Interpolate normal
                 float w = 1.0 - u - v;
-                hit.normal = normalize(w * tri.n0 + u * tri.n1 + v * tri.n2);
+                float3 n0 = tri.n0;
+                float3 n1 = tri.n1;
+                float3 n2 = tri.n2;
+                hit.normal = normalize(w * n0 + u * n1 + v * n2);
                 hit.texCoord = float2(u, v);
                 hit.materialIndex = tri.materialIndex;
             }
@@ -79,92 +81,41 @@ HitInfo Intersect(Ray ray) {
     return hit;
 }
 
-// Evaluate BRDF
 float3 EvaluateBRDF(Material mat, float3 wo, float3 wi, float3 normal) {
     float NdotL = max(0.0, dot(normal, wi));
-    float NdotV = max(0.0, dot(normal, wo));
+    float3 albedo = float3(mat.albedo[0], mat.albedo[1], mat.albedo[2]);
     
-    if (mat.type == 0) { // Diffuse
-        return mat.albedo / 3.14159265359;
-    }
-    else if (mat.type == 1) { // Specular (Cook-Torrance)
-        float3 h = normalize(wo + wi);
-        float NdotH = max(0.0, dot(normal, h));
-        float VdotH = max(0.0, dot(wo, h));
-        
-        // GGX NDF
-        float alpha = mat.roughness * mat.roughness;
-        float alpha2 = alpha * alpha;
-        float denom = NdotH * NdotH * (alpha2 - 1.0) + 1.0;
-        float D = alpha2 / (3.14159265359 * denom * denom);
-        
-        // Schlick-GGX G
-        float k = (mat.roughness + 1.0) * (mat.roughness + 1.0) / 8.0;
-        float G1_V = NdotV / (NdotV * (1.0 - k) + k);
-        float G1_L = NdotL / (NdotL * (1.0 - k) + k);
-        float G = G1_V * G1_L;
-        
-        // Fresnel
-        float3 F0 = lerp(float3(0.04, 0.04, 0.04), mat.albedo, mat.metallic);
-        float3 F = F0 + (1.0 - F0) * pow(1.0 - VdotH, 5.0);
-        
-        float3 specular = (D * G * F) / max(4.0 * NdotV * NdotL, 0.001);
-        float3 kD = (1.0 - F) * (1.0 - mat.metallic);
-        float3 diffuse = kD * mat.albedo / 3.14159265359;
-        
-        return diffuse + specular;
-    }
-    else if (mat.type == 4) { // Emissive
-        return mat.emission;
+    if (mat.type == 0) {
+        // Diffuse BRDF
+        return albedo / 3.14159265359;
+    } else if (mat.type == 1) {
+        // Specular (Mirror) - delta function, only used for direct hits
+        return float3(0, 0, 0);
     }
     
-    return mat.albedo / 3.14159265359;
+    // Default diffuse
+    return albedo / 3.14159265359;
 }
 
-// Sample BRDF direction
 float3 SampleBRDF(Material mat, float3 wo, float3 normal, inout uint rngState, out float pdf) {
+    if (mat.type == 1) {
+        // Specular (Perfect mirror reflection)
+        pdf = 1.0;
+        return reflect(-wo, normal);
+    }
+    
+    // Diffuse sampling
     float3 tangent, bitangent;
     CreateCoordinateSystem(normal, tangent, bitangent);
     
-    if (mat.type == 0) { // Diffuse
-        float2 u = Random2D(rngState);
-        float3 localDir = CosineSampleHemisphere(u);
-        float3 wi = LocalToWorld(localDir, tangent, bitangent, normal);
-        pdf = max(0.0, dot(normal, wi)) / 3.14159265359;
-        return wi;
-    }
-    else if (mat.type == 1) { // Specular (GGX sampling)
-        float2 u = Random2D(rngState);
-        float alpha = mat.roughness * mat.roughness;
-        float alpha2 = alpha * alpha;
-        
-        float phi = 2.0 * 3.14159265359 * u.x;
-        float cosTheta = sqrt((1.0 - u.y) / (1.0 + (alpha2 - 1.0) * u.y));
-        float sinTheta = sqrt(1.0 - cosTheta * cosTheta);
-        
-        float3 h = float3(cos(phi) * sinTheta, sin(phi) * sinTheta, cosTheta);
-        h = LocalToWorld(h, tangent, bitangent, normal);
-        
-        float3 wi = reflect(-wo, h);
-        
-        float NdotH = max(0.0, dot(normal, h));
-        float VdotH = max(0.0, dot(wo, h));
-        float denom = NdotH * NdotH * (alpha2 - 1.0) + 1.0;
-        float D = alpha2 / (3.14159265359 * denom * denom);
-        pdf = D * NdotH / (4.0 * VdotH);
-        
-        return wi;
-    }
-    
-    // Default: cosine sampling
     float2 u = Random2D(rngState);
     float3 localDir = CosineSampleHemisphere(u);
     float3 wi = LocalToWorld(localDir, tangent, bitangent, normal);
-    pdf = max(0.0, dot(normal, wi)) / 3.14159265359;
+    pdf = max(0.0001, dot(normal, wi) / 3.14159265359);
+    
     return wi;
 }
 
-// Path tracing
 float3 TracePath(Ray ray, inout uint rngState) {
     float3 radiance = float3(0, 0, 0);
     float3 throughput = float3(1, 1, 1);
@@ -173,18 +124,86 @@ float3 TracePath(Ray ray, inout uint rngState) {
         HitInfo hit = Intersect(ray);
         
         if (!hit.hit) {
-            // Sky color (bright gradient for debugging)
-            float t = 0.5 * (ray.direction.y + 1.0);
-            radiance += throughput * lerp(float3(1, 1, 1), float3(0.5, 0.7, 1.0), t) * 1.0;
+            // Cornell Box is closed - no environment light
             break;
         }
         
         Material mat = g_materials[hit.materialIndex];
         
-        // Add emission (important for area lights!)
-        if (mat.type == 4) { // Emissive
-            radiance += throughput * mat.emission;
-            break; // Stop at light source
+        // Direct light contribution from hit emissive surface
+        if (mat.type == 4) {
+            float3 emission = float3(mat.emission[0], mat.emission[1], mat.emission[2]);
+            radiance += throughput * emission;
+            break;
+        }
+        
+        // Next Event Estimation: sample light source directly
+        if (bounce == 0 || bounce == 1) {
+            // Find emissive material and sample it
+            for (uint i = 0; i < numTriangles; i++) {
+                Triangle lightTri = g_triangles[i];
+                if (lightTri.materialIndex == 8) { // Light material index
+                    // Sample random point on light triangle
+                    float r1 = Random(rngState);
+                    float r2 = Random(rngState);
+                    float sqrtR1 = sqrt(r1);
+                    float u = 1.0 - sqrtR1;
+                    float v = r2 * sqrtR1;
+                    float w = 1.0 - u - v;
+                    
+                    float3 lv0 = lightTri.v0;
+                    float3 lv1 = lightTri.v1;
+                    float3 lv2 = lightTri.v2;
+                    float3 lightPos = w * lv0 + u * lv1 + v * lv2;
+                    
+                    // Compute light normal
+                    float3 ln0 = lightTri.n0;
+                    float3 ln1 = lightTri.n1;
+                    float3 ln2 = lightTri.n2;
+                    float3 lightNormal = normalize(w * ln0 + u * ln1 + v * ln2);
+                    
+                    // Direction to light
+                    float3 toLight = lightPos - hit.position;
+                    float distToLight = length(toLight);
+                    float3 lightDir = toLight / distToLight;
+                    
+                    // Check if light is above surface
+                    float NdotL = dot(hit.normal, lightDir);
+                    float LdotN = dot(lightNormal, -lightDir);
+                    
+                    if (NdotL > 0.0 && LdotN > 0.0) {
+                        // Shadow ray
+                        Ray shadowRay;
+                        shadowRay.origin = hit.position + hit.normal * 0.001;
+                        shadowRay.direction = lightDir;
+                        shadowRay.tMin = 0.001;
+                        shadowRay.tMax = distToLight - 0.001;
+                        
+                        HitInfo shadowHit = Intersect(shadowRay);
+                        
+                        if (!shadowHit.hit) {
+                            // Light visible
+                            Material lightMat = g_materials[8];
+                            float3 lightEmission = float3(lightMat.emission[0], lightMat.emission[1], lightMat.emission[2]);
+                            
+                            // Compute light area (approximate)
+                            float3 edge1 = lv1 - lv0;
+                            float3 edge2 = lv2 - lv0;
+                            float lightArea = length(cross(edge1, edge2)) * 0.5;
+                            
+                            // BRDF
+                            float3 f = EvaluateBRDF(mat, -ray.direction, lightDir, hit.normal);
+                            
+                            // Geometry term
+                            float G = (NdotL * LdotN) / (distToLight * distToLight);
+                            
+                            // Direct lighting contribution (scaled by triangle count as we only sample one)
+                            radiance += throughput * f * lightEmission * G * lightArea * 2.0;
+                        }
+                    }
+                    break; // Only sample first light triangle
+                }
+            }
         }
         
         // Russian Roulette
@@ -194,21 +213,33 @@ float3 TracePath(Ray ray, inout uint rngState) {
             throughput /= p;
         }
         
-        // Sample BRDF
         float pdf;
         float3 wo = -ray.direction;
         float3 wi = SampleBRDF(mat, wo, hit.normal, rngState, pdf);
         
         if (pdf < 0.0001) break;
         
-        // Evaluate BRDF
-        float3 f = EvaluateBRDF(mat, wo, wi, hit.normal);
-        float cosTheta = max(0.0, dot(hit.normal, wi));
+        // For specular materials, use direct throughput multiplication
+        if (mat.type == 1) {
+            // Perfect specular reflection
+            float3 albedo = float3(mat.albedo[0], mat.albedo[1], mat.albedo[2]);
+            throughput *= albedo;
+        } else {
+            // Diffuse and other materials
+            float3 f = EvaluateBRDF(mat, wo, wi, hit.normal);
+            float cosTheta = max(0.0, dot(hit.normal, wi));
+            throughput *= f * cosTheta / pdf;
+        }
         
-        throughput *= f * cosTheta / pdf;
+        // Clamp throughput to avoid fireflies
+        throughput = min(throughput, float3(10.0, 10.0, 10.0));
         
-        // Next ray
-        ray.origin = hit.position + hit.normal * 0.001; // Offset to avoid self-intersection
+        // Check for invalid values (NaN/Inf)
+        if (any(throughput != throughput) || any(throughput > 1e10)) {
+            break;
+        }
+        
+        ray.origin = hit.position + hit.normal * 0.001;
         ray.direction = wi;
         ray.tMin = 0.001;
         ray.tMax = 1e30;
@@ -217,18 +248,20 @@ float3 TracePath(Ray ray, inout uint rngState) {
     return radiance;
 }
 
-// Generate camera ray
 Ray GenerateCameraRay(uint2 pixelCoord, inout uint rngState) {
-    float2 uv = (float2(pixelCoord) + Random2D(rngState)) / float2(resolution);
+    float2 resolution = float2(float(resolutionX), float(resolutionY));
+    float2 uv = (float2(pixelCoord) + float2(0.5, 0.5)) / resolution;
     uv = uv * 2.0 - 1.0;
-    uv.y = -uv.y;
     
-    float aspectRatio = float(resolution.x) / float(resolution.y);
+    float aspectRatio = resolution.x / resolution.y;
     float halfHeight = tan(camera.fov * 0.5 * 3.14159265359 / 180.0);
     float halfWidth = aspectRatio * halfHeight;
     
-    // Construct ray direction in camera space
-    float3 rayDir = normalize(camera.direction + uv.x * halfWidth * camera.right + uv.y * halfHeight * camera.up);
+    float3 rayDir = normalize(
+        camera.direction + 
+        uv.x * halfWidth * camera.right + 
+        uv.y * halfHeight * camera.up
+    );
     
     Ray ray;
     ray.origin = camera.position;
@@ -243,98 +276,23 @@ Ray GenerateCameraRay(uint2 pixelCoord, inout uint rngState) {
 void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
     uint2 pixelCoord = dispatchThreadID.xy;
     
-    if (pixelCoord.x >= resolution.x || pixelCoord.y >= resolution.y) {
+    if (pixelCoord.x >= resolutionX || pixelCoord.y >= resolutionY) {
         return;
     }
     
-    // TEST: Debug intersection with center pixel
-    if (pixelCoord.x == resolution.x / 2 && pixelCoord.y == resolution.y / 2) {
-        uint rngState = InitRNG(pixelCoord, frameIndex);
-        Ray ray = GenerateCameraRay(pixelCoord, rngState);
-        
-        // Test against first triangle manually
-        Triangle tri = g_triangles[0];
-        float t, u, v;
-        bool hit = RayTriangleIntersect(ray, tri, t, u, v);
-        
-        // Output debug info to first pixel
-        if (hit) {
-            g_output[uint2(0, 0)] = float4(1, 0, 0, 1); // RED = HIT triangle 0
-        } else {
-            g_output[uint2(0, 0)] = float4(0, 1, 0, 1); // GREEN = MISS triangle 0
-        }
-        
-        // Try Intersect function
-        HitInfo hitInfo = Intersect(ray);
-        if (hitInfo.hit) {
-            g_output[uint2(1, 0)] = float4(0, 0, 1, 1); // BLUE = HIT any triangle
-        } else {
-            g_output[uint2(1, 0)] = float4(1, 1, 0, 1); // YELLOW = MISS all
-        }
-    }
-    
-    // Show scene intersection for all pixels
     uint rngState = InitRNG(pixelCoord, frameIndex);
-    Ray ray = GenerateCameraRay(pixelCoord, rngState);
-    HitInfo hit = Intersect(ray);
     
-    if (hit.hit) {
-        // Visualize hit distance or material
-        float3 color = float3(hit.t / 10.0, 0, 0); // Distance in red channel
-        g_output[pixelCoord] = float4(color, 1);
-    } else {
-        g_output[pixelCoord] = float4(0, 0, 0.1, 1); // Dark blue = miss
-    }
-    return;
-    
-    /*
-    // Original path tracing code (disabled for testing)
-    float3 color = float3(0, 0, 0);
+    float3 finalColor = float3(0, 0, 0);
     for (uint i = 0; i < samplesPerPixel; ++i) {
         Ray ray = GenerateCameraRay(pixelCoord, rngState);
-    
-    float3 color;
-    if (hit.hit) {
-        // Show hit as green, with brightness based on distance
-        float brightness = saturate(1.0 - hit.t / 10.0);
-        color = float3(0, brightness, 0);
-    } else {
-        // Show misses as red
-        color = float3(0.1, 0, 0);
+        finalColor += TracePath(ray, rngState);
     }
     
-    g_output[pixelCoord] = float4(color, 1.0);
-    return;
+    finalColor /= float(samplesPerPixel);
     
-    /*
-    uint rngState = InitRNG(pixelCoord, frameIndex);
+    // Tone mapping and gamma correction
+    finalColor = finalColor / (finalColor + 1.0);
+    finalColor = pow(abs(finalColor), 1.0 / 2.2);
     
-    // Path tracing
-    float3 color = float3(0, 0, 0);
-    
-    // DEBUG: Simple test - just show ray direction as color
-    Ray testRay = GenerateCameraRay(pixelCoord, rngState);
-    float3 debugColor = testRay.direction * 0.5 + 0.5; // Map [-1,1] to [0,1]
-    
-    for (uint s = 0; s < samplesPerPixel; s++) {
-        Ray ray = GenerateCameraRay(pixelCoord, rngState);
-        color += TracePath(ray, rngState);
-    }
-    
-    color /= float(samplesPerPixel);
-    
-    // If color is completely black, show debug visualization
-    if (length(color) < 0.001) {
-        color = debugColor * 0.3; // Dim debug color
-    }
-    
-    // Accumulate with previous frames
-    if (frameIndex > 0) {
-        float3 prevColor = g_output[pixelCoord].rgb;
-        float t = 1.0 / float(frameIndex + 1);
-        color = lerp(prevColor, color, t);
-    }
-    
-    g_output[pixelCoord] = float4(color, 1.0);
-    */
+    g_output[pixelCoord] = float4(finalColor, 1.0);
 }

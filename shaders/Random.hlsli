@@ -51,9 +51,11 @@ float3 UniformSampleHemisphere(float2 u) {
 // Build orthonormal basis from normal
 void CreateCoordinateSystem(float3 normal, out float3 tangent, out float3 bitangent) {
     if (abs(normal.x) > abs(normal.y)) {
-        tangent = normalize(float3(-normal.z, 0, normal.x));
+        float invLen = 1.0 / sqrt(normal.x * normal.x + normal.z * normal.z);
+        tangent = float3(-normal.z * invLen, 0, normal.x * invLen);
     } else {
-        tangent = normalize(float3(0, normal.z, -normal.y));
+        float invLen = 1.0 / sqrt(normal.y * normal.y + normal.z * normal.z);
+        tangent = float3(0, normal.z * invLen, -normal.y * invLen);
     }
     bitangent = cross(normal, tangent);
 }

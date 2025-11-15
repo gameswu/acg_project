@@ -86,7 +86,7 @@ int main(int argc, char** argv) {
     // Rendering parameters
     const int width = 1280;
     const int height = 720;
-    const int samplesPerPixel = 1;  // Use 1 sample for quick testing
+    const int samplesPerPixel = 10000;
     const int maxBounces = 5;
 
     // Determine scene path
@@ -139,13 +139,15 @@ int main(int argc, char** argv) {
     // Box bounds: [-1.02, 0, -1.04] to [1, 1.99, 0.99]
     glm::vec3 sceneCenter = (scene.GetBBoxMin() + scene.GetBBoxMax()) * 0.5f;
     
-    // Position camera inside the box, looking forward
-    glm::vec3 cameraPos = glm::vec3(0.0f, 1.0f, 2.5f);  // Inside box, mid-height, back
-    glm::vec3 cameraTarget = glm::vec3(0.0f, 1.0f, 0.0f);  // Look toward center
+    // Position camera for Cornell Box
+    // Standard Cornell Box: camera looks into the box from the front opening
+    // Scene bounds: [-1.02, 0, -1.04] to [1, 1.99, 0.99]
+    glm::vec3 cameraPos = glm::vec3(0.0f, 1.0f, 2.7f);  // Outside front, mid-height
+    glm::vec3 cameraTarget = glm::vec3(0.0f, 1.0f, 0.0f);  // Look at center of box
     
     camera.SetPosition(cameraPos);
     camera.SetTarget(cameraTarget);
-    camera.SetFOV(60.0f);  // Wider FOV to see more of the box
+    camera.SetFOV(60.0f);  // Standard Cornell Box FOV
     camera.SetAspectRatio(static_cast<float>(width) / height);
     camera.SetAperture(0.0f);  // 0 = no depth of field
     camera.SetFocusDistance(glm::length(cameraPos - cameraTarget));

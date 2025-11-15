@@ -65,9 +65,19 @@ bool Scene::LoadFromFile(const std::string& filename) {
         aiMat->Get(AI_MATKEY_COLOR_EMISSIVE, emission);
         glm::vec3 emissive(emission.r, emission.g, emission.b);
         
+        // Get specular properties
+        aiColor3D specular(0.0f, 0.0f, 0.0f);
+        aiMat->Get(AI_MATKEY_COLOR_SPECULAR, specular);
+        float shininess = 0.0f;
+        aiMat->Get(AI_MATKEY_SHININESS, shininess);
+        int illum = 0;
+        aiMat->Get(AI_MATKEY_SHADING_MODEL, illum);
+        
         // Create material based on properties
         std::shared_ptr<Material> mat;
         float emissiveIntensity = glm::length(emissive);
+        float specularIntensity = (specular.r + specular.g + specular.b) / 3.0f;
+        
         if (emissiveIntensity > 0.01f) {
             // Emissive material (light source)
             mat = std::make_shared<Material>();
@@ -76,6 +86,11 @@ bool Scene::LoadFromFile(const std::string& filename) {
             mat->SetEmission(emissive);
             std::cout << "Material[" << i << "] \"" << name.C_Str() << "\": Emissive (Ke=" 
                      << emissive.x << "," << emissive.y << "," << emissive.z << ")" << std::endl;
+        } else if (specularIntensity > 0.5f || illum == 5) {
+            // Specular/Mirror material (illum 5 is mirror reflection)
+            mat = std::make_shared<SpecularMaterial>(albedo, 0.0f); // 0.0f roughness = perfect mirror
+            std::cout << "Material[" << i << "] \"" << name.C_Str() << "\": Specular/Mirror (Ks=" 
+                     << specular.r << "," << specular.g << "," << specular.b << ", illum=" << illum << ")" << std::endl;
         } else {
             // Diffuse material
             mat = std::make_shared<DiffuseMaterial>(albedo);

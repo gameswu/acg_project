@@ -119,7 +119,10 @@ void Camera::Move(const glm::vec3& offset) {
 }
 
 void Camera::UpdateVectors() {
-    m_right = glm::normalize(glm::cross(m_direction, m_up));
+    // Standard right-hand coordinate system for Cornell Box
+    // Ensure Up is (0,1,0) to match scene Y-up convention
+    glm::vec3 worldUp(0.0f, 1.0f, 0.0f);
+    m_right = glm::normalize(glm::cross(m_direction, worldUp));
     m_up = glm::normalize(glm::cross(m_right, m_direction));
 }
 
