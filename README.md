@@ -48,7 +48,9 @@ acg_project/
 ├── include/             # Header directory
 │   ├── BVH.h            # BVH acceleration structure
 │   ├── Camera.h         # Camera system
+│   ├── GUI.h            # GUI system (using ImGui)
 │   ├── Light.h          # Lighting system (point light, area light, environment light)
+│   ├── LogRedirector.h  # Redirect console output to GUI log panel
 │   ├── Material.h       # Material system (diffuse, specular, transmissive, PBR)
 │   ├── MathUtils.h      # Math utility functions
 │   ├── Mesh.h           # Geometry mesh
@@ -60,6 +62,7 @@ acg_project/
 ├── src/                 # Source files directory
 │   ├── BVH.cpp
 │   ├── Camera.cpp
+│   ├── GUI.cpp
 │   ├── Light.cpp
 │   ├── Material.cpp
 │   ├── MathUtils.cpp
@@ -87,8 +90,14 @@ acg_project/
 We provide a GUI for users to configure rendering settings and load scenes. The GUI allows you to adjust parameters such as samples per pixel, maximum bounces, and load different 3D models.
 
 <div align="center">
-    <img src="docs/gui.png" alt="GUI Screenshot" width="600"/>
+    <img src="docs/gui.png" alt="GUI Screenshot" width="800"/>
 </div>
+
+- **Render Settings:** Adjust output resolution, sampling parameters, lighting intensity, and scene model paths.
+- **Camera Settings:** Configure camera position, target, up vector, and field of view.
+- **Render Statistics:** Monitor rendering progress, samples, and performance metrics.
+- **Controls:** Start or stop rendering processes.
+- **Log Details:** View log messages and debug information.
 
 ## Development
 ### Dependencies

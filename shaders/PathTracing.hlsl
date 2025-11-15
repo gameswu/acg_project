@@ -9,7 +9,7 @@ cbuffer RenderParams : register(b0) {
     uint numTriangles;          // 4
     uint numMaterials;          // 4
     uint accumulatedSamples;    // 4 - global sample offset
-    uint _pad1;                 // 4
+    float environmentLight;     // 4 - environment light intensity
     uint _pad2;                 // 4
     uint resolutionX;           // 4
     uint resolutionY;           // 4
@@ -188,7 +188,10 @@ float3 TracePath(Ray ray, inout uint rngState) {
         HitInfo hit = Intersect(ray);
         
         if (!hit.hit) {
-            // Cornell Box is closed - no environment light
+            // Return environment light if enabled
+            if (environmentLight > 0.0) {
+                radiance += throughput * float3(environmentLight, environmentLight, environmentLight);
+            }
             break;
         }
         
@@ -327,6 +330,7 @@ Ray GenerateCameraRay(uint2 pixelCoord, inout uint rngState) {
     float2 jitter = Random2D(rngState);
     float2 uv = (float2(pixelCoord) + jitter) / resolution;
     uv = uv * 2.0 - 1.0;
+    uv.y = -uv.y;  // Flip Y to match camera space (Y-up)
     
     float aspectRatio = resolution.x / resolution.y;
     float halfHeight = tan(camera.fov * 0.5 * 3.14159265359 / 180.0);

@@ -28,6 +28,16 @@ bool GUI::Initialize(HWND hwnd, ID3D11Device* device, ID3D11DeviceContext* conte
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     
+    // Set ImGui ini file path to executable directory
+    static char iniFilePath[MAX_PATH];
+    GetModuleFileNameA(NULL, iniFilePath, MAX_PATH);
+    char* lastSlash = strrchr(iniFilePath, '\\');
+    if (lastSlash) {
+        *(lastSlash + 1) = '\0';
+        strcat_s(iniFilePath, "imgui.ini");
+        io.IniFilename = iniFilePath;
+    }
+    
     // Setup Dear ImGui style
     ImGui::StyleColorsDark();
     
@@ -87,6 +97,10 @@ void GUI::RenderSettingsPanel() {
         ImGui::InputInt("Samples Per Frame", &m_settings.samplesPerFrame);
         ImGui::SliderInt("Max Bounces", &m_settings.maxBounces, 1, 10);
         
+        ImGui::SeparatorText("Lighting");
+        ImGui::SliderFloat("Environment Light", &m_settings.environmentLightIntensity, 0.0f, 2.0f, "%.2f");
+        ImGui::TextWrapped("Tip: Use environment light for scenes without light sources.");
+        
         ImGui::SeparatorText("Scene");
         ImGui::Text("Model Path:");
         ImGui::PushItemWidth(-80);
@@ -117,18 +131,6 @@ void GUI::RenderSettingsPanel() {
         
         ImGui::Spacing();
         ImGui::Checkbox("Auto-render on load", &m_settings.autoRender);
-        
-        ImGui::Spacing();
-        if (ImGui::Button("Load Default Scene")) {
-            // Get absolute path to default scene
-            char absPath[MAX_PATH];
-            const char* relativePath = "tests\\scenes\\CornellBox\\CornellBox-Original.obj";
-            if (GetFullPathNameA(relativePath, MAX_PATH, absPath, NULL)) {
-                m_settings.modelPath = absPath;
-            } else {
-                m_settings.modelPath = relativePath;
-            }
-        }
     }
     ImGui::End();
 }

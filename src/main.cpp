@@ -397,6 +397,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             renderer.SetSamplesPerPixel(settings.samplesPerPixel);
             renderer.SetMaxBounces(settings.maxBounces);
             renderer.SetRussianRouletteDepth(3);
+            renderer.SetEnvironmentLight(settings.environmentLightIntensity);
             renderer.ResetAccumulation();
 
             // Calculate frames

@@ -40,6 +40,7 @@ Renderer::Renderer()
     , m_samplesPerPixel(1)
     , m_maxBounces(5)
     , m_rrDepth(3)
+    , m_environmentLight(0.5f)
     , m_frameCount(0)
     , m_accumulatedSamples(0)
     , m_currentAccumIndex(0)
@@ -124,7 +125,7 @@ void Renderer::RenderFrame(const Scene& scene, const Camera& camera, int samples
             uint32_t numTriangles;
             uint32_t numMaterials;
             uint32_t accumulatedSamples;
-            uint32_t _pad1;
+            float environmentLight;
             uint32_t _pad2;
             uint32_t resX;
             uint32_t resY;
@@ -168,7 +169,7 @@ void Renderer::RenderFrame(const Scene& scene, const Camera& camera, int samples
         params->numTriangles = m_numTriangles;
         params->numMaterials = m_numMaterials;
         params->accumulatedSamples = m_accumulatedSamples;  // Pass current accumulated count
-        params->_pad1 = 0;
+        params->environmentLight = m_environmentLight;
         params->_pad2 = 0;
         params->resX = m_width;
         params->resY = m_height;
@@ -470,6 +471,10 @@ void Renderer::SetMaxBounces(int bounces) {
 
 void Renderer::SetRussianRouletteDepth(int depth) {
     m_rrDepth = depth;
+}
+
+void Renderer::SetEnvironmentLight(float intensity) {
+    m_environmentLight = intensity;
 }
 
 bool Renderer::InitializeD3D() {

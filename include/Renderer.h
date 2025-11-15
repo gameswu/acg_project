@@ -41,6 +41,7 @@ public:
     void SetSamplesPerPixel(int samples);
     void SetMaxBounces(int bounces);
     void SetRussianRouletteDepth(int depth);
+    void SetEnvironmentLight(float intensity);
     
     // 获取 D3D11 设备和上下文（用于 GUI）
     ID3D11Device* GetDevice() const { return m_device; }
@@ -91,6 +92,7 @@ private:
     int m_samplesPerPixel;
     int m_maxBounces;
     int m_rrDepth;  // Russian Roulette depth
+    float m_environmentLight;  // Environment light intensity
     int m_frameCount;
     int m_accumulatedSamples;  // 已累积的样本数
     

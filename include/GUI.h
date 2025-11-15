@@ -16,6 +16,7 @@ struct RenderSettings {
     int samplesPerFrame = 10;
     int maxBounces = 5;
     float fov = 60.0f;
+    float environmentLightIntensity = 0.5f;  // Environment light fallback
     
     // Camera settings
     float cameraPosition[3] = {0.0f, 1.0f, 2.7f};
