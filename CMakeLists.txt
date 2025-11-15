@@ -24,11 +24,10 @@ file(GLOB_RECURSE HEADER_FILES
     "include/*.h"
 )
 
-# 生成可执行文件
-add_executable(${PROJECT_NAME} ${SRC_FILES} ${HEADER_FILES})
+# 生成可执行文件 (WIN32标志隐藏控制台窗口)
+add_executable(${PROJECT_NAME} WIN32 ${SRC_FILES} ${HEADER_FILES})
 
 # 查找 vcpkg 安装的依赖包
-find_package(SDL2 CONFIG REQUIRED)
 find_package(glm REQUIRED)
 find_package(imgui CONFIG REQUIRED)
 find_package(Stb REQUIRED)
@@ -37,7 +36,6 @@ find_package(nlohmann_json CONFIG REQUIRED)
 
 # 将依赖库链接到您的可执行文件
 target_link_libraries(${PROJECT_NAME} PRIVATE 
-    $<IF:$<TARGET_EXISTS:SDL2::SDL2>,SDL2::SDL2,SDL2::SDL2-static>
     glm::glm
     imgui::imgui
     assimp::assimp
@@ -54,6 +52,24 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     dxgi.lib       # DirectX Graphics Infrastructure
     d3dcompiler.lib # 着色器编译器
     dxguid.lib     # DirectX GUIDs
+)
+
+# 复制 shader 文件到 bin 目录
+file(GLOB SHADER_FILES "${CMAKE_SOURCE_DIR}/shaders/*.hlsl" "${CMAKE_SOURCE_DIR}/shaders/*.hlsli")
+foreach(SHADER_FILE ${SHADER_FILES})
+    get_filename_component(SHADER_NAME ${SHADER_FILE} NAME)
+    add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        ${SHADER_FILE}
+        ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/shaders/${SHADER_NAME}
+        COMMENT "Copying shader: ${SHADER_NAME}"
+    )
+endforeach()
+
+# 创建 shaders 目录
+add_custom_command(TARGET ${PROJECT_NAME} PRE_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory
+    ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/shaders
 )
 
 # 设置Visual Studio的源文件组织

@@ -17,3 +17,6 @@ tests/scenes/
 
 # vscode settings
 .vscode/
+
+# ImGui settings
+imgui.ini

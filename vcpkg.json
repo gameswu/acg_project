@@ -2,9 +2,11 @@
   "name": "acg-project",
   "version-string": "0.1.0",
   "dependencies": [
-    "sdl2",
     "glm",
-    "imgui",
+    {
+      "name": "imgui",
+      "features": [ "win32-binding", "dx11-binding", "docking-experimental" ]
+    },
     "stb",
     "assimp",
     "nlohmann-json"

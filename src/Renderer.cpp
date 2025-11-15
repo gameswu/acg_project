@@ -1,8 +1,10 @@
 #include "Renderer.h"
+#include "BVH.h"
 #include <iostream>
 #include <fstream>
 #include <vector>
 #include <algorithm>
+#include <chrono>
 #include <d3dcompiler.h>
 
 #pragma comment(lib, "d3dcompiler.lib")
@@ -23,17 +25,31 @@ Renderer::Renderer()
     , m_materialSRV(nullptr)
     , m_lightBuffer(nullptr)
     , m_lightSRV(nullptr)
+    , m_bvhBuffer(nullptr)
+    , m_bvhSRV(nullptr)
+    , m_bvhTriangleIndicesBuffer(nullptr)
+    , m_bvhTriangleIndicesSRV(nullptr)
     , m_constantBuffer(nullptr)
     , m_numTriangles(0)
     , m_numMaterials(0)
     , m_numLights(0)
+    , m_numBVHNodes(0)
+    , m_numBVHTriangleIndices(0)
     , m_width(0)
     , m_height(0)
     , m_samplesPerPixel(1)
     , m_maxBounces(5)
     , m_rrDepth(3)
     , m_frameCount(0)
+    , m_accumulatedSamples(0)
+    , m_currentAccumIndex(0)
 {
+    m_accumulationTexture[0] = nullptr;
+    m_accumulationTexture[1] = nullptr;
+    m_accumulationUAV[0] = nullptr;
+    m_accumulationUAV[1] = nullptr;
+    m_accumulationSRV[0] = nullptr;
+    m_accumulationSRV[1] = nullptr;
 }
 
 Renderer::~Renderer() {
@@ -63,6 +79,155 @@ bool Renderer::Initialize(int width, int height) {
     return true;
 }
 
+void Renderer::ResetAccumulation() {
+    m_accumulatedSamples = 0;
+    m_frameCount = 0;
+    m_currentAccumIndex = 0;
+    
+    // Clear both accumulation textures to zero
+    float clearColor[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    if (m_context) {
+        if (m_accumulationUAV[0]) m_context->ClearUnorderedAccessViewFloat(m_accumulationUAV[0], clearColor);
+        if (m_accumulationUAV[1]) m_context->ClearUnorderedAccessViewFloat(m_accumulationUAV[1], clearColor);
+    }
+}
+
+void Renderer::RenderFrame(const Scene& scene, const Camera& camera, int samplesThisFrame) {
+    if (!m_device || !m_context || !m_pathTracingShader) {
+        return;
+    }
+    
+    // Upload scene data on first frame
+    if (m_frameCount == 0) {
+        if (!UploadSceneData(scene)) {
+            std::cerr << "Failed to upload scene data" << std::endl;
+            return;
+        }
+    }
+    
+    // Update constant buffer
+    D3D11_MAPPED_SUBRESOURCE mappedResource;
+    HRESULT hr = m_context->Map(m_constantBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mappedResource);
+    if (SUCCEEDED(hr)) {
+        struct GPUCamera {
+            float position[3]; float _pad0;
+            float direction[3]; float _pad1;
+            float right[3]; float _pad2;
+            float up[3]; float _pad3;
+            float fov; float aspectRatio; float aperture; float focusDistance;
+        };
+        struct RenderParams {
+            GPUCamera camera;
+            uint32_t frameIndex;
+            uint32_t samplesPerPixel;
+            uint32_t maxBounces;
+            uint32_t numTriangles;
+            uint32_t numMaterials;
+            uint32_t accumulatedSamples;
+            uint32_t _pad1;
+            uint32_t _pad2;
+            uint32_t resX;
+            uint32_t resY;
+            uint32_t _pad3[2];
+        };
+        
+        RenderParams* params = static_cast<RenderParams*>(mappedResource.pData);
+        glm::vec3 pos = camera.GetPosition();
+        glm::vec3 dir = camera.GetDirection();
+        glm::vec3 right = camera.GetRight();
+        glm::vec3 up = camera.GetUp();
+        
+        params->camera.position[0] = pos.x;
+        params->camera.position[1] = pos.y;
+        params->camera.position[2] = pos.z;
+        params->camera._pad0 = 0.0f;
+        
+        params->camera.direction[0] = dir.x;
+        params->camera.direction[1] = dir.y;
+        params->camera.direction[2] = dir.z;
+        params->camera._pad1 = 0.0f;
+        
+        params->camera.right[0] = right.x;
+        params->camera.right[1] = right.y;
+        params->camera.right[2] = right.z;
+        params->camera._pad2 = 0.0f;
+        
+        params->camera.up[0] = up.x;
+        params->camera.up[1] = up.y;
+        params->camera.up[2] = up.z;
+        params->camera._pad3 = 0.0f;
+        
+        params->camera.fov = camera.GetFOV();
+        params->camera.aspectRatio = static_cast<float>(m_width) / m_height;
+        params->camera.aperture = camera.GetAperture();
+        params->camera.focusDistance = camera.GetFocusDistance();
+        
+        params->frameIndex = m_frameCount;
+        params->samplesPerPixel = samplesThisFrame;  // Use samplesThisFrame instead of total
+        params->maxBounces = m_maxBounces;
+        params->numTriangles = m_numTriangles;
+        params->numMaterials = m_numMaterials;
+        params->accumulatedSamples = m_accumulatedSamples;  // Pass current accumulated count
+        params->_pad1 = 0;
+        params->_pad2 = 0;
+        params->resX = m_width;
+        params->resY = m_height;
+        params->_pad3[0] = 0;
+        params->_pad3[1] = 0;
+        
+        m_context->Unmap(m_constantBuffer, 0);
+    }
+    
+    // Bind resources
+    m_context->CSSetShader(m_pathTracingShader, nullptr, 0);
+    m_context->CSSetConstantBuffers(0, 1, &m_constantBuffer);
+    
+    // Ping-pong: read from current, write to next
+    int readIndex = m_currentAccumIndex;
+    int writeIndex = 1 - m_currentAccumIndex;
+    
+    ID3D11ShaderResourceView* srvs[5] = { 
+        m_triangleSRV, 
+        m_materialSRV, 
+        m_accumulationSRV[readIndex],  // Read from current accumulation
+        m_bvhSRV, 
+        m_bvhTriangleIndicesSRV 
+    };
+    m_context->CSSetShaderResources(0, 5, srvs);
+    
+    // Bind both render target and accumulation texture as UAVs
+    ID3D11UnorderedAccessView* uavs[2] = { 
+        m_renderTargetUAV, 
+        m_accumulationUAV[writeIndex]  // Write to next accumulation
+    };
+    m_context->CSSetUnorderedAccessViews(0, 2, uavs, nullptr);
+    
+    // Dispatch
+    UINT groupsX = (m_width + 7) / 8;
+    UINT groupsY = (m_height + 7) / 8;
+    m_context->Dispatch(groupsX, groupsY, 1);
+    m_context->Flush();
+    
+    // Check device status
+    HRESULT deviceStatus = m_device->GetDeviceRemovedReason();
+    if (FAILED(deviceStatus)) {
+        std::cerr << "ERROR: Device removed! HRESULT: 0x" << std::hex << deviceStatus << std::dec << std::endl;
+    }
+    
+    // Unbind resources
+    ID3D11ShaderResourceView* nullSRVs[] = { nullptr, nullptr, nullptr, nullptr };
+    m_context->CSSetShaderResources(0, 4, nullSRVs);
+    ID3D11UnorderedAccessView* nullUAVs[] = { nullptr, nullptr };
+    m_context->CSSetUnorderedAccessViews(0, 2, nullUAVs, nullptr);
+    
+    // Swap accumulation buffers for next frame
+    m_currentAccumIndex = writeIndex;
+    
+    m_frameCount++;
+    m_accumulatedSamples += samplesThisFrame;
+}
+
+// Legacy single-shot render (calls RenderFrame once)
 void Renderer::Render(const Scene& scene, const Camera& camera) {
     if (!m_device || !m_context || !m_pathTracingShader) {
         return;
@@ -199,17 +364,6 @@ void Renderer::Render(const Scene& scene, const Camera& camera) {
     }
 }
 
-void Renderer::ResetAccumulation() {
-    m_frameCount = 0;
-    
-    if (m_context && m_renderTarget) {
-        // Clear render target
-        float clearColor[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
-        // Would need to create a RTV to clear, or use compute shader
-        std::cout << "Accumulation reset" << std::endl;
-    }
-}
-
 void Renderer::GetRenderResult(unsigned char* pixels) {
     if (!m_device || !m_context || !m_renderTarget || !pixels) {
         return;
@@ -239,34 +393,58 @@ void Renderer::GetRenderResult(unsigned char* pixels) {
     // Map and read data
     D3D11_MAPPED_SUBRESOURCE mapped;
     hr = m_context->Map(stagingTexture, 0, D3D11_MAP_READ, 0, &mapped);
+    std::cout << "Map result: HRESULT=0x" << std::hex << hr << std::dec << std::endl;
+    
+    if (FAILED(hr)) {
+        // Check if device was removed
+        HRESULT deviceRemoved = m_device->GetDeviceRemovedReason();
+        std::cerr << "ERROR: Failed to map staging texture!" << std::endl;
+        std::cerr << "Device removed reason: 0x" << std::hex << deviceRemoved << std::dec << std::endl;
+        
+        if (deviceRemoved == DXGI_ERROR_DEVICE_HUNG) {
+            std::cerr << "Device hung - GPU took too long to respond (TDR timeout)" << std::endl;
+            std::cerr << "Large scenes may require splitting render into smaller dispatches or using async compute" << std::endl;
+        } else if (deviceRemoved == DXGI_ERROR_DEVICE_REMOVED) {
+            std::cerr << "Device removed - GPU driver crashed or was reset" << std::endl;
+        } else if (deviceRemoved == DXGI_ERROR_DEVICE_RESET) {
+            std::cerr << "Device reset - GPU was reset by the OS" << std::endl;
+        } else if (deviceRemoved == DXGI_ERROR_DRIVER_INTERNAL_ERROR) {
+            std::cerr << "Driver internal error" << std::endl;
+        }
+        
+        stagingTexture->Release();
+        return;
+    }
+    
     if (SUCCEEDED(hr)) {
+        std::cout << "Mapped successfully, RowPitch=" << mapped.RowPitch << std::endl;
         float* src = static_cast<float*>(mapped.pData);
         
-        // Debug: check pixel (0,0) and (1,0) for debug info
-        int debugIdx0 = 0;
-        int debugIdx1 = 4;
-        std::cout << "Debug pixel (0,0): R=" << src[debugIdx0] << " G=" << src[debugIdx0+1] 
-                  << " B=" << src[debugIdx0+2] << std::endl;
-        std::cout << "Debug pixel (1,0): R=" << src[debugIdx1] << " G=" << src[debugIdx1+1] 
-                  << " B=" << src[debugIdx1+2] << std::endl;
+        // Validate mapped data
+        if (src == nullptr) {
+            std::cerr << "ERROR: Mapped pointer is null!" << std::endl;
+            m_context->Unmap(stagingTexture, 0);
+            stagingTexture->Release();
+            return;
+        }
         
-        // Debug: check if we have any non-zero pixels
-        int nonZeroPixels = 0;
-        float maxValue = 0.0f;
+        // Calculate row pitch in floats
+        size_t rowPitchFloats = mapped.RowPitch / sizeof(float);
         
         for (int y = 0; y < m_height; ++y) {
             for (int x = 0; x < m_width; ++x) {
-                int srcIdx = y * (mapped.RowPitch / sizeof(float)) + x * 4;
-                int dstIdx = (y * m_width + x) * 4;
+                size_t srcIdx = static_cast<size_t>(y) * rowPitchFloats + static_cast<size_t>(x) * 4;
+                size_t dstIdx = static_cast<size_t>(y * m_width + x) * 4;
+                
+                // Bounds check
+                if (dstIdx + 3 >= static_cast<size_t>(m_width * m_height * 4)) {
+                    std::cerr << "ERROR: Destination index out of bounds at (" << x << "," << y << ")" << std::endl;
+                    break;
+                }
                 
                 float r = src[srcIdx + 0];
                 float g = src[srcIdx + 1];
                 float b = src[srcIdx + 2];
-                
-                if (r > 0.001f || g > 0.001f || b > 0.001f) {
-                    nonZeroPixels++;
-                    maxValue = std::max(maxValue, std::max(r, std::max(g, b)));
-                }
                 
                 // Convert float to byte with gamma correction
                 pixels[dstIdx + 0] = static_cast<unsigned char>(std::pow(std::clamp(r, 0.0f, 1.0f), 1.0f / 2.2f) * 255.0f);
@@ -275,8 +453,6 @@ void Renderer::GetRenderResult(unsigned char* pixels) {
                 pixels[dstIdx + 3] = 255;
             }
         }
-        
-        std::cout << "GPU Result: " << nonZeroPixels << " non-zero pixels (max value: " << maxValue << ")" << std::endl;
         
         m_context->Unmap(stagingTexture, 0);
     }
@@ -337,6 +513,20 @@ bool Renderer::InitializeD3D() {
 bool Renderer::CreateShaders() {
     HRESULT hr;
     
+    // Get executable directory
+    wchar_t exePath[MAX_PATH];
+    GetModuleFileNameW(NULL, exePath, MAX_PATH);
+    std::wstring exeDir = exePath;
+    size_t lastSlash = exeDir.find_last_of(L"\\/");
+    if (lastSlash != std::wstring::npos) {
+        exeDir = exeDir.substr(0, lastSlash);
+    }
+    
+    // Construct shader path (shaders are copied to bin/shaders/ during build)
+    std::wstring shaderPath = exeDir + L"\\shaders\\PathTracing.hlsl";
+    
+    std::wcout << L"Loading shader from: " << shaderPath << std::endl;
+    
     // Compile path tracing compute shader
     ID3DBlob* shaderBlob = nullptr;
     ID3DBlob* errorBlob = nullptr;
@@ -347,7 +537,7 @@ bool Renderer::CreateShaders() {
 #endif
     
     hr = D3DCompileFromFile(
-        L"..\\shaders\\PathTracing.hlsl",
+        shaderPath.c_str(),
         nullptr,
         D3D_COMPILE_STANDARD_FILE_INCLUDE,
         "main",
@@ -430,6 +620,41 @@ bool Renderer::CreateBuffers() {
         return false;
     }
     
+    // Create ping-pong accumulation textures (for progressive rendering)
+    for (int i = 0; i < 2; ++i) {
+        hr = m_device->CreateTexture2D(&texDesc, nullptr, &m_accumulationTexture[i]);
+        if (FAILED(hr)) {
+            std::cerr << "Failed to create accumulation texture " << i << std::endl;
+            return false;
+        }
+        
+        // Create UAV for accumulation texture
+        hr = m_device->CreateUnorderedAccessView(m_accumulationTexture[i], &uavDesc, &m_accumulationUAV[i]);
+        if (FAILED(hr)) {
+            std::cerr << "Failed to create accumulation UAV " << i << std::endl;
+            return false;
+        }
+        
+        // Create SRV for accumulation texture (to read previous frame)
+        D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+        srvDesc.Format = texDesc.Format;
+        srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        srvDesc.Texture2D.MostDetailedMip = 0;
+        srvDesc.Texture2D.MipLevels = 1;
+        
+        hr = m_device->CreateShaderResourceView(m_accumulationTexture[i], &srvDesc, &m_accumulationSRV[i]);
+        if (FAILED(hr)) {
+            std::cerr << "Failed to create accumulation SRV " << i << std::endl;
+            return false;
+        }
+        
+        // Initialize accumulation texture to zero
+        float clearColor[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        m_context->ClearUnorderedAccessViewFloat(m_accumulationUAV[i], clearColor);
+    }
+    
+    m_currentAccumIndex = 0;
+    
     // Create constant buffer
     // RenderParams structure: Camera (80) + 6 uints (24) + padding (8) + 2 uints (8) = 120 bytes
     // Must be aligned to 16 bytes for D3D11
@@ -456,6 +681,10 @@ void Renderer::CleanupSceneBuffers() {
     if (m_materialBuffer) { m_materialBuffer->Release(); m_materialBuffer = nullptr; }
     if (m_lightSRV) { m_lightSRV->Release(); m_lightSRV = nullptr; }
     if (m_lightBuffer) { m_lightBuffer->Release(); m_lightBuffer = nullptr; }
+    if (m_bvhSRV) { m_bvhSRV->Release(); m_bvhSRV = nullptr; }
+    if (m_bvhBuffer) { m_bvhBuffer->Release(); m_bvhBuffer = nullptr; }
+    if (m_bvhTriangleIndicesSRV) { m_bvhTriangleIndicesSRV->Release(); m_bvhTriangleIndicesSRV = nullptr; }
+    if (m_bvhTriangleIndicesBuffer) { m_bvhTriangleIndicesBuffer->Release(); m_bvhTriangleIndicesBuffer = nullptr; }
 }
 
 bool Renderer::UploadSceneData(const Scene& scene) {
@@ -503,6 +732,15 @@ bool Renderer::UploadSceneData(const Scene& scene) {
     m_numTriangles = static_cast<uint32_t>(triangles.size());
     std::cout << "Uploading " << m_numTriangles << " triangles..." << std::endl;
     
+    // Check buffer size limits
+    size_t triangleBufferSize = sizeof(GPUTriangle) * m_numTriangles;
+    std::cout << "Triangle buffer size: " << triangleBufferSize << " bytes (" 
+              << (triangleBufferSize / 1024.0 / 1024.0) << " MB)" << std::endl;
+    
+    if (triangleBufferSize > 128 * 1024 * 1024) {
+        std::cerr << "WARNING: Triangle buffer exceeds 128MB, may fail on some GPUs!" << std::endl;
+    }
+    
     // Debug: Print first triangle
     if (m_numTriangles > 0) {
         const auto& tri0 = triangles[0];
@@ -525,9 +763,12 @@ bool Renderer::UploadSceneData(const Scene& scene) {
         
         hr = m_device->CreateBuffer(&bufferDesc, &initData, &m_triangleBuffer);
         if (FAILED(hr)) {
-            std::cerr << "Failed to create triangle buffer" << std::endl;
+            std::cerr << "Failed to create triangle buffer! HRESULT: 0x" << std::hex << hr << std::dec << std::endl;
+            std::cerr << "Buffer size: " << bufferDesc.ByteWidth << " bytes" << std::endl;
+            std::cerr << "Number of triangles: " << m_numTriangles << std::endl;
             return false;
         }
+        std::cout << "Triangle buffer created successfully" << std::endl;
         
         D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
         srvDesc.Format = DXGI_FORMAT_UNKNOWN;
@@ -582,6 +823,10 @@ bool Renderer::UploadSceneData(const Scene& scene) {
     m_numMaterials = static_cast<uint32_t>(materials.size());
     std::cout << "Uploading " << m_numMaterials << " materials..." << std::endl;
     
+    // Check material buffer size
+    size_t materialBufferSize = sizeof(GPUMaterial) * m_numMaterials;
+    std::cout << "Material buffer size: " << materialBufferSize << " bytes" << std::endl;
+    
     if (m_numMaterials > 0) {
         D3D11_BUFFER_DESC bufferDesc = {};
         bufferDesc.ByteWidth = sizeof(GPUMaterial) * m_numMaterials;
@@ -595,9 +840,12 @@ bool Renderer::UploadSceneData(const Scene& scene) {
         
         hr = m_device->CreateBuffer(&bufferDesc, &initData, &m_materialBuffer);
         if (FAILED(hr)) {
-            std::cerr << "Failed to create material buffer" << std::endl;
+            std::cerr << "Failed to create material buffer! HRESULT: 0x" << std::hex << hr << std::dec << std::endl;
+            std::cerr << "Buffer size: " << bufferDesc.ByteWidth << " bytes" << std::endl;
+            std::cerr << "Number of materials: " << m_numMaterials << std::endl;
             return false;
         }
+        std::cout << "Material buffer created successfully" << std::endl;
         
         D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
         srvDesc.Format = DXGI_FORMAT_UNKNOWN;
@@ -609,6 +857,155 @@ bool Renderer::UploadSceneData(const Scene& scene) {
         if (FAILED(hr)) {
             std::cerr << "Failed to create material SRV" << std::endl;
             return false;
+        }
+    }
+    
+    // Build and upload BVH
+    std::cout << "Building BVH for acceleration..." << std::endl;
+    BVH bvh;
+    
+    // Collect all vertices and indices
+    std::vector<glm::vec3> allVertices;
+    std::vector<uint32_t> allIndices;
+    
+    for (const auto& mesh : scene.GetMeshes()) {
+        const auto& vertices = mesh->GetVertices();
+        const auto& indices = mesh->GetIndices();
+        
+        uint32_t baseVertex = static_cast<uint32_t>(allVertices.size());
+        for (const auto& v : vertices) {
+            allVertices.push_back(v.position);
+        }
+        for (uint32_t idx : indices) {
+            allIndices.push_back(baseVertex + idx);
+        }
+    }
+    
+    auto buildStart = std::chrono::high_resolution_clock::now();
+    bvh.Build(allVertices, allIndices);
+    auto buildEnd = std::chrono::high_resolution_clock::now();
+    auto buildTime = std::chrono::duration_cast<std::chrono::milliseconds>(buildEnd - buildStart).count();
+    
+    std::cout << "BVH built in " << buildTime << " ms" << std::endl;
+    std::cout << "BVH nodes: " << bvh.GetNodeCount() << ", max depth: " << bvh.GetMaxDepth() << std::endl;
+    
+    // Upload BVH to GPU
+    const auto& bvhNodes = bvh.GetNodes();
+    m_numBVHNodes = static_cast<uint32_t>(bvhNodes.size());
+    
+    if (m_numBVHNodes > 0) {
+        // First, build a triangle index remapping array
+        // This maps BVH internal triangle indices to original GPU buffer indices
+        std::vector<int32_t> triangleIndexRemap;
+        
+        // Convert BVH nodes to GPU format
+        struct GPUBVHNode {
+            float bboxMin[3]; float _pad0;
+            float bboxMax[3]; float _pad1;
+            int32_t leftChild;
+            int32_t rightChild;
+            int32_t firstPrim;
+            int32_t primCount;
+        };
+        
+        std::vector<GPUBVHNode> gpuNodes;
+        for (const auto& node : bvhNodes) {
+            GPUBVHNode gpuNode;
+            gpuNode.bboxMin[0] = node.bbox.min.x;
+            gpuNode.bboxMin[1] = node.bbox.min.y;
+            gpuNode.bboxMin[2] = node.bbox.min.z;
+            gpuNode._pad0 = 0.0f;
+            gpuNode.bboxMax[0] = node.bbox.max.x;
+            gpuNode.bboxMax[1] = node.bbox.max.y;
+            gpuNode.bboxMax[2] = node.bbox.max.z;
+            gpuNode._pad1 = 0.0f;
+            gpuNode.leftChild = node.leftChild;
+            gpuNode.rightChild = node.rightChild;
+            
+            // For leaf nodes, remap triangle indices from BVH internal indices
+            // to original GPU buffer indices
+            if (node.leftChild == -1) {  // Leaf node
+                gpuNode.firstPrim = static_cast<int32_t>(triangleIndexRemap.size());
+                gpuNode.primCount = node.primCount;
+                
+                // Add the original triangle indices to the remap array
+                for (int i = 0; i < node.primCount; ++i) {
+                    int bvhTriIdx = node.firstPrim + i;
+                    int originalIdx = bvh.GetTriangleOriginalIndex(bvhTriIdx);
+                    triangleIndexRemap.push_back(originalIdx);
+                }
+            } else {  // Internal node
+                gpuNode.firstPrim = 0;
+                gpuNode.primCount = 0;
+            }
+            
+            gpuNodes.push_back(gpuNode);
+        }
+        
+        D3D11_BUFFER_DESC bufferDesc = {};
+        bufferDesc.ByteWidth = sizeof(GPUBVHNode) * m_numBVHNodes;
+        bufferDesc.Usage = D3D11_USAGE_DEFAULT;
+        bufferDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        bufferDesc.StructureByteStride = sizeof(GPUBVHNode);
+        bufferDesc.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+        
+        D3D11_SUBRESOURCE_DATA initData = {};
+        initData.pSysMem = gpuNodes.data();
+        
+        hr = m_device->CreateBuffer(&bufferDesc, &initData, &m_bvhBuffer);
+        if (FAILED(hr)) {
+            std::cerr << "Failed to create BVH buffer! HRESULT: 0x" << std::hex << hr << std::dec << std::endl;
+            return false;
+        }
+        
+        D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+        srvDesc.Format = DXGI_FORMAT_UNKNOWN;
+        srvDesc.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+        srvDesc.Buffer.FirstElement = 0;
+        srvDesc.Buffer.NumElements = m_numBVHNodes;
+        
+        hr = m_device->CreateShaderResourceView(m_bvhBuffer, &srvDesc, &m_bvhSRV);
+        if (FAILED(hr)) {
+            std::cerr << "Failed to create BVH SRV" << std::endl;
+            return false;
+        }
+        
+        std::cout << "BVH uploaded to GPU (" << (bufferDesc.ByteWidth / 1024.0) << " KB)" << std::endl;
+        
+        // Upload triangle index remapping buffer
+        m_numBVHTriangleIndices = static_cast<uint32_t>(triangleIndexRemap.size());
+        
+        if (m_numBVHTriangleIndices > 0) {
+            D3D11_BUFFER_DESC indexBufferDesc = {};
+            indexBufferDesc.ByteWidth = sizeof(int32_t) * m_numBVHTriangleIndices;
+            indexBufferDesc.Usage = D3D11_USAGE_DEFAULT;
+            indexBufferDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            indexBufferDesc.StructureByteStride = sizeof(int32_t);
+            indexBufferDesc.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+            
+            D3D11_SUBRESOURCE_DATA indexInitData = {};
+            indexInitData.pSysMem = triangleIndexRemap.data();
+            
+            hr = m_device->CreateBuffer(&indexBufferDesc, &indexInitData, &m_bvhTriangleIndicesBuffer);
+            if (FAILED(hr)) {
+                std::cerr << "Failed to create BVH triangle indices buffer!" << std::endl;
+                return false;
+            }
+            
+            D3D11_SHADER_RESOURCE_VIEW_DESC indexSrvDesc = {};
+            indexSrvDesc.Format = DXGI_FORMAT_UNKNOWN;
+            indexSrvDesc.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+            indexSrvDesc.Buffer.FirstElement = 0;
+            indexSrvDesc.Buffer.NumElements = m_numBVHTriangleIndices;
+            
+            hr = m_device->CreateShaderResourceView(m_bvhTriangleIndicesBuffer, &indexSrvDesc, &m_bvhTriangleIndicesSRV);
+            if (FAILED(hr)) {
+                std::cerr << "Failed to create BVH triangle indices SRV!" << std::endl;
+                return false;
+            }
+            
+            std::cout << "BVH triangle indices uploaded: " << m_numBVHTriangleIndices << " indices (" 
+                     << (indexBufferDesc.ByteWidth / 1024.0) << " KB)" << std::endl;
         }
     }
     
@@ -683,6 +1080,23 @@ void Renderer::Cleanup() {
         m_constantBuffer->Release();
         m_constantBuffer = nullptr;
     }
+    
+    // Release ping-pong accumulation buffers
+    for (int i = 0; i < 2; ++i) {
+        if (m_accumulationSRV[i]) {
+            m_accumulationSRV[i]->Release();
+            m_accumulationSRV[i] = nullptr;
+        }
+        if (m_accumulationUAV[i]) {
+            m_accumulationUAV[i]->Release();
+            m_accumulationUAV[i] = nullptr;
+        }
+        if (m_accumulationTexture[i]) {
+            m_accumulationTexture[i]->Release();
+            m_accumulationTexture[i] = nullptr;
+        }
+    }
+    
     if (m_renderTargetUAV) {
         m_renderTargetUAV->Release();
         m_renderTargetUAV = nullptr;

@@ -22,19 +22,29 @@ public:
     // 初始化渲染器
     bool Initialize(int width, int height);
     
-    // 渲染一帧
+    // 渲染单帧(分帧渲染模式)
+    void RenderFrame(const Scene& scene, const Camera& camera, int samplesThisFrame);
+    
+    // 传统单次渲染(保留兼容性)
     void Render(const Scene& scene, const Camera& camera);
     
     // 重置累积缓冲区（用于交互式渲染）
     void ResetAccumulation();
     
-    // 获取渲染结果
+    // 获取当前累积的渲染结果
     void GetRenderResult(unsigned char* pixels);
+    
+    // 获取累积的样本数
+    int GetAccumulatedSamples() const { return m_accumulatedSamples; }
     
     // 设置渲染参数
     void SetSamplesPerPixel(int samples);
     void SetMaxBounces(int bounces);
     void SetRussianRouletteDepth(int depth);
+    
+    // 获取 D3D11 设备和上下文（用于 GUI）
+    ID3D11Device* GetDevice() const { return m_device; }
+    ID3D11DeviceContext* GetContext() const { return m_context; }
 
 private:
     // DirectX 资源
@@ -47,8 +57,14 @@ private:
     ID3D11ComputeShader* m_accumShader;
     
     // 渲染目标和缓冲区
-    ID3D11Texture2D* m_renderTarget;
+    ID3D11Texture2D* m_renderTarget;        // 当前帧结果
     ID3D11UnorderedAccessView* m_renderTargetUAV;
+    
+    // Ping-pong accumulation textures to avoid read/write hazards
+    ID3D11Texture2D* m_accumulationTexture[2];  // 乒乓累积纹理
+    ID3D11UnorderedAccessView* m_accumulationUAV[2];
+    ID3D11ShaderResourceView* m_accumulationSRV[2];
+    int m_currentAccumIndex;  // 0 or 1 - current accumulation buffer index
     
     // Scene data buffers
     ID3D11Buffer* m_triangleBuffer;
@@ -57,11 +73,17 @@ private:
     ID3D11ShaderResourceView* m_materialSRV;
     ID3D11Buffer* m_lightBuffer;
     ID3D11ShaderResourceView* m_lightSRV;
+    ID3D11Buffer* m_bvhBuffer;
+    ID3D11ShaderResourceView* m_bvhSRV;
+    ID3D11Buffer* m_bvhTriangleIndicesBuffer;
+    ID3D11ShaderResourceView* m_bvhTriangleIndicesSRV;
     ID3D11Buffer* m_constantBuffer;
     
     uint32_t m_numTriangles;
     uint32_t m_numMaterials;
     uint32_t m_numLights;
+    uint32_t m_numBVHNodes;
+    uint32_t m_numBVHTriangleIndices;
     
     // 渲染参数
     int m_width;
@@ -70,6 +92,7 @@ private:
     int m_maxBounces;
     int m_rrDepth;  // Russian Roulette depth
     int m_frameCount;
+    int m_accumulatedSamples;  // 已累积的样本数
     
     bool InitializeD3D();
     bool CreateShaders();

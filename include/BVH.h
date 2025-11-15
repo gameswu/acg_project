@@ -55,6 +55,14 @@ public:
     // Get BVH data for GPU
     const std::vector<BVHNode>& GetNodes() const { return m_nodes; }
     
+    // Get triangle mapping (for remapping BVH indices to original indices)
+    int GetTriangleOriginalIndex(int bvhTriangleIndex) const {
+        if (bvhTriangleIndex >= 0 && bvhTriangleIndex < static_cast<int>(m_triangles.size())) {
+            return m_triangles[bvhTriangleIndex].index;
+        }
+        return -1;
+    }
+    
     // Statistics
     int GetNodeCount() const { return static_cast<int>(m_nodes.size()); }
     int GetMaxDepth() const { return m_maxDepth; }

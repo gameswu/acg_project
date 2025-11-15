@@ -31,8 +31,8 @@ struct Light {
 };
 
 struct BVHNode {
-    float3 bboxMin;
-    float3 bboxMax;
+    float3 bboxMin; float _pad0;
+    float3 bboxMax; float _pad1;
     int leftChild;      // -1 if leaf
     int rightChild;     // -1 if leaf
     int firstPrim;

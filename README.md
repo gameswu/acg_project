@@ -84,6 +84,12 @@ acg_project/
 
 ## Usage
 
+We provide a GUI for users to configure rendering settings and load scenes. The GUI allows you to adjust parameters such as samples per pixel, maximum bounces, and load different 3D models.
+
+<div align="center">
+    <img src="docs/gui.png" alt="GUI Screenshot" width="600"/>
+</div>
+
 ## Development
 ### Dependencies
 
@@ -94,6 +100,7 @@ This project requires the following dependencies:
 - Windows SDK for DirectX libraries
 
 ### Building the Project
+
 To build the project, follow these steps:
 1. Clone the repository:
     ```bash

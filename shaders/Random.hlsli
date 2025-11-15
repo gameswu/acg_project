@@ -9,7 +9,13 @@ uint PCGHash(uint input) {
     return (word >> 22u) ^ word;
 }
 
-// Initialize RNG state
+// Initialize RNG state with sample offset for better distribution
+uint InitRNG(uint2 pixelCoord, uint frameIndex, uint sampleIndex) {
+    uint seed = pixelCoord.x + pixelCoord.y * 19349663u + frameIndex * 83492791u + sampleIndex * 3141592653u;
+    return PCGHash(seed);
+}
+
+// Initialize RNG state (legacy version)
 uint InitRNG(uint2 pixelCoord, uint frameIndex) {
     return PCGHash(pixelCoord.x + PCGHash(pixelCoord.y + PCGHash(frameIndex)));
 }

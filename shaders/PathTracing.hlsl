@@ -8,7 +8,7 @@ cbuffer RenderParams : register(b0) {
     uint maxBounces;            // 4
     uint numTriangles;          // 4
     uint numMaterials;          // 4
-    uint _pad0;                 // 4
+    uint accumulatedSamples;    // 4 - global sample offset
     uint _pad1;                 // 4
     uint _pad2;                 // 4
     uint resolutionX;           // 4
@@ -18,7 +18,11 @@ cbuffer RenderParams : register(b0) {
 
 StructuredBuffer<Triangle> g_triangles : register(t0);
 StructuredBuffer<Material> g_materials : register(t1);
-RWTexture2D<float4> g_output : register(u0);
+Texture2D<float4> g_accumulation : register(t2);  // Previous accumulated samples
+StructuredBuffer<BVHNode> g_bvhNodes : register(t3);  // BVH acceleration structure
+StructuredBuffer<int> g_bvhTriangleIndices : register(t4);  // Triangle index remapping for BVH
+RWTexture2D<float4> g_output : register(u0);      // Current frame output
+RWTexture2D<float4> g_accum_out : register(u1);   // Updated accumulation
 
 bool RayTriangleIntersect(Ray ray, Triangle tri, out float t, out float u, out float v) {
     t = 1e30;
@@ -52,28 +56,88 @@ bool RayTriangleIntersect(Ray ray, Triangle tri, out float t, out float u, out f
     return t > ray.tMin && t < ray.tMax;
 }
 
+// AABB-Ray intersection test
+bool IntersectAABB(float3 bboxMin, float3 bboxMax, Ray ray, float tMax) {
+    float3 invDir = 1.0 / ray.direction;
+    
+    // Handle near-zero direction components to avoid inf/nan
+    if (abs(ray.direction.x) < 1e-8) invDir.x = 1e8 * sign(ray.direction.x);
+    if (abs(ray.direction.y) < 1e-8) invDir.y = 1e8 * sign(ray.direction.y);
+    if (abs(ray.direction.z) < 1e-8) invDir.z = 1e8 * sign(ray.direction.z);
+    
+    float3 t0 = (bboxMin - ray.origin) * invDir;
+    float3 t1 = (bboxMax - ray.origin) * invDir;
+    
+    float3 tSmaller = min(t0, t1);
+    float3 tBigger = max(t0, t1);
+    
+    float tMin = max(max(tSmaller.x, tSmaller.y), max(tSmaller.z, ray.tMin));
+    float tMaxAABB = min(min(tBigger.x, tBigger.y), min(tBigger.z, tMax));
+    
+    return tMin <= tMaxAABB && tMaxAABB > 0.0;
+}
+
 HitInfo Intersect(Ray ray) {
     HitInfo hit;
     hit.hit = false;
     hit.t = 1e30;
     
-    for (uint i = 0; i < numTriangles; i++) {
-        Triangle tri = g_triangles[i];
-        float t, u, v;
+    // Check if scene is loaded
+    if (numTriangles == 0) {
+        return hit;
+    }
+
+    // BVH traversal
+    int stack[32];
+    int stackPtr = 0;
+    stack[stackPtr++] = 0; // Start from root node
+    
+    while (stackPtr > 0) {
         
-        if (RayTriangleIntersect(ray, tri, t, u, v)) {
-            if (t < hit.t) {
-                hit.hit = true;
-                hit.t = t;
-                hit.position = ray.origin + ray.direction * t;
+        int nodeIdx = stack[--stackPtr];
+        
+        BVHNode node = g_bvhNodes[nodeIdx];
+        
+        // Test AABB intersection
+        if (!IntersectAABB(node.bboxMin, node.bboxMax, ray, hit.t)) {
+            continue;
+        }
+        
+        // Leaf node - test triangles
+        if (node.leftChild == -1) {
+            for (int i = 0; i < node.primCount; ++i) {
+                // Use the triangle index remap buffer to get the original GPU triangle index
+                int remapIdx = node.firstPrim + i;
+                int triIdx = g_bvhTriangleIndices[remapIdx];
                 
-                float w = 1.0 - u - v;
-                float3 n0 = tri.n0;
-                float3 n1 = tri.n1;
-                float3 n2 = tri.n2;
-                hit.normal = normalize(w * n0 + u * n1 + v * n2);
-                hit.texCoord = float2(u, v);
-                hit.materialIndex = tri.materialIndex;
+                Triangle tri = g_triangles[triIdx];
+                float t, u, v;
+                
+                if (RayTriangleIntersect(ray, tri, t, u, v)) {
+                    if (t < hit.t && t > ray.tMin) {
+                        hit.hit = true;
+                        hit.t = t;
+                        hit.position = ray.origin + ray.direction * t;
+                        
+                        float w = 1.0 - u - v;
+                        hit.normal = normalize(w * tri.n0 + u * tri.n1 + v * tri.n2);
+                        hit.texCoord = float2(u, v);
+                        
+                        // Clamp material index to valid range
+                        hit.materialIndex = min(tri.materialIndex, numMaterials - 1);
+                    }
+                }
+            }
+        }
+        // Internal node - push children
+        else {
+            // Push right child first (will be popped last, visited second)
+            if (node.rightChild >= 0 && stackPtr < 31) {
+                stack[stackPtr++] = node.rightChild;
+            }
+            // Push left child second (will be popped first, visited first)
+            if (node.leftChild >= 0 && stackPtr < 31) {
+                stack[stackPtr++] = node.leftChild;
             }
         }
     }
@@ -128,7 +192,9 @@ float3 TracePath(Ray ray, inout uint rngState) {
             break;
         }
         
-        Material mat = g_materials[hit.materialIndex];
+        // Ensure material index is valid
+        uint matIdx = min(hit.materialIndex, numMaterials - 1);
+        Material mat = g_materials[matIdx];
         
         // Direct light contribution from hit emissive surface
         if (mat.type == 4) {
@@ -138,11 +204,17 @@ float3 TracePath(Ray ray, inout uint rngState) {
         }
         
         // Next Event Estimation: sample light source directly
-        if (bounce == 0 || bounce == 1) {
+        // Only do this for diffuse surfaces to avoid double counting with specular
+        // TEMPORARILY DISABLED FOR DEBUGGING
+        if (false && mat.type == 0 && bounce < 3) {
             // Find emissive material and sample it
             for (uint i = 0; i < numTriangles; i++) {
                 Triangle lightTri = g_triangles[i];
-                if (lightTri.materialIndex == 8) { // Light material index
+                uint lightMatIdx = min(lightTri.materialIndex, numMaterials - 1);
+                Material lightMat = g_materials[lightMatIdx];
+                
+                // Check if material is emissive
+                if (lightMat.type == 4) { // Emissive material
                     // Sample random point on light triangle
                     float r1 = Random(rngState);
                     float r2 = Random(rngState);
@@ -183,22 +255,22 @@ float3 TracePath(Ray ray, inout uint rngState) {
                         
                         if (!shadowHit.hit) {
                             // Light visible
-                            Material lightMat = g_materials[8];
                             float3 lightEmission = float3(lightMat.emission[0], lightMat.emission[1], lightMat.emission[2]);
                             
-                            // Compute light area (approximate)
+                            // Compute light area
                             float3 edge1 = lv1 - lv0;
                             float3 edge2 = lv2 - lv0;
                             float lightArea = length(cross(edge1, edge2)) * 0.5;
                             
-                            // BRDF
+                            // BRDF evaluation
                             float3 f = EvaluateBRDF(mat, -ray.direction, lightDir, hit.normal);
                             
-                            // Geometry term
-                            float G = (NdotL * LdotN) / (distToLight * distToLight);
-                            
-                            // Direct lighting contribution (scaled by triangle count as we only sample one)
-                            radiance += throughput * f * lightEmission * G * lightArea * 2.0;
+                            // Direct lighting: L = Le * BRDF * cosTheta * cosTheta_light * Area / r^2
+                            // PDF for uniform area sampling = 1/Area
+                            // Contribution = Le * BRDF * cosTheta * cosTheta_light * Area / r^2 / (1/Area)
+                            //              = Le * BRDF * cosTheta * cosTheta_light * Area^2 / r^2
+                            float geometry = (NdotL * abs(LdotN)) / max(distToLight * distToLight, 0.0001);
+                            radiance += throughput * f * lightEmission * geometry * lightArea;
                         }
                     }
                     break; // Only sample first light triangle
@@ -206,9 +278,9 @@ float3 TracePath(Ray ray, inout uint rngState) {
             }
         }
         
-        // Russian Roulette
-        if (bounce > 3) {
-            float p = max(throughput.r, max(throughput.g, throughput.b));
+        // Russian Roulette (start after a few bounces to ensure good sampling)
+        if (bounce >= 3) {
+            float p = max(0.05, max(throughput.r, max(throughput.g, throughput.b)));
             if (Random(rngState) > p) break;
             throughput /= p;
         }
@@ -250,7 +322,10 @@ float3 TracePath(Ray ray, inout uint rngState) {
 
 Ray GenerateCameraRay(uint2 pixelCoord, inout uint rngState) {
     float2 resolution = float2(float(resolutionX), float(resolutionY));
-    float2 uv = (float2(pixelCoord) + float2(0.5, 0.5)) / resolution;
+    
+    // Add random jitter for antialiasing
+    float2 jitter = Random2D(rngState);
+    float2 uv = (float2(pixelCoord) + jitter) / resolution;
     uv = uv * 2.0 - 1.0;
     
     float aspectRatio = resolution.x / resolution.y;
@@ -280,19 +355,34 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID) {
         return;
     }
     
-    uint rngState = InitRNG(pixelCoord, frameIndex);
-    
-    float3 finalColor = float3(0, 0, 0);
+    // Render new samples for this frame (samplesPerPixel is actually samples THIS frame)
+    float3 newSamples = float3(0, 0, 0);
     for (uint i = 0; i < samplesPerPixel; ++i) {
+        // Use global sample index to ensure unique seeds across all frames
+        uint globalSampleIndex = accumulatedSamples + i;
+        uint rngState = InitRNG(pixelCoord, frameIndex, globalSampleIndex);
+        
         Ray ray = GenerateCameraRay(pixelCoord, rngState);
-        finalColor += TracePath(ray, rngState);
+        newSamples += TracePath(ray, rngState);
     }
+    // Don't divide by samplesPerPixel yet - accumulate raw samples
     
-    finalColor /= float(samplesPerPixel);
+    // Load previous accumulated samples (linear HDR space)
+    float4 prevAccum = g_accumulation[pixelCoord];
     
-    // Tone mapping and gamma correction
-    finalColor = finalColor / (finalColor + 1.0);
-    finalColor = pow(abs(finalColor), 1.0 / 2.2);
+    // Add new samples to accumulation (stays in linear HDR)
+    float3 totalAccum = prevAccum.rgb + newSamples;
+    float totalSamples = prevAccum.a + float(samplesPerPixel);
     
-    g_output[pixelCoord] = float4(finalColor, 1.0);
+    // Write updated accumulation
+    g_accum_out[pixelCoord] = float4(totalAccum, totalSamples);
+    
+    // Compute averaged result for display
+    float3 avgColor = totalAccum / max(1.0, totalSamples);
+    
+    // Apply tone mapping and gamma correction
+    avgColor = avgColor / (avgColor + 1.0);
+    avgColor = pow(abs(avgColor), 1.0 / 2.2);
+    
+    g_output[pixelCoord] = float4(avgColor, 1.0);
 }
