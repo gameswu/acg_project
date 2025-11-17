@@ -336,12 +336,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 void RenderGUI(ACG::Renderer* renderer) {
     static bool isRendering = false;
     static int samplesPerPixel = 100;
-    static int samplesPerFrame = 5;
     static int maxBounces = 5;
     static char modelPath[512] = "";
     static char outputPath[512] = "";
     static std::string renderStatus = "";
     static bool showRenderStatus = false;
+    static std::chrono::steady_clock::time_point renderStartTime;
+    static float lastRenderTime = 0.0f;
     
     // Initialize environment light on first call
     static bool envLightInitialized = false;
@@ -382,12 +383,10 @@ void RenderGUI(ACG::Renderer* renderer) {
     
     ImGui::Separator();
     ImGui::Text("Sampling");
-    ImGui::InputInt("Samples Per Pixel", &samplesPerPixel);
-    
-    if (ImGui::InputInt("Samples Per Frame", &samplesPerFrame)) {
-        if (samplesPerFrame < 1) samplesPerFrame = 1;
-        renderer->SetSamplesPerPixel(samplesPerFrame);
+    if (ImGui::InputInt("Samples Per Pixel", &samplesPerPixel)) {
+        if (samplesPerPixel < 1) samplesPerPixel = 1;
     }
+    ImGui::TextDisabled("(Total number of samples to accumulate per pixel)");
     
     if (ImGui::InputInt("Max Bounces", &maxBounces)) {
         if (maxBounces < 1) maxBounces = 1;
@@ -481,6 +480,9 @@ void RenderGUI(ACG::Renderer* renderer) {
             // Check if scene needs to be loaded
             bool needsSceneLoad = (g_lastLoadedScene != modelPathStr);
             
+            // Record start time
+            renderStartTime = std::chrono::steady_clock::now();
+            
             g_renderThread = std::make_unique<std::thread>([renderer, modelPathStr, outputPathStr, samples, bounces, renderWidth, renderHeight, needsSceneLoad]() {
                 try {
                     // Set rendering flags at the start
@@ -504,6 +506,11 @@ void RenderGUI(ACG::Renderer* renderer) {
                     renderer->OnResize(renderWidth, renderHeight);
                     
                     renderer->RenderToFile(outputPathStr, samples, bounces);
+                    
+                    // Calculate actual render time
+                    auto endTime = std::chrono::steady_clock::now();
+                    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - renderStartTime);
+                    lastRenderTime = duration.count() / 1000.0f;  // Convert to seconds
                     
                     std::lock_guard<std::mutex> lock(g_renderMutex);
                     g_renderResultMessage = "Rendering complete!\nOutput saved to:\n" + outputPathStr;
@@ -645,13 +652,21 @@ void RenderGUI(ACG::Renderer* renderer) {
     int accumulated = renderer->GetAccumulatedSamples();
     float progress = samplesPerPixel > 0 ? (float)accumulated / (float)samplesPerPixel : 0.0f;
     char progressText[64];
-    sprintf_s(progressText, "Progress: %d / %d frames", accumulated / samplesPerFrame, samplesPerPixel / samplesPerFrame);
-    if (!g_isRendering.load()) {
-        ImGui::ProgressBar(progress, ImVec2(-1, 0), progressText);
-    }
+    sprintf_s(progressText, "Progress: %d / %d samples", accumulated, samplesPerPixel);
+    ImGui::ProgressBar(progress, ImVec2(-1, 0), progressText);
     
     ImGui::Text("Samples: %d / %d", accumulated, samplesPerPixel);
-    ImGui::Text("Render Time: %.1f seconds", accumulated * 0.016f); // 粗略估算
+    
+    // Display render time
+    if (g_isRendering.load()) {
+        auto currentTime = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(currentTime - renderStartTime);
+        ImGui::Text("Render Time: %.1f seconds (in progress)", elapsed.count() / 1000.0f);
+    } else if (lastRenderTime > 0.0f) {
+        ImGui::Text("Render Time: %.1f seconds (last render)", lastRenderTime);
+    } else {
+        ImGui::Text("Render Time: N/A");
+    }
     
     ImGui::Separator();
     ImGui::Text("Scene Info:");

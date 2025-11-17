@@ -14,21 +14,15 @@
 // Forward declare DXC interfaces
 struct IDxcBlob;
 
-// Ensure 16-byte alignment for HLSL compatibility
+// Simplified GPU Material structure - only vec4 fields for guaranteed alignment
+// Total 96 bytes (6 * 16)
 struct alignas(16) GPUMaterial {
-    glm::vec4 albedo;        // 16 bytes - Kd (diffuse color)
-    glm::vec4 emission;      // 16 bytes - Ke (emissive color)
-    glm::vec4 specular;      // 16 bytes - Ks (specular color)
-    uint32_t type;           // 4 bytes - material type enum
-    float metallic;          // 4 bytes - Metallic factor (PBR)
-    float roughness;         // 4 bytes - Roughness factor (PBR)
-    float ior;               // 4 bytes - index of refraction
-    float transmission;      // 4 bytes - Transmission factor
-    int albedoTextureIndex;  // 4 bytes - Texture index
-    int illum;               // 4 bytes - MTL illumination model
-    glm::vec2 albedoTextureSize; // 8 bytes
-    float padding[3];        // 12 bytes padding
-    // Total: 48 + 28 + 8 + 12 = 96 bytes
+    glm::vec4 albedo;        // 0-15: Kd (diffuse color)
+    glm::vec4 emission;      // 16-31: Ke (emissive color)
+    glm::vec4 specular;      // 32-47: Ks (specular color)
+    glm::vec4 params1;       // 48-63: type, metallic, roughness, ior
+    glm::vec4 params2;       // 64-79: transmission, albedoTextureIndex, illum, unused
+    glm::vec4 params3;       // 80-95: albedoTextureSize.xy, padding.xy
 };
 
 namespace ACG {

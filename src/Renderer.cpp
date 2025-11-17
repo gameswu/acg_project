@@ -282,12 +282,11 @@ namespace ACG {
             std::cout.flush();
             renderCommandList->SetComputeRootDescriptorTable(4, triMatHandle);
             
-            // Root parameter 5: Materials SRV table (index 4)
-            D3D12_GPU_DESCRIPTOR_HANDLE materialsHandle = m_srvUavHeap->GetGPUDescriptorHandleForHeapStart();
-            materialsHandle.ptr += m_srvIndex_Materials * m_srvUavDescriptorSize;
-            std::cout << "  Materials SRV (index " << m_srvIndex_Materials << ") ptr: " << materialsHandle.ptr << std::endl;
+            // Root parameter 5: Materials SRV (direct root descriptor)
+            D3D12_GPU_VIRTUAL_ADDRESS materialsAddress = m_materialBuffer->GetGPUVirtualAddress();
+            std::cout << "  Materials SRV (direct) address: " << materialsAddress << std::endl;
             std::cout.flush();
-            renderCommandList->SetComputeRootDescriptorTable(5, materialsHandle);
+            renderCommandList->SetComputeRootShaderResourceView(5, materialsAddress);
             
             // Root parameter 6: Textures SRV table (not used yet, bind dummy)
             D3D12_GPU_DESCRIPTOR_HANDLE texturesHandle = m_srvUavHeap->GetGPUDescriptorHandleForHeapStart();
@@ -366,6 +365,23 @@ namespace ACG {
 
             std::cout << "Starting progressive rendering loop..." << std::endl;
             
+            // Clear output texture before first sample to ensure clean start
+            D3D12_RECT clearRect = { 0, 0, (LONG)m_width, (LONG)m_height };
+            float clearColor[] = { 0.0f, 0.0f, 0.0f, 0.0f };
+            renderCommandList->ClearUnorderedAccessViewFloat(
+                m_srvUavHeap->GetGPUDescriptorHandleForHeapStart(),
+                CD3DX12_CPU_DESCRIPTOR_HANDLE(m_srvUavHeap->GetCPUDescriptorHandleForHeapStart(), m_uavIndex_Output, m_srvUavDescriptorSize),
+                m_outputTexture.Get(),
+                clearColor,
+                1, &clearRect
+            );
+            
+            // Barrier after clear
+            D3D12_RESOURCE_BARRIER initialBarrier = {};
+            initialBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+            initialBarrier.UAV.pResource = m_outputTexture.Get();
+            renderCommandList->ResourceBarrier(1, &initialBarrier);
+            
             // Reset accumulated samples counter
             m_accumulatedSamples = 0;
 
@@ -384,27 +400,8 @@ namespace ACG {
                     std::cout.flush();
                 }
                 
-                // Clear output texture before first sample to ensure clean start
-                if (sampleIdx == 0) {
-                    D3D12_RECT clearRect = { 0, 0, (LONG)m_width, (LONG)m_height };
-                    float clearColor[] = { 0.0f, 0.0f, 0.0f, 0.0f };
-                    renderCommandList->ClearUnorderedAccessViewFloat(
-                        m_srvUavHeap->GetGPUDescriptorHandleForHeapStart(),
-                        CD3DX12_CPU_DESCRIPTOR_HANDLE(m_srvUavHeap->GetCPUDescriptorHandleForHeapStart(), m_uavIndex_Output, m_srvUavDescriptorSize),
-                        m_outputTexture.Get(),
-                        clearColor,
-                        1, &clearRect
-                    );
-                    
-                    // Barrier after clear
-                    D3D12_RESOURCE_BARRIER uavBarrier = {};
-                    uavBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-                    uavBarrier.UAV.pResource = m_outputTexture.Get();
-                    renderCommandList->ResourceBarrier(1, &uavBarrier);
-                }
-                
-                // Update frameIndex for this sample (already set camera constants earlier)
-                // Just need to update frameIndex via root constants
+                // Update frameIndex for this sample
+                // frameIndex represents the number of samples already accumulated (0 for first sample)
                 uint32_t currentFrameIndex = static_cast<uint32_t>(sampleIdx);
                 // SetComputeRoot32BitConstants can update part of the constants
                 // frameIndex is at offset 32 (after two 4x4 matrices = 32 floats = 128 bytes)
@@ -934,7 +931,7 @@ namespace ACG {
         rootParameters[2].InitAsDescriptorTable(1, &ranges[2]); // Vertices (t1, space0)
         rootParameters[3].InitAsDescriptorTable(1, &ranges[3]); // Indices (t1, space1)
         rootParameters[4].InitAsDescriptorTable(1, &ranges[4]); // Triangle material indices (t1, space2)
-        rootParameters[5].InitAsDescriptorTable(1, &ranges[5]); // Materials (t2)
+        rootParameters[5].InitAsShaderResourceView(2); // Materials (t2) - ROOT DESCRIPTOR
         rootParameters[6].InitAsDescriptorTable(1, &ranges[6]); // Textures (t3)
         // Scene constants (b0): view and projection matrices
         rootParameters[7].InitAsConstants(sizeof(CameraConstants) / 4, 0);
@@ -985,53 +982,65 @@ namespace ACG {
         copyBarriers[1].UAV.pResource = nullptr;
         cmdList->ResourceBarrier(1, &copyBarriers[0]);
         
-        // For simplicity, we'll create a single BLAS for all geometry
-        // In production, you'd create one BLAS per mesh for better culling
-        
-        // Count total triangles
+        // Create a geometry descriptor for each mesh
+        // IMPORTANT: Since indices are already adjusted to global vertex indices in CreateShaderResources,
+        // all geometry descriptors must use the SAME vertex buffer start address (no offset)
+        std::vector<D3D12_RAYTRACING_GEOMETRY_DESC> geometryDescs;
+        UINT indexOffset = 0;
         UINT totalTriangles = 0;
+        UINT totalVertices = 0;
+
+        // Count total vertices first
         for (const auto& mesh : m_scene->GetMeshes()) {
-            totalTriangles += static_cast<UINT>(mesh->GetIndices().size() / 3);
+            totalVertices += static_cast<UINT>(mesh->GetVertices().size());
+        }
+
+        std::cout << "  Creating geometry descriptors for " << m_scene->GetMeshes().size() << " meshes:" << std::endl;
+        
+        for (size_t i = 0; i < m_scene->GetMeshes().size(); ++i) {
+            const auto& mesh = m_scene->GetMeshes()[i];
+            UINT meshIndexCount = static_cast<UINT>(mesh->GetIndices().size());
+            UINT meshTriangleCount = meshIndexCount / 3;
+
+            D3D12_RAYTRACING_GEOMETRY_DESC geometryDesc = {};
+            geometryDesc.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
+            geometryDesc.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_NONE;
+            
+            // CRITICAL: Use the SAME vertex buffer start for all geometries
+            // because indices are global (already offset by baseVertex in CreateShaderResources)
+            geometryDesc.Triangles.Transform3x4 = 0;
+            geometryDesc.Triangles.VertexBuffer.StartAddress = m_vertexBuffer->GetGPUVirtualAddress();
+            geometryDesc.Triangles.VertexBuffer.StrideInBytes = 48;
+            geometryDesc.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
+            geometryDesc.Triangles.VertexCount = totalVertices; // All vertices accessible
+            
+            // Index buffer with offset for this mesh
+            geometryDesc.Triangles.IndexBuffer = 
+                m_indexBuffer->GetGPUVirtualAddress() + (indexOffset * sizeof(uint32_t));
+            geometryDesc.Triangles.IndexFormat = DXGI_FORMAT_R32_UINT;
+            geometryDesc.Triangles.IndexCount = meshIndexCount;
+            
+            geometryDescs.push_back(geometryDesc);
+            
+            std::cout << "    Mesh " << i << ": " << meshTriangleCount << " triangles, "
+                      << meshIndexCount << " indices (IndexByteOffset: " << (indexOffset * sizeof(uint32_t)) << ")" << std::endl;
+            
+            indexOffset += meshIndexCount;
+            totalTriangles += meshTriangleCount;
         }
 
         try {
-            // Build Bottom Level AS (BLAS)
-            D3D12_RAYTRACING_GEOMETRY_DESC geometryDesc = {};
-            geometryDesc.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
-            geometryDesc.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
-            
-            // Vertex buffer view
-            geometryDesc.Triangles.VertexBuffer.StartAddress = m_vertexBuffer->GetGPUVirtualAddress();
-            geometryDesc.Triangles.VertexBuffer.StrideInBytes = 48; // sizeof(GPUVertex): 3*4 + 3*4 + 2*4 + 3*4 + 1*4 = 48
-            geometryDesc.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
-            
-            // Count vertices
-            UINT totalVertices = 0;
-            for (const auto& mesh : m_scene->GetMeshes()) {
-                totalVertices += static_cast<UINT>(mesh->GetVertices().size());
-            }
-            geometryDesc.Triangles.VertexCount = totalVertices;
-            
-            // Index buffer view
-            geometryDesc.Triangles.IndexBuffer = m_indexBuffer->GetGPUVirtualAddress();
-            geometryDesc.Triangles.IndexFormat = DXGI_FORMAT_R32_UINT;
-            geometryDesc.Triangles.IndexCount = totalTriangles * 3;
-            
-            std::cout << "  Geometry info:" << std::endl;
-            std::cout << "    Vertex buffer GPU address: " << geometryDesc.Triangles.VertexBuffer.StartAddress << std::endl;
-            std::cout << "    Vertex count: " << geometryDesc.Triangles.VertexCount << std::endl;
-            std::cout << "    Vertex stride: " << geometryDesc.Triangles.VertexBuffer.StrideInBytes << std::endl;
-            std::cout << "    Index buffer GPU address: " << geometryDesc.Triangles.IndexBuffer << std::endl;
-            std::cout << "    Index count: " << geometryDesc.Triangles.IndexCount << std::endl;
-            std::cout << "    Total triangles: " << totalTriangles << std::endl;
+            // Build Bottom Level AS (BLAS) with all geometry descriptors
+            std::cout << "  Total geometry: " << totalTriangles << " triangles, "
+                      << totalVertices << " vertices" << std::endl;
 
             // Get required sizes for BLAS
             D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS blasInputs = {};
             blasInputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
             blasInputs.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
-            blasInputs.NumDescs = 1;
+            blasInputs.NumDescs = static_cast<UINT>(geometryDescs.size());
             blasInputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
-            blasInputs.pGeometryDescs = &geometryDesc;
+            blasInputs.pGeometryDescs = geometryDescs.data();
 
             D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO blasPrebuildInfo = {};
             m_device->GetRaytracingAccelerationStructurePrebuildInfo(&blasInputs, &blasPrebuildInfo);
@@ -1086,8 +1095,12 @@ namespace ACG {
 
         // Build Top Level AS (TLAS)
         D3D12_RAYTRACING_INSTANCE_DESC instanceDesc = {};
-        // Identity transform
-        instanceDesc.Transform[0][0] = instanceDesc.Transform[1][1] = instanceDesc.Transform[2][2] = 1.0f;
+        // Identity transform (3x4 matrix in row-major)
+        // Initialize ALL elements to avoid garbage values
+        memset(&instanceDesc.Transform, 0, sizeof(instanceDesc.Transform));
+        instanceDesc.Transform[0][0] = 1.0f;
+        instanceDesc.Transform[1][1] = 1.0f;
+        instanceDesc.Transform[2][2] = 1.0f;
         instanceDesc.InstanceID = 0;
         instanceDesc.InstanceMask = 0xFF;
         instanceDesc.InstanceContributionToHitGroupIndex = 0;
@@ -1165,7 +1178,9 @@ namespace ACG {
 
         // Note: Do NOT close or execute here - caller will handle command list execution
 
-        std::cout << "Acceleration structures built: " << totalTriangles << " triangles, "
+        std::cout << "Acceleration structures built successfully with " 
+                  << geometryDescs.size() << " geometry descriptors, "
+                  << totalTriangles << " triangles, "
                   << totalVertices << " vertices" << std::endl;
         } catch (const std::exception& e) {
             std::cerr << "Failed to create acceleration structures: " << e.what() << std::endl;
@@ -1262,7 +1277,12 @@ namespace ACG {
             // Add a default material if none are loaded
             GPUMaterial mat = {};
             mat.albedo = glm::vec4(0.8f, 0.8f, 0.8f, 1.0f);
-            mat.type = 0; // Diffuse
+            mat.emission = glm::vec4(0.0f, 0.0f, 0.0f, 1.0f);
+            mat.specular = glm::vec4(0.0f, 0.0f, 0.0f, 1.0f);
+            uint32_t type = 0; // Diffuse
+            mat.params1 = glm::vec4(*reinterpret_cast<float*>(&type), 0.0f, 0.5f, 1.5f);
+            mat.params2 = glm::vec4(0.0f, 0.0f, 0.0f, 0.0f);
+            mat.params3 = glm::vec4(0.0f, 0.0f, 0.0f, 0.0f);
             materialsCPU.push_back(mat);
         } else {
             for (const auto& m : m_scene->GetMaterials()) {
@@ -1276,33 +1296,45 @@ namespace ACG {
                 glm::vec3 spec = m->GetSpecular();
                 mat.specular = glm::vec4(spec.x, spec.y, spec.z, 1.0f);
                 
-                mat.type = static_cast<uint32_t>(m->GetType());
-                mat.metallic = m->GetMetallic();
-                mat.roughness = m->GetRoughness();
-                mat.ior = m->GetIOR();
-                mat.transmission = m->GetTransmission();
-                mat.albedoTextureIndex = -1;
-                mat.illum = m->GetIllum();
-                mat.albedoTextureSize = glm::vec2(0.0f, 0.0f);
-                mat.padding[0] = mat.padding[1] = mat.padding[2] = 0.0f;
+                // Pack scalar parameters into vec4s
+                uint32_t materialType = static_cast<uint32_t>(m->GetType());
+                mat.params1 = glm::vec4(
+                    *reinterpret_cast<float*>(&materialType),  // type as float bits
+                    m->GetMetallic(),
+                    m->GetRoughness(),
+                    m->GetIOR()
+                );
+                
+                int texIdx = -1;
+                int illum = m->GetIllum();
+                mat.params2 = glm::vec4(
+                    m->GetTransmission(),
+                    *reinterpret_cast<float*>(&texIdx),  // albedoTextureIndex as float bits
+                    *reinterpret_cast<float*>(&illum),  // illum as float bits
+                    0.0f
+                );
+                
+                mat.params3 = glm::vec4(0.0f, 0.0f, 0.0f, 0.0f);  // albedoTextureSize + padding
+                
                 materialsCPU.push_back(mat);
                 
                 // DEBUG: Print material data
                 std::cout << "  Material[" << materialsCPU.size()-1 << "]: albedo=(" << mat.albedo.x << "," << mat.albedo.y << "," << mat.albedo.z 
                          << "), emission=(" << mat.emission.x << "," << mat.emission.y << "," << mat.emission.z
-                         << "), type=" << mat.type << std::endl;
+                         << "), type=" << static_cast<int>(m->GetType()) << std::endl;
             }
         }
 
         size_t materialBufferSize = sizeof(GPUMaterial) * materialsCPU.size();
         std::cout << "Creating material buffer: " << materialsCPU.size() << " materials, " 
                   << materialBufferSize << " bytes total, " << sizeof(GPUMaterial) << " bytes per material." << std::endl;
-        std::cout << "  GPUMaterial structure offsets:" << std::endl;
+        std::cout << "  GPUMaterial structure (vec4 only):" << std::endl;
         std::cout << "    albedo offset: " << offsetof(GPUMaterial, albedo) << std::endl;
         std::cout << "    emission offset: " << offsetof(GPUMaterial, emission) << std::endl;
         std::cout << "    specular offset: " << offsetof(GPUMaterial, specular) << std::endl;
-        std::cout << "    type offset: " << offsetof(GPUMaterial, type) << std::endl;
-        std::cout << "    padding offset: " << offsetof(GPUMaterial, padding) << std::endl;
+        std::cout << "    params1 offset: " << offsetof(GPUMaterial, params1) << std::endl;
+        std::cout << "    params2 offset: " << offsetof(GPUMaterial, params2) << std::endl;
+        std::cout << "    params3 offset: " << offsetof(GPUMaterial, params3) << std::endl;
         std::cout << "  First material albedo in CPU buffer: (" << materialsCPU[0].albedo.x << "," 
                  << materialsCPU[0].albedo.y << "," << materialsCPU[0].albedo.z << "," << materialsCPU[0].albedo.w << ")" << std::endl;
         if (materialBufferSize > 0) {
@@ -1383,21 +1415,21 @@ namespace ACG {
         D3D12_CPU_DESCRIPTOR_HANDLE srvTriMatHandle = { srvHandle.ptr + m_srvUavDescriptorSize * srvIndex_TriangleMaterials };
         m_device->CreateShaderResourceView(m_triangleMaterialBuffer.Get(), &srvTriMatDesc, srvTriMatHandle);
 
-        // Create SRV for materials (use RAW buffer for ByteAddressBuffer access)
+        // Create SRV for materials (structured buffer)
         m_srvIndex_Materials = 4;
         if (!m_materialBuffer) {
             std::cout << "  ERROR: Material buffer is null, cannot create SRV!" << std::endl;
         } else {
             D3D12_SHADER_RESOURCE_VIEW_DESC srvMatDesc = {};
             srvMatDesc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
-            srvMatDesc.Format = DXGI_FORMAT_R32_TYPELESS;  // Raw buffer format
+            srvMatDesc.Format = DXGI_FORMAT_UNKNOWN;  // Structured buffer
             srvMatDesc.Buffer.FirstElement = 0;
             srvMatDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-            srvMatDesc.Buffer.NumElements = static_cast<UINT>(materialBufferSize / 4);  // Number of DWORDs
-            srvMatDesc.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;  // Enable RAW access
+            srvMatDesc.Buffer.NumElements = static_cast<UINT>(materialsCPU.size());  // Number of materials
+            srvMatDesc.Buffer.StructureByteStride = sizeof(GPUMaterial);  // 96 bytes per material
             D3D12_CPU_DESCRIPTOR_HANDLE srvMatHandle = { srvHandle.ptr + m_srvUavDescriptorSize * m_srvIndex_Materials };
             m_device->CreateShaderResourceView(m_materialBuffer.Get(), &srvMatDesc, srvMatHandle);
-            std::cout << "  Material SRV created as RAW buffer: " << (materialBufferSize / 4) << " DWORDs" << std::endl;
+            std::cout << "  Material SRV created as StructuredBuffer: " << materialsCPU.size() << " materials, stride=" << sizeof(GPUMaterial) << " bytes" << std::endl;
         }
 
         // Transition output texture to UAV state

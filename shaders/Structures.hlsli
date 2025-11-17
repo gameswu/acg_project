@@ -10,21 +10,26 @@ struct Vertex {
     float _pad;       // 4 bytes padding -> total 48 bytes (aligned to 16)
 };
 
-// Use tight packing to match C++ structure layout exactly
+// Simplified Material structure - only float4 fields to avoid alignment issues
+// This matches C++ GPUMaterial but forces 16-byte alignment for all fields
 struct Material {
     float4 albedo;              // 0-15: 16 bytes
     float4 emission;            // 16-31: 16 bytes
     float4 specular;            // 32-47: 16 bytes
-    uint type;                  // 48-51: 4 bytes
-    float metallic;             // 52-55: 4 bytes
-    float roughness;            // 56-59: 4 bytes
-    float ior;                  // 60-63: 4 bytes
-    float transmission;         // 64-67: 4 bytes
-    int albedoTextureIndex;     // 68-71: 4 bytes
-    int illum;                  // 72-75: 4 bytes
-    float2 albedoTextureSize;   // 76-83: 8 bytes
-    float3 padding;             // 84-95: 12 bytes
-    // Total: 96 bytes - matches C++ GPUMaterial exactly
+    float4 params1;             // 48-63: type, metallic, roughness, ior
+    float4 params2;             // 64-79: transmission, albedoTextureIndex, illum, (unused)
+    float4 params3;             // 80-95: albedoTextureSize.xy, padding.xy
+    // Total: 96 bytes (6 * 16) - guaranteed aligned
+    
+    // Helper accessors
+    uint GetType() { return asuint(params1.x); }
+    float GetMetallic() { return params1.y; }
+    float GetRoughness() { return params1.z; }
+    float GetIOR() { return params1.w; }
+    float GetTransmission() { return params2.x; }
+    int GetAlbedoTextureIndex() { return asint(params2.y); }
+    int GetIllum() { return asint(params2.z); }
+    float2 GetAlbedoTextureSize() { return params3.xy; }
 };
 
 struct Light {
