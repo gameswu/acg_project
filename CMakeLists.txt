@@ -48,7 +48,7 @@ target_include_directories(${PROJECT_NAME} PRIVATE ${Stb_INCLUDE_DIR})
 # 链接 Windows SDK 提供的 DirectX 库
 # 这些库由 Windows SDK 自动提供，无需通过 vcpkg 安装
 target_link_libraries(${PROJECT_NAME} PRIVATE
-    d3d11.lib      # Direct3D 11
+    d3d12.lib      # Direct3D 12
     dxgi.lib       # DirectX Graphics Infrastructure
     d3dcompiler.lib # 着色器编译器
     dxguid.lib     # DirectX GUIDs
@@ -71,6 +71,26 @@ add_custom_command(TARGET ${PROJECT_NAME} PRE_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory
     ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/shaders
 )
+
+# 复制 DXC 编译器 DLL 到 bin 目录
+# DXC 位于 Windows SDK 中
+set(WINDOWS_SDK_BIN_PATH "C:/Program Files (x86)/Windows Kits/10/bin/10.0.26100.0/x64")
+if(EXISTS "${WINDOWS_SDK_BIN_PATH}/dxcompiler.dll")
+    add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${WINDOWS_SDK_BIN_PATH}/dxcompiler.dll"
+        ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/dxcompiler.dll
+        COMMENT "Copying dxcompiler.dll from Windows SDK"
+    )
+    add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${WINDOWS_SDK_BIN_PATH}/dxil.dll"
+        ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/dxil.dll
+        COMMENT "Copying dxil.dll from Windows SDK"
+    )
+else()
+    message(WARNING "DXC DLLs not found at ${WINDOWS_SDK_BIN_PATH}, you may need to copy them manually")
+endif()
 
 # 设置Visual Studio的源文件组织
 source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR}/src PREFIX "Source Files" FILES ${SRC_FILES})

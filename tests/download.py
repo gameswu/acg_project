@@ -77,16 +77,20 @@ def unzip_file(zip_path, extract_to):
 if __name__ == "__main__":
     # Casual Effects archive sometimes rejects plain python user agents.
     urls = [
-        "https://casual-effects.com/g3d/data10/common/model/CornellBox/CornellBox.zip",
-        "https://casual-effects.com/g3d/data10/research/model/breakfast_room/breakfast_room.zip",
-        "https://casual-effects.com/g3d/data10/research/model/conference/conference.zip",
+        "https://casual-effects.com/g3d/data10/common/model/CornellBox/CornellBox.zip", # Basic test scene
+        "https://casual-effects.com/g3d/data10/research/model/breakfast_room/breakfast_room.zip", # Texture test
+        "https://casual-effects.com/g3d/data10/common/model/crytek_sponza/sponza.zip", # Large scene
+        "https://casual-effects.com/g3d/data10/research/model/lpshead/lpshead.zip", # Head model
+        "https://casual-effects.com/g3d/data10/research/model/hairball/hairball.zip" # Hair model
     ]
     dest_folder = "tests/scenes"
 
     extract_paths = [
         Path(dest_folder) / "CornellBox",
         Path(dest_folder) / "breakfast_room",
-        Path(dest_folder) / "conference",
+        Path(dest_folder) / "sponza",
+        Path(dest_folder) / "lpshead",
+        Path(dest_folder) / "hairball"
     ]
     for url, extract_path in zip(urls, extract_paths):
         try:

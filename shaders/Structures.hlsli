@@ -3,21 +3,28 @@
 #define STRUCTURES_HLSLI
 
 struct Vertex {
-    float3 position;
-    float3 normal;
-    float2 texCoord;
-    float3 tangent;
+    float3 position;  // 12 bytes
+    float3 normal;    // 12 bytes
+    float2 texCoord;  // 8 bytes
+    float3 tangent;   // 12 bytes
+    float _pad;       // 4 bytes padding -> total 48 bytes (aligned to 16)
 };
 
+// Use tight packing to match C++ structure layout exactly
 struct Material {
-    uint type;          // 0=Diffuse, 1=Specular, 2=Transmissive, 3=PrincipledBSDF, 4=Emissive
-    float albedo[3];
-    float emission[3];
-    float metallic;
-    float roughness;
-    float ior;
-    float transmission;
-    uint padding[1];
+    float4 albedo;              // 0-15: 16 bytes
+    float4 emission;            // 16-31: 16 bytes
+    float4 specular;            // 32-47: 16 bytes
+    uint type;                  // 48-51: 4 bytes
+    float metallic;             // 52-55: 4 bytes
+    float roughness;            // 56-59: 4 bytes
+    float ior;                  // 60-63: 4 bytes
+    float transmission;         // 64-67: 4 bytes
+    int albedoTextureIndex;     // 68-71: 4 bytes
+    int illum;                  // 72-75: 4 bytes
+    float2 albedoTextureSize;   // 76-83: 8 bytes
+    float3 padding;             // 84-95: 12 bytes
+    // Total: 96 bytes - matches C++ GPUMaterial exactly
 };
 
 struct Light {
@@ -46,6 +53,9 @@ struct Triangle {
     float3 n0; float _pad_n0;
     float3 n1; float _pad_n1;
     float3 n2; float _pad_n2;
+    float2 t0; float2 _pad_t0;
+    float2 t1; float2 _pad_t1;
+    float2 t2; float2 _pad_t2;
     uint materialIndex;
     uint _pad_mat[3];
 };

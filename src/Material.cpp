@@ -8,9 +8,11 @@ Material::Material()
     : m_type(MaterialType::Diffuse)
     , m_albedo(0.8f, 0.8f, 0.8f)
     , m_emission(0.0f, 0.0f, 0.0f)
+    , m_specular(0.0f, 0.0f, 0.0f)
+    , m_illum(2)
     , m_metallic(0.0f)
     , m_roughness(0.5f)
-    , m_ior(1.5f)
+    , m_ior(1.45f)
     , m_transmission(0.0f)
     , m_subsurfaceRadius(0.0f)
     , m_subsurfaceColor(1.0f)
@@ -20,14 +22,21 @@ Material::Material()
 Material::~Material() {
 }
 
-glm::vec3 Material::Evaluate(const glm::vec3& wo, const glm::vec3& wi, const glm::vec3& normal) const {
+glm::vec3 Material::Evaluate(const glm::vec3& wo, const glm::vec3& wi, const glm::vec3& normal, const glm::vec2& texCoord) const {
+    // Get albedo (with texture if available)
+    glm::vec3 albedo = m_albedo;
+    if (m_albedoTexture) {
+        glm::vec4 texColor = m_albedoTexture->SampleBilinear(texCoord.x, texCoord.y);
+        albedo = glm::vec3(texColor.r, texColor.g, texColor.b);
+    }
+    
     float NdotL = std::max(0.0f, glm::dot(normal, wi));
     float NdotV = std::max(0.0f, glm::dot(normal, wo));
     
     switch (m_type) {
         case MaterialType::Diffuse: {
             // Lambertian BRDF
-            return m_albedo / glm::pi<float>();
+            return albedo / glm::pi<float>();
         }
         
         case MaterialType::Specular: {
@@ -36,21 +45,28 @@ glm::vec3 Material::Evaluate(const glm::vec3& wo, const glm::vec3& wi, const glm
             float NdotH = std::max(0.0f, glm::dot(normal, h));
             float VdotH = std::max(0.0f, glm::dot(wo, h));
             
+            // Get roughness (with texture if available)
+            float roughness = m_roughness;
+            if (m_roughnessTexture) {
+                glm::vec4 texRoughness = m_roughnessTexture->SampleBilinear(texCoord.x, texCoord.y);
+                roughness = texRoughness.r;
+            }
+            
             // GGX normal distribution
-            float alpha = m_roughness * m_roughness;
+            float alpha = roughness * roughness;
             float alpha2 = alpha * alpha;
             float NdotH2 = NdotH * NdotH;
             float denom = NdotH2 * (alpha2 - 1.0f) + 1.0f;
             float D = alpha2 / (glm::pi<float>() * denom * denom);
             
             // Schlick-GGX geometry
-            float k = (m_roughness + 1.0f) * (m_roughness + 1.0f) / 8.0f;
+            float k = (roughness + 1.0f) * (roughness + 1.0f) / 8.0f;
             float G1_V = NdotV / (NdotV * (1.0f - k) + k);
             float G1_L = NdotL / (NdotL * (1.0f - k) + k);
             float G = G1_V * G1_L;
             
             // Fresnel (Schlick approximation)
-            glm::vec3 F0 = glm::mix(glm::vec3(0.04f), m_albedo, m_metallic);
+            glm::vec3 F0 = glm::mix(glm::vec3(0.04f), albedo, m_metallic);
             glm::vec3 F = F0 + (glm::vec3(1.0f) - F0) * std::pow(1.0f - VdotH, 5.0f);
             
             // Specular BRDF
@@ -58,7 +74,7 @@ glm::vec3 Material::Evaluate(const glm::vec3& wo, const glm::vec3& wi, const glm
             
             // Diffuse component for non-metallic
             glm::vec3 kD = (glm::vec3(1.0f) - F) * (1.0f - m_metallic);
-            glm::vec3 diffuse = kD * m_albedo / glm::pi<float>();
+            glm::vec3 diffuse = kD * albedo / glm::pi<float>();
             
             return diffuse + specular;
         }
@@ -75,9 +91,9 @@ glm::vec3 Material::Evaluate(const glm::vec3& wo, const glm::vec3& wi, const glm
             // Reflection or refraction
             bool isReflection = glm::dot(wi, normal) > 0.0f;
             if (isReflection) {
-                return glm::vec3(F) * m_albedo;
+                return glm::vec3(F) * albedo;
             } else {
-                return glm::vec3(1.0f - F) * m_albedo;
+                return glm::vec3(1.0f - F) * albedo;
             }
         }
         
@@ -85,8 +101,13 @@ glm::vec3 Material::Evaluate(const glm::vec3& wo, const glm::vec3& wi, const glm
             return m_emission;
         
         default:
-            return m_albedo / glm::pi<float>();
+            return albedo / glm::pi<float>();
     }
+}
+
+glm::vec3 Material::Evaluate(const glm::vec3& wo, const glm::vec3& wi, const glm::vec3& normal) const {
+    // Call the texture version with a dummy UV coordinate
+    return Evaluate(wo, wi, normal, glm::vec2(0.0f));
 }
 
 glm::vec3 Material::Sample(const glm::vec3& wo, const glm::vec3& normal, glm::vec3& wi, float& pdf) const {

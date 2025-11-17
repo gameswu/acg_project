@@ -65,6 +65,7 @@ public:
     int GetHeight() const { return m_height; }
     int GetChannels() const { return m_channels; }
     int GetMipLevels() const { return static_cast<int>(m_mipLevels.size()); }
+    const unsigned char* GetRawData() const { return m_mipLevels.empty() ? nullptr : m_mipLevels[0].data.data(); }
     
     // Settings
     void SetFilter(TextureFilter filter) { m_filter = filter; }

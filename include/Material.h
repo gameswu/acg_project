@@ -37,8 +37,12 @@ public:
     // Color properties
     void SetAlbedo(const glm::vec3& albedo) { m_albedo = albedo; }
     void SetEmission(const glm::vec3& emission) { m_emission = emission; }
+    void SetSpecular(const glm::vec3& specular) { m_specular = specular; }
+    void SetIllum(int illum) { m_illum = illum; }
     glm::vec3 GetAlbedo() const { return m_albedo; }
     glm::vec3 GetEmission() const { return m_emission; }
+    glm::vec3 GetSpecular() const { return m_specular; }
+    int GetIllum() const { return m_illum; }
     
     // Physical properties
     void SetMetallic(float metallic) { m_metallic = metallic; }
@@ -60,8 +64,11 @@ public:
     void SetRoughnessTexture(std::shared_ptr<Texture> texture) { m_roughnessTexture = texture; }
     void SetMetallicTexture(std::shared_ptr<Texture> texture) { m_metallicTexture = texture; }
     
+    std::shared_ptr<Texture> GetAlbedoTexture() const { return m_albedoTexture; }
+    
     // Evaluate material
     virtual glm::vec3 Evaluate(const glm::vec3& wo, const glm::vec3& wi, const glm::vec3& normal) const;
+    virtual glm::vec3 Evaluate(const glm::vec3& wo, const glm::vec3& wi, const glm::vec3& normal, const glm::vec2& texCoord) const;
     virtual glm::vec3 Sample(const glm::vec3& wo, const glm::vec3& normal, glm::vec3& wi, float& pdf) const;
     virtual float PDF(const glm::vec3& wo, const glm::vec3& wi, const glm::vec3& normal) const;
 
@@ -71,6 +78,8 @@ protected:
     // Base color
     glm::vec3 m_albedo;
     glm::vec3 m_emission;
+    glm::vec3 m_specular;
+    int m_illum;
     
     // PBR parameters
     float m_metallic;

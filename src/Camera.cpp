@@ -1,18 +1,21 @@
 #include "Camera.h"
 #include <glm/gtc/constants.hpp>
+#include <glm/gtc/matrix_transform.hpp>
 
 namespace ACG {
 
 Camera::Camera() 
-    : m_position(0.0f, 0.0f, 5.0f)
+    : m_position(0.0f, 1.0f, 3.0f)
+    , m_target(0.0f, 1.0f, 0.0f)  // Look toward center of scene
     , m_direction(0.0f, 0.0f, -1.0f)
     , m_right(1.0f, 0.0f, 0.0f)
     , m_up(0.0f, 1.0f, 0.0f)
-    , m_fov(45.0f)
+    , m_fov(60.0f)
     , m_aspectRatio(16.0f / 9.0f)
     , m_aperture(0.0f)
     , m_focusDistance(5.0f)
 {
+    SetTarget(m_target);
 }
 
 Camera::~Camera() {
@@ -23,6 +26,7 @@ void Camera::SetPosition(const glm::vec3& position) {
 }
 
 void Camera::SetTarget(const glm::vec3& target) {
+    m_target = target;
     m_direction = glm::normalize(target - m_position);
     UpdateVectors();
 }
@@ -46,6 +50,10 @@ void Camera::SetAperture(float aperture) {
 
 void Camera::SetFocusDistance(float distance) {
     m_focusDistance = distance;
+}
+
+glm::mat4 Camera::GetProjectionMatrix() const {
+    return glm::perspective(glm::radians(m_fov), m_aspectRatio, 0.1f, 100.0f);
 }
 
 void Camera::GenerateRay(float u, float v, glm::vec3& origin, glm::vec3& direction) const {

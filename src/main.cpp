@@ -1,484 +1,693 @@
-#include <iostream>
-#include <fstream>
+#define WIN32_LEAN_AND_MEAN
+#define UNICODE
+#include <Windows.h>
+#include <stdexcept>
 #include <vector>
 #include <string>
-#include <filesystem>
-#include <iomanip>
+#include <fstream>
 #include <chrono>
-#include <Windows.h>
-#include <Commdlg.h>
-#include <d3d11.h>
-#include <dxgi.h>
-#include <imgui.h>
-#include <imgui_impl_win32.h>
-#include <imgui_impl_dx11.h>
+#include <ctime>
+#include <codecvt>
+#include <locale>
+#include <thread>
+#include <atomic>
+#include <mutex>
+#include <memory>
 #include "Renderer.h"
-#include "Scene.h"
 #include "Camera.h"
-#include "GUI.h"
+#include "Scene.h"
 #include "LogRedirector.h"
+#include "imgui.h"
+#include "imgui_impl_win32.h"
+#include "imgui_impl_dx12.h"
+#include <glm/glm.hpp>
+#include <commdlg.h>
 
-using namespace ACG;
-namespace fs = std::filesystem;
+// Global variable for executable directory
+std::string g_exeDirectory;
+static HWND g_hwnd = nullptr;
 
-// Forward declare Win32 message handler from imgui_impl_win32.cpp
+// Async rendering state
+static std::atomic<bool> g_isRendering(false);
+static std::atomic<bool> g_renderComplete(false);
+static std::string g_renderResultMessage;
+static std::mutex g_renderMutex;
+static std::unique_ptr<std::thread> g_renderThread;
+
+// 文件对话框辅助函数
+std::string OpenFileDialog(HWND hwnd, const char* filter, const char* title) {
+    char filename[MAX_PATH] = "";
+    OPENFILENAMEA ofn = {};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = hwnd;
+    ofn.lpstrFilter = filter;
+    ofn.lpstrFile = filename;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrTitle = title;
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+    
+    if (GetOpenFileNameA(&ofn)) {
+        return std::string(filename);
+    }
+    return "";
+}
+
+std::string SaveFileDialog(HWND hwnd, const char* filter, const char* title) {
+    char filename[MAX_PATH] = "";
+    OPENFILENAMEA ofn = {};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = hwnd;
+    ofn.lpstrFilter = filter;
+    ofn.lpstrFile = filename;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrTitle = title;
+    ofn.Flags = OFN_OVERWRITEPROMPT;
+    
+    if (GetSaveFileNameA(&ofn)) {
+        return std::string(filename);
+    }
+    return "";
+}
+
+// Forward declare the renderer pointer
+ACG::Renderer* g_pRenderer = nullptr;
+bool g_ImGuiInitialized = false;
+
+// Scene loading tracking
+std::string g_lastLoadedScene;
+
+// 日志系统
+std::vector<std::string> g_logMessages;
+std::ofstream g_logFile;
+ACG::LogRedirector* g_coutRedirector = nullptr;
+ACG::LogRedirector* g_cerrRedirector = nullptr;
+
+void AddLogMessage(const std::string& msg) {
+    g_logMessages.push_back(msg);
+    if (g_logFile.is_open()) {
+        auto now = std::chrono::system_clock::now();
+        auto time_t = std::chrono::system_clock::to_time_t(now);
+        char timeStr[100];
+        strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", std::localtime(&time_t));
+        g_logFile << "[" << timeStr << "] " << msg << std::endl;
+        g_logFile.flush();
+    }
+}
+
+// Forward declarations
+void RenderGUI(ACG::Renderer* renderer);
+
+// Forward declare message handler from imgui_impl_win32.cpp
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
-static bool SavePPM(const std::string& filename, int width, int height, const unsigned char* rgba)
-{
-    std::ofstream ofs(filename, std::ios::binary);
-    if (!ofs) return false;
-    ofs << "P6\n" << width << " " << height << "\n255\n";
-    // Convert RGBA to RGB while writing
-    for (int y = 0; y < height; ++y) {
-        for (int x = 0; x < width; ++x) {
-            const unsigned char* p = &rgba[(y * width + x) * 4];
-            ofs.put(static_cast<char>(p[0]));
-            ofs.put(static_cast<char>(p[1]));
-            ofs.put(static_cast<char>(p[2]));
-        }
-    }
-    return true;
-}
-
-// Global state for window procedure
-static GUI* g_gui = nullptr;
-static bool g_running = true;
-
-// Win32 window procedure
-LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
-{
-    if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam))
+LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    // Handle ImGui events first (only if initialized)
+    if (g_ImGuiInitialized && ImGui_ImplWin32_WndProcHandler(hwnd, uMsg, wParam, lParam))
         return true;
+        
+    switch (uMsg) {
+        case WM_CREATE:
+        {
+            // Store the renderer pointer passed from CreateWindowEx
+            LPCREATESTRUCT pCreateStruct = reinterpret_cast<LPCREATESTRUCT>(lParam);
+            SetWindowLongPtr(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(pCreateStruct->lpCreateParams));
+            g_pRenderer = reinterpret_cast<ACG::Renderer*>(pCreateStruct->lpCreateParams);
+        }
+        return 0;
 
-    switch (msg)
-    {
-    case WM_DESTROY:
-        g_running = false;
-        PostQuitMessage(0);
-        return 0;
-    case WM_CLOSE:
-        g_running = false;
-        return 0;
+        case WM_DESTROY:
+            PostQuitMessage(0);
+            return 0;
+        
+        case WM_SIZE:
+            if (g_pRenderer && wParam != SIZE_MINIMIZED) {
+                g_pRenderer->OnResize(LOWORD(lParam), HIWORD(lParam));
+            }
+            return 0;
     }
-    return DefWindowProcW(hWnd, msg, wParam, lParam);
+    return DefWindowProc(hwnd, uMsg, wParam, lParam);
 }
 
-int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow)
-{
-    std::cout << "=== ACG Path Tracing Renderer ===" << std::endl;
-    std::cout << "Advanced Computer Graphics Project - Fall 2025" << std::endl;
-    std::cout << std::endl;
+int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
+    // Get executable directory for default output path
+    wchar_t exePath[MAX_PATH];
+    GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+    std::wstring exePathWStr(exePath);
+    size_t lastSlash = exePathWStr.find_last_of(L"\\/");
+    std::wstring exeDirWStr = exePathWStr.substr(0, lastSlash);
+    
+    // Convert to UTF-8 string
+    int sizeNeeded = WideCharToMultiByte(CP_UTF8, 0, exeDirWStr.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    std::string exeDirStr(sizeNeeded, 0);
+    WideCharToMultiByte(CP_UTF8, 0, exeDirWStr.c_str(), -1, &exeDirStr[0], sizeNeeded, nullptr, nullptr);
+    exeDirStr.pop_back(); // Remove null terminator
+    g_exeDirectory = exeDirStr;
+    
+    const wchar_t CLASS_NAME[] = L"ACG DXR Window Class";
 
-    // Create window class
-    WNDCLASSEXW wc = {};
-    wc.cbSize = sizeof(WNDCLASSEXW);
-    wc.style = CS_CLASSDC;
-    wc.lpfnWndProc = WndProc;
+    WNDCLASS wc = {};
+    wc.lpfnWndProc = WindowProc;
     wc.hInstance = hInstance;
+    wc.lpszClassName = CLASS_NAME;
+    wc.style = CS_HREDRAW | CS_VREDRAW;
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-    wc.lpszClassName = L"ACGPathTracer";
-    RegisterClassExW(&wc);
 
-    // Create window
-    const int windowWidth = 1280;
-    const int windowHeight = 720;
-    HWND hwnd = CreateWindowW(
-        wc.lpszClassName,
-        L"ACG Path Tracer",
+    if (!RegisterClass(&wc)) {
+        MessageBox(nullptr, L"Window Registration Failed!", L"Error", MB_ICONEXCLAMATION | MB_OK);
+        return 0;
+    }
+
+    ACG::Renderer renderer(1280, 720);
+
+    RECT windowRect = { 0, 0, 1280, 720 };
+    AdjustWindowRect(&windowRect, WS_OVERLAPPEDWINDOW, FALSE);
+
+    HWND hwnd = CreateWindowEx(
+        0,
+        CLASS_NAME,
+        L"ACG Project - DirectX 12",
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT,
-        windowWidth, windowHeight,
-        NULL, NULL,
+        windowRect.right - windowRect.left,
+        windowRect.bottom - windowRect.top,
+        nullptr,
+        nullptr,
         hInstance,
-        NULL
+        &renderer
     );
 
-    if (!hwnd) {
-        std::cerr << "Failed to create window!" << std::endl;
-        UnregisterClassW(wc.lpszClassName, hInstance);
-        return 1;
+    if (hwnd == nullptr) {
+        MessageBox(nullptr, L"Window Creation Failed!", L"Error", MB_ICONEXCLAMATION | MB_OK);
+        return 0;
     }
 
-    ShowWindow(hwnd, SW_SHOW);
-    UpdateWindow(hwnd);
-
-    std::cout << "Window created successfully" << std::endl;
-
-    // Initialize renderer
-    std::cout << "Initializing renderer..." << std::endl;
-    Renderer renderer;
-    if (!renderer.Initialize(windowWidth, windowHeight)) {
-        std::cerr << "Failed to initialize renderer!" << std::endl;
-        DestroyWindow(hwnd);
-        UnregisterClassW(wc.lpszClassName, hInstance);
-        return 1;
-    }
-
-    // Get D3D11 device and context from renderer
-    std::cout << "Getting D3D11 device and context..." << std::endl;
-    ID3D11Device* device = renderer.GetDevice();
-    ID3D11DeviceContext* context = renderer.GetContext();
-
-    if (!device || !context) {
-        std::cerr << "Failed to get D3D11 device or context!" << std::endl;
-        DestroyWindow(hwnd);
-        UnregisterClassW(wc.lpszClassName, hInstance);
-        std::cout << "Press Enter to exit..." << std::endl;
-        std::cin.get();
-        return 1;
-    }
-
-    // Create swap chain for window display
-    std::cout << "Creating swap chain for GUI..." << std::endl;
-    DXGI_SWAP_CHAIN_DESC swapChainDesc = {};
-    swapChainDesc.BufferCount = 2;
-    swapChainDesc.BufferDesc.Width = windowWidth;
-    swapChainDesc.BufferDesc.Height = windowHeight;
-    swapChainDesc.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    swapChainDesc.BufferDesc.RefreshRate.Numerator = 60;
-    swapChainDesc.BufferDesc.RefreshRate.Denominator = 1;
-    swapChainDesc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    swapChainDesc.OutputWindow = hwnd;
-    swapChainDesc.SampleDesc.Count = 1;
-    swapChainDesc.SampleDesc.Quality = 0;
-    swapChainDesc.Windowed = TRUE;
-    swapChainDesc.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
-
-    IDXGISwapChain* swapChain = nullptr;
-    IDXGIDevice* dxgiDevice = nullptr;
-    IDXGIAdapter* dxgiAdapter = nullptr;
-    IDXGIFactory* dxgiFactory = nullptr;
-
-    HRESULT hr = device->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxgiDevice);
-    if (SUCCEEDED(hr)) {
-        hr = dxgiDevice->GetAdapter(&dxgiAdapter);
-        if (SUCCEEDED(hr)) {
-            hr = dxgiAdapter->GetParent(__uuidof(IDXGIFactory), (void**)&dxgiFactory);
-            if (SUCCEEDED(hr)) {
-                hr = dxgiFactory->CreateSwapChain(device, &swapChainDesc, &swapChain);
-                dxgiFactory->Release();
-            }
-            dxgiAdapter->Release();
+    try {
+        // 打开日志文件
+        g_logFile.open("renderer.log", std::ios::out | std::ios::trunc);
+        if (g_logFile.is_open()) {
+            AddLogMessage("Log file opened successfully");
         }
-        dxgiDevice->Release();
-    }
-
-    if (!swapChain) {
-        std::cerr << "Failed to create swap chain!" << std::endl;
-        DestroyWindow(hwnd);
-        UnregisterClassW(wc.lpszClassName, hInstance);
-        return 1;
-    }
-
-    // Create render target view from swap chain back buffer
-    ID3D11Texture2D* backBuffer = nullptr;
-    ID3D11RenderTargetView* renderTargetView = nullptr;
-    hr = swapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&backBuffer);
-    if (SUCCEEDED(hr)) {
-        hr = device->CreateRenderTargetView(backBuffer, nullptr, &renderTargetView);
-        backBuffer->Release();
-    }
-
-    if (!renderTargetView) {
-        std::cerr << "Failed to create render target view!" << std::endl;
-        swapChain->Release();
-        DestroyWindow(hwnd);
-        UnregisterClassW(wc.lpszClassName, hInstance);
-        return 1;
-    }
-
-    std::cout << "Swap chain and render target created successfully" << std::endl;
-
-    // Initialize GUI
-    std::cout << "Initializing GUI..." << std::endl;
-    GUI gui;
-    g_gui = &gui;
-    if (!gui.Initialize(hwnd, device, context)) {
-        std::cerr << "Failed to initialize GUI!" << std::endl;
-        DestroyWindow(hwnd);
-        UnregisterClassW(wc.lpszClassName, hInstance);
-        std::cout << "Press Enter to exit..." << std::endl;
-        std::cin.get();
-        return 1;
-    }
-
-    std::cout << "GUI initialized successfully" << std::endl;
-    
-    // Setup log redirection to GUI
-    LogRedirector coutRedirector(std::cout, [&gui](const std::string& text) {
-        gui.AddLog(text);
-    });
-    LogRedirector cerrRedirector(std::cerr, [&gui](const std::string& text) {
-        gui.AddLog("[ERROR] " + text);
-    });
-
-    // Load default scene if specified (command line parsing for WinMain)
-    int argc = 0;
-    LPWSTR* argvW = CommandLineToArgvW(GetCommandLineW(), &argc);
-    if (argc > 1) {
-        // Convert wide string to multi-byte
-        char absPath[MAX_PATH];
-        WideCharToMultiByte(CP_UTF8, 0, argvW[1], -1, absPath, MAX_PATH, NULL, NULL);
         
-        // Convert to absolute path
-        char fullPath[MAX_PATH];
-        if (GetFullPathNameA(absPath, MAX_PATH, fullPath, NULL)) {
-            gui.GetSettings().modelPath = fullPath;
-        } else {
-            gui.GetSettings().modelPath = absPath;
-        }
-        gui.GetSettings().autoRender = false;
-        std::cout << "Loaded scene: " << gui.GetSettings().modelPath << std::endl;
-    }
-    if (argvW) LocalFree(argvW);
-
-    // Application state
-    bool renderRequested = false;
-    Scene scene;
-    Camera camera;
-    RenderStats stats;
-    auto renderStartTime = std::chrono::high_resolution_clock::now();
-
-    // Setup callbacks
-    gui.SetOnStartRender([&]() {
-        renderRequested = true;
-    });
-
-    gui.SetOnStopRender([&]() {
-        gui.GetSettings().isRendering = false;
-        std::cout << "Rendering stopped by user" << std::endl;
-    });
-
-    gui.SetOnBrowseModel([&]() {
-        // Open file dialog for model selection
-        OPENFILENAMEA ofn = {};
-        char szFile[260] = {0};
+        // 设置日志重定向（同时重定向 cout 和 cerr）
+        g_coutRedirector = new ACG::LogRedirector(std::cout, AddLogMessage);
+        g_cerrRedirector = new ACG::LogRedirector(std::cerr, AddLogMessage);
         
-        ofn.lStructSize = sizeof(ofn);
-        ofn.hwndOwner = hwnd;
-        ofn.lpstrFile = szFile;
-        ofn.nMaxFile = sizeof(szFile);
-        ofn.lpstrFilter = "3D Models\0*.obj;*.fbx;*.gltf;*.glb;*.dae\0OBJ Files\0*.obj\0FBX Files\0*.fbx\0GLTF Files\0*.gltf;*.glb\0All Files\0*.*\0";
-        ofn.nFilterIndex = 1;
-        ofn.lpstrFileTitle = NULL;
-        ofn.nMaxFileTitle = 0;
-        ofn.lpstrInitialDir = NULL;
-        ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST;
+        // 添加控制台窗口用于调试
+        // AllocConsole();
+        // FILE* fp;
+        // freopen_s(&fp, "CONOUT$", "w", stdout);
+        // freopen_s(&fp, "CONOUT$", "w", stderr);
         
-        if (GetOpenFileNameA(&ofn)) {
-            gui.GetSettings().modelPath = szFile;
-            std::cout << "Selected model: " << szFile << std::endl;
-        }
-    });
-
-    gui.SetOnBrowseOutput([&]() {
-        // Save file dialog for output selection
-        OPENFILENAMEA ofn = {};
-        char szFile[260] = "output.ppm";
+        std::cout << "Initializing renderer..." << std::endl;
+        renderer.OnInit(hwnd);
+        std::cout << "Renderer initialized successfully" << std::endl;
         
-        ofn.lStructSize = sizeof(ofn);
-        ofn.hwndOwner = hwnd;
-        ofn.lpstrFile = szFile;
-        ofn.nMaxFile = sizeof(szFile);
-        ofn.lpstrFilter = "PPM Image\0*.ppm\0All Files\0*.*\0";
-        ofn.nFilterIndex = 1;
-        ofn.lpstrFileTitle = NULL;
-        ofn.nMaxFileTitle = 0;
-        ofn.lpstrInitialDir = NULL;
-        ofn.lpstrDefExt = "ppm";
-        ofn.Flags = OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT;
+        // 初始化 ImGui
+        std::cout << "Initializing ImGui..." << std::endl;
+        IMGUI_CHECKVERSION();
+        ImGui::CreateContext();
+        ImGuiIO& io = ImGui::GetIO(); (void)io;
+        io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
         
-        if (GetSaveFileNameA(&ofn)) {
-            gui.GetSettings().outputPath = szFile;
-            std::cout << "Selected output: " << szFile << std::endl;
-        }
-    });
+        ImGui::StyleColorsDark();
+        
+        // 初始化 ImGui Win32 后端
+        ImGui_ImplWin32_Init(hwnd);
+        
+        // 初始化 ImGui DX12 后端
+        // 需要从 Renderer 获取 DX12 资源
+        ImGui_ImplDX12_Init(
+            renderer.GetDevice(),
+            2, // FrameCount
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            renderer.GetSrvHeap(),
+            renderer.GetSrvHeap()->GetCPUDescriptorHandleForHeapStart(),
+            renderer.GetSrvHeap()->GetGPUDescriptorHandleForHeapStart()
+        );
+        
+        g_ImGuiInitialized = true;
+        std::cout << "ImGui initialized successfully (with DX12 backend)" << std::endl;
+        
+        ShowWindow(hwnd, nCmdShow);
+        std::cout << "Window shown, entering main loop..." << std::endl;
+        
+        // 不自动加载场景，等待用户选择
 
-    std::cout << "GUI initialized. Ready to render." << std::endl;
-    std::cout << "Load a scene using the GUI or pass a model path as command line argument." << std::endl;
-
-    // Main message loop
-    MSG msg = {};
-    while (g_running)
-    {
-        // Process Win32 messages
-        while (PeekMessageW(&msg, NULL, 0U, 0U, PM_REMOVE))
-        {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-            if (msg.message == WM_QUIT)
-                g_running = false;
-        }
-
-        if (!g_running)
-            break;
-
-        // Start new ImGui frame
-        gui.NewFrame();
-
-        // Render GUI
-        gui.RenderUI();
-
-        // Handle render request
-        if (renderRequested && !gui.GetSettings().isRendering) {
-            renderRequested = false;
-            gui.GetSettings().isRendering = true;
-            
-            const auto& settings = gui.GetSettings();
-            
-            // Validate settings
-            if (settings.modelPath.empty()) {
-                std::cerr << "No model path specified!" << std::endl;
-                gui.GetSettings().isRendering = false;
-                continue;
-            }
-
-            std::cout << "\n=== Starting Render ===" << std::endl;
-            std::cout << "Model: " << settings.modelPath << std::endl;
-            std::cout << "Resolution: " << settings.width << "x" << settings.height << std::endl;
-            std::cout << "Samples: " << settings.samplesPerPixel << " (" << settings.samplesPerFrame << " per frame)" << std::endl;
-
-            // Reinitialize renderer if resolution changed
-            if (settings.width != windowWidth || settings.height != windowHeight) {
-                std::cout << "Warning: Resolution change requires application restart" << std::endl;
-                std::cout << "Using initial resolution: " << windowWidth << "x" << windowHeight << std::endl;
-            }
-
-            // Adjust path if relative (add ../ to go from bin/ to project root)
-            std::string modelPath = settings.modelPath;
-            if (modelPath.find(":\\") == std::string::npos && modelPath.find(":/") == std::string::npos) {
-                // Relative path - adjust for bin directory
-                modelPath = "..\\" + modelPath;
-            }
-
-            // Load scene
-            scene = Scene();
-            if (!scene.LoadFromFile(modelPath)) {
-                std::cerr << "Failed to load scene: " << settings.modelPath << std::endl;
-                gui.GetSettings().isRendering = false;
-                continue;
-            }
-
-            scene.ComputeBoundingBox();
-            
-            // Count triangles
-            stats.triangleCount = 0;
-            for (const auto& mesh : scene.GetMeshes()) {
-                stats.triangleCount += static_cast<int>(mesh->GetIndices().size() / 3);
-            }
-            stats.materialCount = static_cast<int>(scene.GetMaterials().size());
-
-            // Setup camera from GUI settings
-            glm::vec3 cameraPos = glm::vec3(
-                settings.cameraPosition[0], 
-                settings.cameraPosition[1], 
-                settings.cameraPosition[2]
-            );
-            glm::vec3 cameraTarget = glm::vec3(
-                settings.cameraTarget[0], 
-                settings.cameraTarget[1], 
-                settings.cameraTarget[2]
-            );
-            glm::vec3 cameraUp = glm::vec3(
-                settings.cameraUp[0], 
-                settings.cameraUp[1], 
-                settings.cameraUp[2]
-            );
-            
-            camera.SetPosition(cameraPos);
-            camera.SetTarget(cameraTarget);
-            camera.SetUp(cameraUp);
-            camera.SetFOV(settings.fov);
-            camera.SetAspectRatio(static_cast<float>(settings.width) / settings.height);
-            camera.SetAperture(0.0f);
-            camera.SetFocusDistance(glm::length(cameraPos - cameraTarget));
-
-            renderer.SetSamplesPerPixel(settings.samplesPerPixel);
-            renderer.SetMaxBounces(settings.maxBounces);
-            renderer.SetRussianRouletteDepth(3);
-            renderer.SetEnvironmentLight(settings.environmentLightIntensity);
-            renderer.ResetAccumulation();
-
-            // Calculate frames
-            stats.totalFrames = (settings.samplesPerPixel + settings.samplesPerFrame - 1) / settings.samplesPerFrame;
-            stats.currentFrame = 0;
-            stats.accumulatedSamples = 0;
-            stats.progress = 0.0f;
-            
-            renderStartTime = std::chrono::high_resolution_clock::now();
-        }
-
-        // Process rendering frame by frame
-        if (gui.GetSettings().isRendering) {
-            const auto& settings = gui.GetSettings();
-            
-            if (stats.currentFrame < stats.totalFrames) {
-                int samplesToRender = std::min(
-                    settings.samplesPerFrame, 
-                    settings.samplesPerPixel - renderer.GetAccumulatedSamples()
-                );
-                
-                renderer.RenderFrame(scene, camera, samplesToRender);
-                
-                stats.currentFrame++;
-                stats.accumulatedSamples = renderer.GetAccumulatedSamples();
-                stats.progress = 100.0f * stats.currentFrame / stats.totalFrames;
-                
-                auto now = std::chrono::high_resolution_clock::now();
-                stats.renderTime = std::chrono::duration<float>(now - renderStartTime).count();
-                
-                gui.UpdateStats(stats);
-                
-                // Log progress
-                if (stats.currentFrame % 10 == 0 || stats.currentFrame == stats.totalFrames) {
-                    std::cout << "Progress: " << stats.currentFrame << "/" << stats.totalFrames 
-                             << " frames (" << stats.accumulatedSamples << "/" << settings.samplesPerPixel 
-                             << " samples, " << std::fixed << std::setprecision(1) << stats.progress << "%)" << std::endl;
-                }
+        MSG msg = {};
+        while (msg.message != WM_QUIT) {
+            if (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&msg);
+                DispatchMessage(&msg);
             } else {
-                // Rendering complete
-                std::cout << "\nRendering complete! Saving image..." << std::endl;
                 
-                std::vector<unsigned char> pixels(settings.width * settings.height * 4);
-                renderer.GetRenderResult(pixels.data());
+                // 开始新的 ImGui 帧
+                ImGui_ImplDX12_NewFrame();
+                ImGui_ImplWin32_NewFrame();
+                ImGui::NewFrame();
                 
-                if (SavePPM(settings.outputPath, settings.width, settings.height, pixels.data())) {
-                    std::cout << "Saved image: " << settings.outputPath << std::endl;
-                } else {
-                    std::cerr << "Failed to save image: " << settings.outputPath << std::endl;
+                // 渲染 GUI
+                RenderGUI(&renderer);
+                
+                // 准备 ImGui 渲染
+                ImGui::Render();
+                
+                // 始终渲染 ImGui 到屏幕，保持界面响应
+                // 后台离线渲染使用独立的命令资源，不会冲突
+                renderer.OnUpdate();
+                try {
+                    renderer.OnRender();
+                } catch (...) {
+                    // Ignore all render errors
                 }
-                
-                gui.GetSettings().isRendering = false;
-                std::cout << "Render complete! Time: " << stats.renderTime << " seconds" << std::endl;
             }
         }
-
-        // Render ImGui
-        float clearColor[4] = { 0.1f, 0.1f, 0.1f, 1.0f };
-        context->ClearRenderTargetView(renderTargetView, clearColor);
-        context->OMSetRenderTargets(1, &renderTargetView, nullptr);
         
-        gui.Render();
+        std::cout << "Exiting main loop, cleaning up..." << std::endl;
         
-        // Present frame
-        swapChain->Present(1, 0);
+        // Wait for render thread to complete
+        if (g_renderThread && g_renderThread->joinable()) {
+            std::cout << "Waiting for render thread to complete..." << std::endl;
+            g_renderThread->join();
+        }
 
-        // Small sleep to prevent busy waiting
-        Sleep(1);
+        renderer.OnDestroy();
+        std::cout << "Renderer destroyed" << std::endl;
+        
+        // 清理 ImGui
+        if (g_ImGuiInitialized) {
+            ImGui_ImplDX12_Shutdown();
+            ImGui_ImplWin32_Shutdown();
+            ImGui::DestroyContext();
+            g_ImGuiInitialized = false;
+            std::cout << "ImGui cleaned up" << std::endl;
+        }
+        
+        // 清理日志
+        if (g_coutRedirector) {
+            delete g_coutRedirector;
+            g_coutRedirector = nullptr;
+        }
+        if (g_cerrRedirector) {
+            delete g_cerrRedirector;
+            g_cerrRedirector = nullptr;
+        }
+        if (g_logFile.is_open()) {
+            g_logFile.close();
+        }
+        
+        FreeConsole();
+        return static_cast<char>(msg.wParam);
     }
-
-    // Cleanup
-    std::cout << "Shutting down..." << std::endl;
-    gui.Shutdown();
-    
-    if (renderTargetView)
-        renderTargetView->Release();
-    if (swapChain)
-        swapChain->Release();
-    
-    DestroyWindow(hwnd);
-    UnregisterClassW(wc.lpszClassName, hInstance);
+    catch (const std::exception& e) {
+        std::cerr << "EXCEPTION CAUGHT: " << e.what() << std::endl;
+        std::string errorMsg = std::string("Fatal error: ") + e.what();
+        AddLogMessage(errorMsg);
+        MessageBoxA(nullptr, e.what(), "Error", MB_OK | MB_ICONERROR);
+        renderer.OnDestroy();
+        
+        if (g_ImGuiInitialized) {
+            ImGui_ImplDX12_Shutdown();
+            ImGui_ImplWin32_Shutdown();
+            ImGui::DestroyContext();
+            g_ImGuiInitialized = false;
+        }
+        
+        // 清理日志
+        if (g_coutRedirector) {
+            delete g_coutRedirector;
+            g_coutRedirector = nullptr;
+        }
+        if (g_cerrRedirector) {
+            delete g_cerrRedirector;
+            g_cerrRedirector = nullptr;
+        }
+        if (g_logFile.is_open()) {
+            g_logFile.close();
+        }
+        
+        FreeConsole();
+        return -1;
+    }
 
     return 0;
+}
+
+// GUI渲染函数
+void RenderGUI(ACG::Renderer* renderer) {
+    static bool isRendering = false;
+    static int samplesPerPixel = 100;
+    static int samplesPerFrame = 5;
+    static int maxBounces = 5;
+    static char modelPath[512] = "";
+    static char outputPath[512] = "";
+    static std::string renderStatus = "";
+    static bool showRenderStatus = false;
+    
+    // Initialize environment light on first call
+    static bool envLightInitialized = false;
+    if (!envLightInitialized) {
+        renderer->SetEnvironmentLightIntensity(0.5f);
+        envLightInitialized = true;
+    }
+    
+    // Initialize output path with absolute path on first call
+    static bool outputPathInitialized = false;
+    if (!outputPathInitialized && !g_exeDirectory.empty()) {
+        std::string defaultOutput = g_exeDirectory + "\\output.ppm";
+        strncpy_s(outputPath, defaultOutput.c_str(), sizeof(outputPath) - 1);
+        outputPathInitialized = true;
+    }
+    
+    // Show render status popup
+    if (showRenderStatus) {
+        ImGui::OpenPopup("Render Status");
+        showRenderStatus = false;
+    }
+    if (ImGui::BeginPopupModal("Render Status", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::Text("%s", renderStatus.c_str());
+        if (ImGui::Button("OK", ImVec2(120, 0))) {
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+    
+    // Render Settings 窗口
+    ImGui::Begin("Render Settings", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
+    
+    ImGui::Text("Output Resolution");
+    static int width = 1280;
+    static int height = 720;
+    ImGui::InputInt("Width", &width);
+    ImGui::InputInt("Height", &height);
+    
+    ImGui::Separator();
+    ImGui::Text("Sampling");
+    ImGui::InputInt("Samples Per Pixel", &samplesPerPixel);
+    
+    if (ImGui::InputInt("Samples Per Frame", &samplesPerFrame)) {
+        if (samplesPerFrame < 1) samplesPerFrame = 1;
+        renderer->SetSamplesPerPixel(samplesPerFrame);
+    }
+    
+    if (ImGui::InputInt("Max Bounces", &maxBounces)) {
+        if (maxBounces < 1) maxBounces = 1;
+        renderer->SetMaxBounces(maxBounces);
+    }
+    
+    ImGui::Separator();
+    ImGui::Text("Lighting");
+    static float envLightIntensity = 0.50f;
+    if (ImGui::SliderFloat("Environment Light", &envLightIntensity, 0.0f, 10.0f)) {
+        renderer->SetEnvironmentLightIntensity(envLightIntensity);
+    }
+    
+    ImGui::Separator();
+    ImGui::Text("Scene");
+    ImGui::InputText("Model Path", modelPath, sizeof(modelPath));
+    ImGui::SameLine();
+    if (ImGui::Button("Browse")) {
+        std::string path = OpenFileDialog(g_hwnd, 
+            "3D Models\0*.obj;*.fbx;*.gltf\0All Files\0*.*\0\0",
+            "Select 3D Model");
+        if (!path.empty()) {
+            strncpy_s(modelPath, path.c_str(), sizeof(modelPath) - 1);
+        }
+    }
+    
+    ImGui::InputText("Output Path", outputPath, sizeof(outputPath));
+    ImGui::SameLine();
+    if (ImGui::Button("Browse##Output")) {
+        std::string path = SaveFileDialog(g_hwnd,
+            "PPM Image\0*.ppm\0All Files\0*.*\0\0",
+            "Save Output Image");
+        if (!path.empty()) {
+            strncpy_s(outputPath, path.c_str(), sizeof(outputPath) - 1);
+        }
+    }
+    
+    static bool autoRenderOnLoad = false;
+    ImGui::Checkbox("Auto-render on load", &autoRenderOnLoad);
+    
+    ImGui::End();
+    
+    // Controls 窗口
+    ImGui::Begin("Controls", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
+    
+    // Check if render completed
+    if (g_renderComplete.load()) {
+        g_renderComplete.store(false);
+        g_isRendering.store(false);
+        std::lock_guard<std::mutex> lock(g_renderMutex);
+        renderStatus = g_renderResultMessage;
+        showRenderStatus = true;
+        // Join the thread
+        if (g_renderThread && g_renderThread->joinable()) {
+            g_renderThread->join();
+            g_renderThread.reset();
+        }
+    }
+    
+    bool canStartRender = !g_isRendering.load();
+    if (!canStartRender) {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.5f, 0.5f, 0.5f, 1.0f));
+    }
+    
+    // Show Start or Stop button based on rendering state
+    if (!g_isRendering.load()) {
+        if (ImGui::Button("Start Render", ImVec2(150, 30)) && canStartRender) {
+            if (strlen(modelPath) > 0 && strlen(outputPath) > 0) {
+            // Copy parameters
+            std::string modelPathStr = modelPath;
+            std::string outputPathStr = outputPath;
+            int samples = samplesPerPixel;
+            int bounces = maxBounces;
+            int renderWidth = width;
+            int renderHeight = height;
+            
+            // Join previous thread if exists
+            if (g_renderThread && g_renderThread->joinable()) {
+                g_renderThread->join();
+            }
+            
+            // Wait for previous render thread to finish
+            if (g_renderThread && g_renderThread->joinable()) {
+                g_renderThread->join();
+                g_renderThread.reset();
+            }
+            
+            std::cout << "Starting async load and render..." << std::endl;
+            std::cout.flush();
+            
+            // Check if scene needs to be loaded
+            bool needsSceneLoad = (g_lastLoadedScene != modelPathStr);
+            
+            g_renderThread = std::make_unique<std::thread>([renderer, modelPathStr, outputPathStr, samples, bounces, renderWidth, renderHeight, needsSceneLoad]() {
+                try {
+                    // Set rendering flags at the start
+                    g_isRendering.store(true);
+                    g_renderComplete.store(false);
+                    
+                    // Only load scene if it hasn't been loaded yet or path changed
+                    if (needsSceneLoad) {
+                        std::cout << "[Async] Loading scene: " << modelPathStr << std::endl;
+                        std::cout.flush();
+                        renderer->LoadSceneAsync(modelPathStr);
+                    } else {
+                        std::cout << "[Async] Using already loaded scene" << std::endl;
+                        std::cout.flush();
+                    }
+                    
+                    std::cout << "[Async] Starting render..." << std::endl;
+                    std::cout.flush();
+                    
+                    // Resize if needed
+                    renderer->OnResize(renderWidth, renderHeight);
+                    
+                    renderer->RenderToFile(outputPathStr, samples, bounces);
+                    
+                    std::lock_guard<std::mutex> lock(g_renderMutex);
+                    g_renderResultMessage = "Rendering complete!\nOutput saved to:\n" + outputPathStr;
+                    
+                    // Update last loaded scene
+                    if (needsSceneLoad) {
+                        g_lastLoadedScene = modelPathStr;
+                    }
+                }
+                catch (const std::exception& e) {
+                    std::lock_guard<std::mutex> lock(g_renderMutex);
+                    g_renderResultMessage = std::string("Error: ") + (e.what() ? e.what() : "Unknown error");
+                    std::cerr << "[Async] Failed: " << g_renderResultMessage << std::endl;
+                    std::cerr.flush();
+                }
+                catch (...) {
+                    std::lock_guard<std::mutex> lock(g_renderMutex);
+                    g_renderResultMessage = "Unknown exception occurred";
+                    std::cerr << "[Async] Failed: Unknown exception" << std::endl;
+                    std::cerr.flush();
+                }
+                
+                // Clear rendering flag
+                g_isRendering.store(false);
+                g_renderComplete.store(true);
+            });
+        } else {
+            if (strlen(modelPath) == 0) renderStatus = "Please select a model file first";
+            else renderStatus = "Please specify an output path first";
+            showRenderStatus = true;
+            std::cerr << renderStatus << std::endl;
+        }
+    }
+    } else {
+        // Show Stop Render button while rendering
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.2f, 0.2f, 1.0f));
+        if (ImGui::Button("Stop Render", ImVec2(150, 30))) {
+            std::cout << "Stop render requested by user" << std::endl;
+            renderer->StopRender();
+        }
+        ImGui::PopStyleColor();
+    }
+    
+    if (!canStartRender) {
+        ImGui::PopStyleColor();
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.0f, 1.0f), "Rendering in background...");
+    }
+    
+    // Show rendering progress info
+    if (g_isRendering.load()) {
+        ImGui::Separator();
+        ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), "Status: Rendering offline to file");
+        ImGui::Text("Please wait, the GUI remains responsive");
+        ImGui::Text("Check console for progress updates");
+    }
+    
+    ImGui::End();
+    
+    // Camera Settings 窗口
+    ImGui::Begin("Camera Settings");
+        
+        ACG::Camera* camera = renderer->GetCamera();
+        if (camera) {
+            ImGui::Text("Camera Position");
+            glm::vec3 pos = camera->GetPosition();
+            if (ImGui::InputFloat("X##Pos", &pos.x, 0.1f, 1.0f, "%.2f")) {
+                camera->SetPosition(pos);
+            }
+            if (ImGui::InputFloat("Y##Pos", &pos.y, 0.1f, 1.0f, "%.2f")) {
+                camera->SetPosition(pos);
+            }
+            if (ImGui::InputFloat("Z##Pos", &pos.z, 0.1f, 1.0f, "%.2f")) {
+                camera->SetPosition(pos);
+            }
+            ImGui::SameLine();
+            ImGui::Text("Position");
+            
+            ImGui::Separator();
+            ImGui::Text("Camera Target");
+            glm::vec3 target = camera->GetTarget();
+            if (ImGui::InputFloat("X##Target", &target.x, 0.1f, 1.0f, "%.2f")) {
+                camera->SetTarget(target);
+            }
+            if (ImGui::InputFloat("Y##Target", &target.y, 0.1f, 1.0f, "%.2f")) {
+                camera->SetTarget(target);
+            }
+            if (ImGui::InputFloat("Z##Target", &target.z, 0.1f, 1.0f, "%.2f")) {
+                camera->SetTarget(target);
+            }
+            ImGui::SameLine();
+            ImGui::Text("Target");
+            
+            ImGui::Separator();
+            ImGui::Text("Camera Up Vector");
+            glm::vec3 up = camera->GetUp();
+            if (ImGui::InputFloat("X##Up", &up.x, 0.01f, 0.1f, "%.3f")) {
+                camera->SetUp(up);
+            }
+            if (ImGui::InputFloat("Y##Up", &up.y, 0.01f, 0.1f, "%.3f")) {
+                camera->SetUp(up);
+            }
+            if (ImGui::InputFloat("Z##Up", &up.z, 0.01f, 0.1f, "%.3f")) {
+                camera->SetUp(up);
+            }
+            ImGui::SameLine();
+            ImGui::Text("Up");
+            
+            ImGui::Separator();
+            ImGui::Text("Field of View");
+            float fov = camera->GetFOV();
+            if (ImGui::InputFloat("FOV (deg)", &fov, 1.0f, 10.0f, "%.1f")) {
+                camera->SetFOV(fov);
+            }
+            
+            if (ImGui::Button("Reset to Default")) {
+                camera->SetPosition(glm::vec3(0.0f, 1.0f, 3.0f));
+                camera->SetTarget(glm::vec3(0.0f, 0.0f, 0.0f));
+                camera->SetUp(glm::vec3(0.0f, 1.0f, 0.0f));
+                camera->SetFOV(60.0f);
+            }
+        }
+        
+    ImGui::End();
+    
+    // Renderer Statistics 窗口
+    ImGui::Begin("Renderer Statistics", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
+    
+    const char* statusText = g_isRendering.load() ? "Rendering" : "Idle";
+    ImGui::Text("Status: %s", statusText);
+    
+    if (g_isRendering.load()) {
+        ImGui::SameLine();
+        static float progress = 0.0f;
+        progress = fmodf(progress + 0.02f, 1.0f);
+        ImGui::ProgressBar(progress, ImVec2(-1, 0), "Processing...");
+    }
+    
+    int accumulated = renderer->GetAccumulatedSamples();
+    float progress = samplesPerPixel > 0 ? (float)accumulated / (float)samplesPerPixel : 0.0f;
+    char progressText[64];
+    sprintf_s(progressText, "Progress: %d / %d frames", accumulated / samplesPerFrame, samplesPerPixel / samplesPerFrame);
+    if (!g_isRendering.load()) {
+        ImGui::ProgressBar(progress, ImVec2(-1, 0), progressText);
+    }
+    
+    ImGui::Text("Samples: %d / %d", accumulated, samplesPerPixel);
+    ImGui::Text("Render Time: %.1f seconds", accumulated * 0.016f); // 粗略估算
+    
+    ImGui::Separator();
+    ImGui::Text("Scene Info:");
+    ACG::Scene* scene = renderer->GetScene();
+    if (scene) {
+        ImGui::Text("  Meshes: %zu", scene->GetMeshes().size());
+        ImGui::Text("  Materials: %zu", scene->GetMaterials().size());
+        ImGui::Text("  Lights: %zu", scene->GetLights().size());
+    } else {
+        ImGui::Text("  No scene loaded");
+    }
+    
+    ImGui::End();
+    
+    // Log Details 窗口
+    ImGui::Begin("Log Details");
+    
+    static bool autoScroll = true;
+    if (ImGui::Button("Clear")) {
+        g_logMessages.clear();
+    }
+    ImGui::SameLine();
+    ImGui::Checkbox("Auto-scroll", &autoScroll);
+    
+    ImGui::Separator();
+    ImGui::BeginChild("LogScrolling", ImVec2(0, 0), false, ImGuiWindowFlags_HorizontalScrollbar);
+    
+    // 显示实际的日志内容
+    for (const auto& msg : g_logMessages) {
+        ImGui::TextUnformatted(msg.c_str());
+    }
+    
+    if (autoScroll && ImGui::GetScrollY() >= ImGui::GetScrollMaxY()) {
+        ImGui::SetScrollHereY(1.0f);
+    }
+    
+    ImGui::EndChild();
+    ImGui::End();
 }

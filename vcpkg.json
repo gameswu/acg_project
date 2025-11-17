@@ -5,10 +5,11 @@
     "glm",
     {
       "name": "imgui",
-      "features": [ "win32-binding", "dx11-binding", "docking-experimental" ]
+      "features": [ "win32-binding", "dx12-binding", "docking-experimental" ]
     },
     "stb",
     "assimp",
-    "nlohmann-json"
+    "nlohmann-json",
+    "d3dx12"
   ]
 }

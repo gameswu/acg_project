@@ -30,6 +30,10 @@ public:
     const std::vector<std::shared_ptr<Material>>& GetMaterials() const { return m_materials; }
     const std::vector<std::shared_ptr<Light>>& GetLights() const { return m_lights; }
     
+    // 场景名称
+    std::string GetName() const { return m_name; }
+    void SetName(const std::string& name) { m_name = name; }
+    
     // 场景包围盒
     void ComputeBoundingBox();
     glm::vec3 GetBBoxMin() const { return m_bboxMin; }
@@ -40,6 +44,7 @@ private:
     std::vector<std::shared_ptr<Material>> m_materials;
     std::vector<std::shared_ptr<Light>> m_lights;
     
+    std::string m_name;
     glm::vec3 m_bboxMin;
     glm::vec3 m_bboxMax;
 };

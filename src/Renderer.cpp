@@ -1,1143 +1,1658 @@
 #include "Renderer.h"
-#include "BVH.h"
+#include "DX12Helper.h"
+#include "imgui.h"
+#include "imgui_impl_dx12.h"
+#include <vector>
 #include <iostream>
 #include <fstream>
-#include <vector>
-#include <algorithm>
+#include <thread>
 #include <chrono>
-#include <d3dcompiler.h>
+#include <dxcapi.h>
+#include <glm/glm.hpp>
+#define GLM_ENABLE_EXPERIMENTAL
+#include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtx/string_cast.hpp>
 
-#pragma comment(lib, "d3dcompiler.lib")
+#pragma comment(lib, "dxcompiler.lib")
+
+// Note: The DXR helper includes have been removed for now to resolve compilation issues.
+// We will build the DXR pipeline using the core D3D12 interfaces first.
+// #include "dxr/DXRHelper.h"
+// #include "dxr/nv_helpers_dx12/BottomLevelASGenerator.h"
+// #include "dxr/nv_helpers_dx12/TopLevelASGenerator.h"
+// #include "dxr/nv_helpers_dx12/RaytracingPipelineGenerator.h"
+// #include "dxr/nv_helpers_dx12/RootSignatureGenerator.h"
+// #include "dxr/nv_helpers_dx12/ShaderBindingTableGenerator.h"
+
 
 namespace ACG {
 
-Renderer::Renderer() 
-    : m_device(nullptr)
-    , m_context(nullptr)
-    , m_swapChain(nullptr)
-    , m_pathTracingShader(nullptr)
-    , m_accumShader(nullptr)
-    , m_renderTarget(nullptr)
-    , m_renderTargetUAV(nullptr)
-    , m_triangleBuffer(nullptr)
-    , m_triangleSRV(nullptr)
-    , m_materialBuffer(nullptr)
-    , m_materialSRV(nullptr)
-    , m_lightBuffer(nullptr)
-    , m_lightSRV(nullptr)
-    , m_bvhBuffer(nullptr)
-    , m_bvhSRV(nullptr)
-    , m_bvhTriangleIndicesBuffer(nullptr)
-    , m_bvhTriangleIndicesSRV(nullptr)
-    , m_constantBuffer(nullptr)
-    , m_numTriangles(0)
-    , m_numMaterials(0)
-    , m_numLights(0)
-    , m_numBVHNodes(0)
-    , m_numBVHTriangleIndices(0)
-    , m_width(0)
-    , m_height(0)
-    , m_samplesPerPixel(1)
-    , m_maxBounces(5)
-    , m_rrDepth(3)
-    , m_environmentLight(0.5f)
-    , m_frameCount(0)
-    , m_accumulatedSamples(0)
-    , m_currentAccumIndex(0)
-{
-    m_accumulationTexture[0] = nullptr;
-    m_accumulationTexture[1] = nullptr;
-    m_accumulationUAV[0] = nullptr;
-    m_accumulationUAV[1] = nullptr;
-    m_accumulationSRV[0] = nullptr;
-    m_accumulationSRV[1] = nullptr;
-}
+    Renderer::Renderer(UINT width, UINT height) :
+        m_width(width),
+        m_height(height),
+        m_frameIndex(0),
+        m_fenceValue(0),
+        m_rtvDescriptorSize(0),
+        m_hwnd(nullptr),
+        m_dxrSupported(false),
+        m_sbtEntrySize(0),
+        m_sbtRayGenOffset(0),
+        m_sbtMissOffset(0),
+        m_sbtHitGroupOffset(0),
+        m_samplesPerPixel(1),
+        m_maxBounces(5),
+        m_accumulatedSamples(0),
+        m_isRendering(false),
+        m_offlineFenceValue(0),
+        m_offlineFenceEvent(nullptr),
+        m_stopRenderRequested(false)
+    {}
 
-Renderer::~Renderer() {
-    Cleanup();
-}
-
-bool Renderer::Initialize(int width, int height) {
-    m_width = width;
-    m_height = height;
-    
-    // TODO: Initialize DirectX 11
-    if (!InitializeD3D()) {
-        return false;
-    }
-    
-    // TODO: Create compute shaders
-    if (!CreateShaders()) {
-        return false;
-    }
-    
-    // TODO: Create render buffers
-    if (!CreateBuffers()) {
-        return false;
-    }
-    
-    std::cout << "Renderer initialized: " << width << "x" << height << std::endl;
-    return true;
-}
-
-void Renderer::ResetAccumulation() {
-    m_accumulatedSamples = 0;
-    m_frameCount = 0;
-    m_currentAccumIndex = 0;
-    
-    // Clear both accumulation textures to zero
-    float clearColor[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    if (m_context) {
-        if (m_accumulationUAV[0]) m_context->ClearUnorderedAccessViewFloat(m_accumulationUAV[0], clearColor);
-        if (m_accumulationUAV[1]) m_context->ClearUnorderedAccessViewFloat(m_accumulationUAV[1], clearColor);
-    }
-}
-
-void Renderer::RenderFrame(const Scene& scene, const Camera& camera, int samplesThisFrame) {
-    if (!m_device || !m_context || !m_pathTracingShader) {
-        return;
-    }
-    
-    // Upload scene data on first frame
-    if (m_frameCount == 0) {
-        if (!UploadSceneData(scene)) {
-            std::cerr << "Failed to upload scene data" << std::endl;
-            return;
+    Renderer::~Renderer() {
+        OnDestroy();
+        if (m_offlineFenceEvent) {
+            CloseHandle(m_offlineFenceEvent);
         }
     }
-    
-    // Update constant buffer
-    D3D11_MAPPED_SUBRESOURCE mappedResource;
-    HRESULT hr = m_context->Map(m_constantBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mappedResource);
-    if (SUCCEEDED(hr)) {
-        struct GPUCamera {
-            float position[3]; float _pad0;
-            float direction[3]; float _pad1;
-            float right[3]; float _pad2;
-            float up[3]; float _pad3;
-            float fov; float aspectRatio; float aperture; float focusDistance;
-        };
-        struct RenderParams {
-            GPUCamera camera;
-            uint32_t frameIndex;
-            uint32_t samplesPerPixel;
-            uint32_t maxBounces;
-            uint32_t numTriangles;
-            uint32_t numMaterials;
-            uint32_t accumulatedSamples;
-            float environmentLight;
-            uint32_t _pad2;
-            uint32_t resX;
-            uint32_t resY;
-            uint32_t _pad3[2];
-        };
-        
-        RenderParams* params = static_cast<RenderParams*>(mappedResource.pData);
-        glm::vec3 pos = camera.GetPosition();
-        glm::vec3 dir = camera.GetDirection();
-        glm::vec3 right = camera.GetRight();
-        glm::vec3 up = camera.GetUp();
-        
-        params->camera.position[0] = pos.x;
-        params->camera.position[1] = pos.y;
-        params->camera.position[2] = pos.z;
-        params->camera._pad0 = 0.0f;
-        
-        params->camera.direction[0] = dir.x;
-        params->camera.direction[1] = dir.y;
-        params->camera.direction[2] = dir.z;
-        params->camera._pad1 = 0.0f;
-        
-        params->camera.right[0] = right.x;
-        params->camera.right[1] = right.y;
-        params->camera.right[2] = right.z;
-        params->camera._pad2 = 0.0f;
-        
-        params->camera.up[0] = up.x;
-        params->camera.up[1] = up.y;
-        params->camera.up[2] = up.z;
-        params->camera._pad3 = 0.0f;
-        
-        params->camera.fov = camera.GetFOV();
-        params->camera.aspectRatio = static_cast<float>(m_width) / m_height;
-        params->camera.aperture = camera.GetAperture();
-        params->camera.focusDistance = camera.GetFocusDistance();
-        
-        params->frameIndex = m_frameCount;
-        params->samplesPerPixel = samplesThisFrame;  // Use samplesThisFrame instead of total
-        params->maxBounces = m_maxBounces;
-        params->numTriangles = m_numTriangles;
-        params->numMaterials = m_numMaterials;
-        params->accumulatedSamples = m_accumulatedSamples;  // Pass current accumulated count
-        params->environmentLight = m_environmentLight;
-        params->_pad2 = 0;
-        params->resX = m_width;
-        params->resY = m_height;
-        params->_pad3[0] = 0;
-        params->_pad3[1] = 0;
-        
-        m_context->Unmap(m_constantBuffer, 0);
-    }
-    
-    // Bind resources
-    m_context->CSSetShader(m_pathTracingShader, nullptr, 0);
-    m_context->CSSetConstantBuffers(0, 1, &m_constantBuffer);
-    
-    // Ping-pong: read from current, write to next
-    int readIndex = m_currentAccumIndex;
-    int writeIndex = 1 - m_currentAccumIndex;
-    
-    ID3D11ShaderResourceView* srvs[5] = { 
-        m_triangleSRV, 
-        m_materialSRV, 
-        m_accumulationSRV[readIndex],  // Read from current accumulation
-        m_bvhSRV, 
-        m_bvhTriangleIndicesSRV 
-    };
-    m_context->CSSetShaderResources(0, 5, srvs);
-    
-    // Bind both render target and accumulation texture as UAVs
-    ID3D11UnorderedAccessView* uavs[2] = { 
-        m_renderTargetUAV, 
-        m_accumulationUAV[writeIndex]  // Write to next accumulation
-    };
-    m_context->CSSetUnorderedAccessViews(0, 2, uavs, nullptr);
-    
-    // Dispatch
-    UINT groupsX = (m_width + 7) / 8;
-    UINT groupsY = (m_height + 7) / 8;
-    m_context->Dispatch(groupsX, groupsY, 1);
-    m_context->Flush();
-    
-    // Check device status
-    HRESULT deviceStatus = m_device->GetDeviceRemovedReason();
-    if (FAILED(deviceStatus)) {
-        std::cerr << "ERROR: Device removed! HRESULT: 0x" << std::hex << deviceStatus << std::dec << std::endl;
-    }
-    
-    // Unbind resources
-    ID3D11ShaderResourceView* nullSRVs[] = { nullptr, nullptr, nullptr, nullptr };
-    m_context->CSSetShaderResources(0, 4, nullSRVs);
-    ID3D11UnorderedAccessView* nullUAVs[] = { nullptr, nullptr };
-    m_context->CSSetUnorderedAccessViews(0, 2, nullUAVs, nullptr);
-    
-    // Swap accumulation buffers for next frame
-    m_currentAccumIndex = writeIndex;
-    
-    m_frameCount++;
-    m_accumulatedSamples += samplesThisFrame;
-}
 
-// Legacy single-shot render (calls RenderFrame once)
-void Renderer::Render(const Scene& scene, const Camera& camera) {
-    if (!m_device || !m_context || !m_pathTracingShader) {
-        return;
-    }
-    
-    // Upload scene data on first frame
-    if (m_frameCount == 0) {
-        if (!UploadSceneData(scene)) {
-            std::cerr << "Failed to upload scene data" << std::endl;
-            return;
-        }
-    }
-    
-    // Update constant buffer - Must match HLSL structure exactly
-    D3D11_MAPPED_SUBRESOURCE mappedResource;
-    HRESULT hr = m_context->Map(m_constantBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mappedResource);
-    if (SUCCEEDED(hr)) {
-        struct GPUCamera {
-            float position[3]; float _pad0;
-            float direction[3]; float _pad1;
-            float right[3]; float _pad2;
-            float up[3]; float _pad3;
-            float fov; float aspectRatio; float aperture; float focusDistance;
-        };
-        struct RenderParams {
-            GPUCamera camera;           // 80 bytes
-            uint32_t frameIndex;        // 4
-            uint32_t samplesPerPixel;   // 4
-            uint32_t maxBounces;        // 4
-            uint32_t numTriangles;      // 4
-            uint32_t numMaterials;      // 4
-            uint32_t _pad0;             // 4
-            uint32_t _pad1;             // 4
-            uint32_t _pad2;             // 4
-            uint32_t resX;              // 4
-            uint32_t resY;              // 4
-            uint32_t _pad3[2];          // 8
-        };  // Total: 128 bytes
-        
-        RenderParams* params = static_cast<RenderParams*>(mappedResource.pData);
-        glm::vec3 pos = camera.GetPosition();
-        glm::vec3 dir = camera.GetDirection();
-        glm::vec3 right = camera.GetRight();
-        glm::vec3 up = camera.GetUp();
-        
-        params->camera.position[0] = pos.x;
-        params->camera.position[1] = pos.y;
-        params->camera.position[2] = pos.z;
-        params->camera._pad0 = 0.0f;
-        
-        params->camera.direction[0] = dir.x;
-        params->camera.direction[1] = dir.y;
-        params->camera.direction[2] = dir.z;
-        params->camera._pad1 = 0.0f;
-        
-        params->camera.right[0] = right.x;
-        params->camera.right[1] = right.y;
-        params->camera.right[2] = right.z;
-        params->camera._pad2 = 0.0f;
-        
-        params->camera.up[0] = up.x;
-        params->camera.up[1] = up.y;
-        params->camera.up[2] = up.z;
-        params->camera._pad3 = 0.0f;
-        
-        params->camera.fov = camera.GetFOV();
-        params->camera.aspectRatio = static_cast<float>(m_width) / m_height;
-        params->camera.aperture = camera.GetAperture();
-        params->camera.focusDistance = camera.GetFocusDistance();
-        
-        params->frameIndex = m_frameCount;
-        params->samplesPerPixel = m_samplesPerPixel;
-        params->maxBounces = m_maxBounces;
-        params->numTriangles = m_numTriangles;
-        params->numMaterials = m_numMaterials;
-        params->_pad0 = 0;
-        params->_pad1 = 0;
-        params->_pad2 = 0;
-        params->resX = m_width;
-        params->resY = m_height;
-        params->_pad3[0] = 0;
-        params->_pad3[1] = 0;
-        
-        m_context->Unmap(m_constantBuffer, 0);
-    }
-    
-    // Bind resources
-    m_context->CSSetShader(m_pathTracingShader, nullptr, 0);
-    m_context->CSSetConstantBuffers(0, 1, &m_constantBuffer);
-    
-    // Bind shader resources (only bind valid ones)
-    ID3D11ShaderResourceView* srvs[3] = { m_triangleSRV, m_materialSRV, nullptr };
-    m_context->CSSetShaderResources(0, 2, srvs);  // Only bind 2 resources
-    
-    m_context->CSSetUnorderedAccessViews(0, 1, &m_renderTargetUAV, nullptr);
-    
-    // Dispatch compute shader
-    UINT groupsX = (m_width + 7) / 8;
-    UINT groupsY = (m_height + 7) / 8;
-    
-    glm::vec3 pos = camera.GetPosition();
-    glm::vec3 dir = camera.GetDirection();
-    glm::vec3 right = camera.GetRight();
-    glm::vec3 up = camera.GetUp();
-    
-    std::cout << "Camera vectors - Pos:[" << pos.x << "," << pos.y << "," << pos.z << "]" << std::endl;
-    std::cout << "                Dir:[" << dir.x << "," << dir.y << "," << dir.z << "]" << std::endl;
-    std::cout << "                Right:[" << right.x << "," << right.y << "," << right.z << "]" << std::endl;
-    std::cout << "                Up:[" << up.x << "," << up.y << "," << up.z << "]" << std::endl;
-    
-    m_context->Dispatch(groupsX, groupsY, 1);
-    
-    // Flush to ensure GPU work is submitted
-    m_context->Flush();
-    
-    // Check device status
-    HRESULT deviceStatus = m_device->GetDeviceRemovedReason();
-    if (FAILED(deviceStatus)) {
-        std::cerr << "ERROR: Device removed! HRESULT: 0x" << std::hex << deviceStatus << std::dec << std::endl;
-    } else {
-        std::cout << "Device status: OK" << std::endl;
-    }
-    
-    // Unbind resources
-    ID3D11ShaderResourceView* nullSRVs[] = { nullptr, nullptr, nullptr };
-    m_context->CSSetShaderResources(0, 3, nullSRVs);
-    ID3D11UnorderedAccessView* nullUAV = nullptr;
-    m_context->CSSetUnorderedAccessViews(0, 1, &nullUAV, nullptr);
-    
-    m_frameCount++;
-    
-    if (m_frameCount % 10 == 0) {
-        std::cout << "Frame " << m_frameCount << " rendered" << std::endl;
-    }
-}
-
-void Renderer::GetRenderResult(unsigned char* pixels) {
-    if (!m_device || !m_context || !m_renderTarget || !pixels) {
-        return;
-    }
-    
-    // Create staging texture for readback
-    D3D11_TEXTURE2D_DESC texDesc;
-    m_renderTarget->GetDesc(&texDesc);
-    texDesc.Usage = D3D11_USAGE_STAGING;
-    texDesc.BindFlags = 0;
-    texDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    
-    ID3D11Texture2D* stagingTexture = nullptr;
-    HRESULT hr = m_device->CreateTexture2D(&texDesc, nullptr, &stagingTexture);
-    if (FAILED(hr)) {
-        return;
-    }
-    
-    // Copy from GPU to staging texture
-    std::cout << "Copying GPU texture to staging..." << std::endl;
-    m_context->CopyResource(stagingTexture, m_renderTarget);
-    
-    // Ensure copy is complete
-    m_context->Flush();
-    std::cout << "Copy complete, mapping for readback..." << std::endl;
-    
-    // Map and read data
-    D3D11_MAPPED_SUBRESOURCE mapped;
-    hr = m_context->Map(stagingTexture, 0, D3D11_MAP_READ, 0, &mapped);
-    std::cout << "Map result: HRESULT=0x" << std::hex << hr << std::dec << std::endl;
-    
-    if (FAILED(hr)) {
-        // Check if device was removed
-        HRESULT deviceRemoved = m_device->GetDeviceRemovedReason();
-        std::cerr << "ERROR: Failed to map staging texture!" << std::endl;
-        std::cerr << "Device removed reason: 0x" << std::hex << deviceRemoved << std::dec << std::endl;
-        
-        if (deviceRemoved == DXGI_ERROR_DEVICE_HUNG) {
-            std::cerr << "Device hung - GPU took too long to respond (TDR timeout)" << std::endl;
-            std::cerr << "Large scenes may require splitting render into smaller dispatches or using async compute" << std::endl;
-        } else if (deviceRemoved == DXGI_ERROR_DEVICE_REMOVED) {
-            std::cerr << "Device removed - GPU driver crashed or was reset" << std::endl;
-        } else if (deviceRemoved == DXGI_ERROR_DEVICE_RESET) {
-            std::cerr << "Device reset - GPU was reset by the OS" << std::endl;
-        } else if (deviceRemoved == DXGI_ERROR_DRIVER_INTERNAL_ERROR) {
-            std::cerr << "Driver internal error" << std::endl;
-        }
-        
-        stagingTexture->Release();
-        return;
-    }
-    
-    if (SUCCEEDED(hr)) {
-        std::cout << "Mapped successfully, RowPitch=" << mapped.RowPitch << std::endl;
-        float* src = static_cast<float*>(mapped.pData);
-        
-        // Validate mapped data
-        if (src == nullptr) {
-            std::cerr << "ERROR: Mapped pointer is null!" << std::endl;
-            m_context->Unmap(stagingTexture, 0);
-            stagingTexture->Release();
-            return;
-        }
-        
-        // Calculate row pitch in floats
-        size_t rowPitchFloats = mapped.RowPitch / sizeof(float);
-        
-        for (int y = 0; y < m_height; ++y) {
-            for (int x = 0; x < m_width; ++x) {
-                size_t srcIdx = static_cast<size_t>(y) * rowPitchFloats + static_cast<size_t>(x) * 4;
-                size_t dstIdx = static_cast<size_t>(y * m_width + x) * 4;
-                
-                // Bounds check
-                if (dstIdx + 3 >= static_cast<size_t>(m_width * m_height * 4)) {
-                    std::cerr << "ERROR: Destination index out of bounds at (" << x << "," << y << ")" << std::endl;
-                    break;
-                }
-                
-                float r = src[srcIdx + 0];
-                float g = src[srcIdx + 1];
-                float b = src[srcIdx + 2];
-                
-                // Convert float to byte with gamma correction
-                pixels[dstIdx + 0] = static_cast<unsigned char>(std::pow(std::clamp(r, 0.0f, 1.0f), 1.0f / 2.2f) * 255.0f);
-                pixels[dstIdx + 1] = static_cast<unsigned char>(std::pow(std::clamp(g, 0.0f, 1.0f), 1.0f / 2.2f) * 255.0f);
-                pixels[dstIdx + 2] = static_cast<unsigned char>(std::pow(std::clamp(b, 0.0f, 1.0f), 1.0f / 2.2f) * 255.0f);
-                pixels[dstIdx + 3] = 255;
-            }
-        }
-        
-        m_context->Unmap(stagingTexture, 0);
-    }
-    
-    stagingTexture->Release();
-}
-
-void Renderer::SetSamplesPerPixel(int samples) {
-    m_samplesPerPixel = samples;
-}
-
-void Renderer::SetMaxBounces(int bounces) {
-    m_maxBounces = bounces;
-}
-
-void Renderer::SetRussianRouletteDepth(int depth) {
-    m_rrDepth = depth;
-}
-
-void Renderer::SetEnvironmentLight(float intensity) {
-    m_environmentLight = intensity;
-}
-
-bool Renderer::InitializeD3D() {
-    HRESULT hr;
-    
-    // Create device and context
-    UINT createDeviceFlags = 0;
-#ifdef _DEBUG
-    createDeviceFlags |= D3D11_CREATE_DEVICE_DEBUG;
-#endif
-    
-    D3D_FEATURE_LEVEL featureLevels[] = {
-        D3D_FEATURE_LEVEL_11_1,
-        D3D_FEATURE_LEVEL_11_0,
-    };
-    UINT numFeatureLevels = ARRAYSIZE(featureLevels);
-    
-    D3D_FEATURE_LEVEL featureLevel;
-    hr = D3D11CreateDevice(
-        nullptr,                    // Adapter
-        D3D_DRIVER_TYPE_HARDWARE,
-        nullptr,                    // Software rasterizer module
-        createDeviceFlags,
-        featureLevels,
-        numFeatureLevels,
-        D3D11_SDK_VERSION,
-        &m_device,
-        &featureLevel,
-        &m_context
-    );
-    
-    if (FAILED(hr)) {
-        std::cerr << "Failed to create D3D11 device" << std::endl;
-        return false;
-    }
-    
-    std::cout << "D3D11 device created successfully" << std::endl;
-    return true;
-}
-
-bool Renderer::CreateShaders() {
-    HRESULT hr;
-    
-    // Get executable directory
-    wchar_t exePath[MAX_PATH];
-    GetModuleFileNameW(NULL, exePath, MAX_PATH);
-    std::wstring exeDir = exePath;
-    size_t lastSlash = exeDir.find_last_of(L"\\/");
-    if (lastSlash != std::wstring::npos) {
-        exeDir = exeDir.substr(0, lastSlash);
-    }
-    
-    // Construct shader path (shaders are copied to bin/shaders/ during build)
-    std::wstring shaderPath = exeDir + L"\\shaders\\PathTracing.hlsl";
-    
-    std::wcout << L"Loading shader from: " << shaderPath << std::endl;
-    
-    // Compile path tracing compute shader
-    ID3DBlob* shaderBlob = nullptr;
-    ID3DBlob* errorBlob = nullptr;
-    
-    DWORD shaderFlags = D3DCOMPILE_ENABLE_STRICTNESS;
-#ifdef _DEBUG
-    shaderFlags |= D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
-#endif
-    
-    hr = D3DCompileFromFile(
-        shaderPath.c_str(),
-        nullptr,
-        D3D_COMPILE_STANDARD_FILE_INCLUDE,
-        "main",
-        "cs_5_0",
-        shaderFlags,
-        0,
-        &shaderBlob,
-        &errorBlob
-    );
-    
-    if (FAILED(hr)) {
-        if (errorBlob) {
-            std::string error(static_cast<char*>(errorBlob->GetBufferPointer()), errorBlob->GetBufferSize());
-            std::ofstream errorFile("shader_error.txt");
-            errorFile << error;
-            errorFile.close();
-            std::cerr << "Shader compilation error (see shader_error.txt): " << std::endl;
-            std::cerr << error << std::endl;
-            errorBlob->Release();
+    void Renderer::OnInit(HWND hwnd) {
+        m_hwnd = hwnd;
+        InitPipeline(hwnd);
+        CheckRaytracingSupport();
+        if (m_dxrSupported) {
+            CreateRaytracingPipeline();
         } else {
-            std::cerr << "Shader compilation failed with HRESULT: 0x" << std::hex << hr << std::dec << std::endl;
+            std::cerr << "WARNING: DirectX Raytracing is not supported on this device!" << std::endl;
+            std::cerr << "The application will run without ray tracing." << std::endl;
         }
-        return false;
     }
-    
-    // Check for warnings even if compilation succeeded
-    if (errorBlob) {
-        std::cout << "Shader compilation warnings: " 
-                 << static_cast<char*>(errorBlob->GetBufferPointer()) << std::endl;
-        errorBlob->Release();
-    }
-    
-    hr = m_device->CreateComputeShader(
-        shaderBlob->GetBufferPointer(),
-        shaderBlob->GetBufferSize(),
-        nullptr,
-        &m_pathTracingShader
-    );
-    
-    shaderBlob->Release();
-    
-    if (FAILED(hr)) {
-        std::cerr << "Failed to create compute shader" << std::endl;
-        return false;
-    }
-    
-    std::cout << "Shaders compiled successfully" << std::endl;
-    return true;
-}
 
-bool Renderer::CreateBuffers() {
-    HRESULT hr;
-    
-    // Create render target texture
-    D3D11_TEXTURE2D_DESC texDesc = {};
-    texDesc.Width = m_width;
-    texDesc.Height = m_height;
-    texDesc.MipLevels = 1;
-    texDesc.ArraySize = 1;
-    texDesc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
-    texDesc.SampleDesc.Count = 1;
-    texDesc.Usage = D3D11_USAGE_DEFAULT;
-    texDesc.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
-    
-    hr = m_device->CreateTexture2D(&texDesc, nullptr, &m_renderTarget);
-    if (FAILED(hr)) {
-        std::cerr << "Failed to create render target texture" << std::endl;
-        return false;
-    }
-    
-    // Create UAV for compute shader output
-    D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
-    uavDesc.Format = texDesc.Format;
-    uavDesc.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
-    uavDesc.Texture2D.MipSlice = 0;
-    
-    hr = m_device->CreateUnorderedAccessView(m_renderTarget, &uavDesc, &m_renderTargetUAV);
-    if (FAILED(hr)) {
-        std::cerr << "Failed to create UAV" << std::endl;
-        return false;
-    }
-    
-    // Create ping-pong accumulation textures (for progressive rendering)
-    for (int i = 0; i < 2; ++i) {
-        hr = m_device->CreateTexture2D(&texDesc, nullptr, &m_accumulationTexture[i]);
-        if (FAILED(hr)) {
-            std::cerr << "Failed to create accumulation texture " << i << std::endl;
-            return false;
-        }
-        
-        // Create UAV for accumulation texture
-        hr = m_device->CreateUnorderedAccessView(m_accumulationTexture[i], &uavDesc, &m_accumulationUAV[i]);
-        if (FAILED(hr)) {
-            std::cerr << "Failed to create accumulation UAV " << i << std::endl;
-            return false;
-        }
-        
-        // Create SRV for accumulation texture (to read previous frame)
-        D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
-        srvDesc.Format = texDesc.Format;
-        srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-        srvDesc.Texture2D.MostDetailedMip = 0;
-        srvDesc.Texture2D.MipLevels = 1;
-        
-        hr = m_device->CreateShaderResourceView(m_accumulationTexture[i], &srvDesc, &m_accumulationSRV[i]);
-        if (FAILED(hr)) {
-            std::cerr << "Failed to create accumulation SRV " << i << std::endl;
-            return false;
-        }
-        
-        // Initialize accumulation texture to zero
-        float clearColor[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-        m_context->ClearUnorderedAccessViewFloat(m_accumulationUAV[i], clearColor);
-    }
-    
-    m_currentAccumIndex = 0;
-    
-    // Create constant buffer
-    // RenderParams structure: Camera (80) + 6 uints (24) + padding (8) + 2 uints (8) = 120 bytes
-    // Must be aligned to 16 bytes for D3D11
-    D3D11_BUFFER_DESC cbDesc = {};
-    cbDesc.ByteWidth = 128;  // Next multiple of 16 after 120
-    cbDesc.Usage = D3D11_USAGE_DYNAMIC;
-    cbDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-    cbDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-    
-    hr = m_device->CreateBuffer(&cbDesc, nullptr, &m_constantBuffer);
-    if (FAILED(hr)) {
-        std::cerr << "Failed to create constant buffer" << std::endl;
-        return false;
-    }
-    
-    std::cout << "Render buffers created" << std::endl;
-    return true;
-}
-
-void Renderer::CleanupSceneBuffers() {
-    if (m_triangleSRV) { m_triangleSRV->Release(); m_triangleSRV = nullptr; }
-    if (m_triangleBuffer) { m_triangleBuffer->Release(); m_triangleBuffer = nullptr; }
-    if (m_materialSRV) { m_materialSRV->Release(); m_materialSRV = nullptr; }
-    if (m_materialBuffer) { m_materialBuffer->Release(); m_materialBuffer = nullptr; }
-    if (m_lightSRV) { m_lightSRV->Release(); m_lightSRV = nullptr; }
-    if (m_lightBuffer) { m_lightBuffer->Release(); m_lightBuffer = nullptr; }
-    if (m_bvhSRV) { m_bvhSRV->Release(); m_bvhSRV = nullptr; }
-    if (m_bvhBuffer) { m_bvhBuffer->Release(); m_bvhBuffer = nullptr; }
-    if (m_bvhTriangleIndicesSRV) { m_bvhTriangleIndicesSRV->Release(); m_bvhTriangleIndicesSRV = nullptr; }
-    if (m_bvhTriangleIndicesBuffer) { m_bvhTriangleIndicesBuffer->Release(); m_bvhTriangleIndicesBuffer = nullptr; }
-}
-
-bool Renderer::UploadSceneData(const Scene& scene) {
-    CleanupSceneBuffers();
-    
-    HRESULT hr;
-    
-    // Prepare triangle data (must match HLSL struct Triangle layout exactly)
-    struct GPUTriangle {
-        float v0[3]; float _pad_v0;
-        float v1[3]; float _pad_v1;
-        float v2[3]; float _pad_v2;
-        float n0[3]; float _pad_n0;
-        float n1[3]; float _pad_n1;
-        float n2[3]; float _pad_n2;
-        uint32_t materialIndex;
-        uint32_t _pad_mat[3];
-    }; // Total size: 112 bytes
-    
-    std::vector<GPUTriangle> triangles;
-    for (const auto& mesh : scene.GetMeshes()) {
-        const auto& vertices = mesh->GetVertices();
-        const auto& indices = mesh->GetIndices();
-        uint32_t matIdx = mesh->GetMaterialIndex();
-        
-        for (size_t i = 0; i < indices.size(); i += 3) {
-            GPUTriangle tri;
-            const auto& v0 = vertices[indices[i]];
-            const auto& v1 = vertices[indices[i + 1]];
-            const auto& v2 = vertices[indices[i + 2]];
+    void Renderer::LoadScene(const std::string& path) {
+        try {
+            m_scene = std::make_unique<Scene>();
+            m_scene->LoadFromFile(path);
             
-            tri.v0[0] = v0.position.x; tri.v0[1] = v0.position.y; tri.v0[2] = v0.position.z; tri._pad_v0 = 0.0f;
-            tri.v1[0] = v1.position.x; tri.v1[1] = v1.position.y; tri.v1[2] = v1.position.z; tri._pad_v1 = 0.0f;
-            tri.v2[0] = v2.position.x; tri.v2[1] = v2.position.y; tri.v2[2] = v2.position.z; tri._pad_v2 = 0.0f;
-            tri.n0[0] = v0.normal.x; tri.n0[1] = v0.normal.y; tri.n0[2] = v0.normal.z; tri._pad_n0 = 0.0f;
-            tri.n1[0] = v1.normal.x; tri.n1[1] = v1.normal.y; tri.n1[2] = v1.normal.z; tri._pad_n1 = 0.0f;
-            tri.n2[0] = v2.normal.x; tri.n2[1] = v2.normal.y; tri.n2[2] = v2.normal.z; tri._pad_n2 = 0.0f;
-            tri.materialIndex = matIdx;
-            tri._pad_mat[0] = tri._pad_mat[1] = tri._pad_mat[2] = 0;
+            // Prepare command list for resource creation
+            WaitForGpu(); // Ensure GPU is idle
+            ThrowIfFailed(m_commandAllocators[m_frameIndex]->Reset(), "Failed to reset command allocator");
+            ThrowIfFailed(m_commandList->Reset(m_commandAllocators[m_frameIndex].Get(), nullptr), "Failed to reset command list");
             
-            triangles.push_back(tri);
+            // Create resources (these functions will record commands)
+            CreateShaderResources(m_commandList.Get());
+            CreateAccelerationStructures(m_commandList.Get());
+            CreateShaderBindingTable();
+            
+            // Execute and wait
+            ThrowIfFailed(m_commandList->Close(), "Failed to close command list");
+            ID3D12CommandList* lists[] = { m_commandList.Get() };
+            m_commandQueue->ExecuteCommandLists(1, lists);
+            WaitForGpu();
+            
+            std::cout << "Scene loaded successfully" << std::endl;
+        } catch (const std::runtime_error& e) {
+            std::cerr << "Failed to load scene: " << e.what() << std::endl;
+            throw;
+        } catch (const std::exception& e) {
+            std::cerr << "Failed to load scene: " << e.what() << std::endl;
+            throw;
+        } catch (...) {
+            std::cerr << "Failed to load scene: Unknown error" << std::endl;
+            throw std::runtime_error("Unknown error occurred while loading scene");
         }
     }
-    
-    m_numTriangles = static_cast<uint32_t>(triangles.size());
-    std::cout << "Uploading " << m_numTriangles << " triangles..." << std::endl;
-    
-    // Check buffer size limits
-    size_t triangleBufferSize = sizeof(GPUTriangle) * m_numTriangles;
-    std::cout << "Triangle buffer size: " << triangleBufferSize << " bytes (" 
-              << (triangleBufferSize / 1024.0 / 1024.0) << " MB)" << std::endl;
-    
-    if (triangleBufferSize > 128 * 1024 * 1024) {
-        std::cerr << "WARNING: Triangle buffer exceeds 128MB, may fail on some GPUs!" << std::endl;
-    }
-    
-    // Debug: Print first triangle
-    if (m_numTriangles > 0) {
-        const auto& tri0 = triangles[0];
-        std::cout << "  Triangle[0]: v0=[" << tri0.v0[0] << "," << tri0.v0[1] << "," << tri0.v0[2] << "]"
-                  << " v1=[" << tri0.v1[0] << "," << tri0.v1[1] << "," << tri0.v1[2] << "]"
-                  << " v2=[" << tri0.v2[0] << "," << tri0.v2[1] << "," << tri0.v2[2] << "]"
-                  << " matIdx=" << tri0.materialIndex << std::endl;
-    }
-    
-    if (m_numTriangles > 0) {
-        D3D11_BUFFER_DESC bufferDesc = {};
-        bufferDesc.ByteWidth = sizeof(GPUTriangle) * m_numTriangles;
-        bufferDesc.Usage = D3D11_USAGE_DEFAULT;
-        bufferDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        bufferDesc.StructureByteStride = sizeof(GPUTriangle);
-        bufferDesc.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
-        
-        D3D11_SUBRESOURCE_DATA initData = {};
-        initData.pSysMem = triangles.data();
-        
-        hr = m_device->CreateBuffer(&bufferDesc, &initData, &m_triangleBuffer);
-        if (FAILED(hr)) {
-            std::cerr << "Failed to create triangle buffer! HRESULT: 0x" << std::hex << hr << std::dec << std::endl;
-            std::cerr << "Buffer size: " << bufferDesc.ByteWidth << " bytes" << std::endl;
-            std::cerr << "Number of triangles: " << m_numTriangles << std::endl;
-            return false;
-        }
-        std::cout << "Triangle buffer created successfully" << std::endl;
-        
-        D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
-        srvDesc.Format = DXGI_FORMAT_UNKNOWN;
-        srvDesc.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
-        srvDesc.Buffer.FirstElement = 0;
-        srvDesc.Buffer.NumElements = m_numTriangles;
-        
-        hr = m_device->CreateShaderResourceView(m_triangleBuffer, &srvDesc, &m_triangleSRV);
-        if (FAILED(hr)) {
-            std::cerr << "Failed to create triangle SRV" << std::endl;
-            return false;
-        }
-    }
-    
-    // Prepare material data
-    struct GPUMaterial {
-        uint32_t type;
-        float albedo[3];
-        float emission[3];
-        float metallic;
-        float roughness;
-        float ior;
-        float transmission;
-        uint32_t padding[1];
-    };
-    
-    std::vector<GPUMaterial> materials;
-    for (const auto& mat : scene.GetMaterials()) {
-        GPUMaterial gmat;
-        gmat.type = static_cast<uint32_t>(mat->GetType());
-        
-        glm::vec3 albedo = mat->GetAlbedo();
-        gmat.albedo[0] = albedo.x; gmat.albedo[1] = albedo.y; gmat.albedo[2] = albedo.z;
-        
-        glm::vec3 emission = mat->GetEmission();
-        gmat.emission[0] = emission.x; gmat.emission[1] = emission.y; gmat.emission[2] = emission.z;
-        
-        gmat.metallic = mat->GetMetallic();
-        gmat.roughness = mat->GetRoughness();
-        gmat.ior = mat->GetIOR();
-        gmat.transmission = mat->GetTransmission();
-        
-        // Debug output
-        if (glm::length(emission) > 0.01f) {
-            std::cout << "  GPU Material type=" << gmat.type 
-                     << " emission=[" << emission.x << "," << emission.y << "," << emission.z << "]" << std::endl;
-        }
-        
-        materials.push_back(gmat);
-    }
-    
-    m_numMaterials = static_cast<uint32_t>(materials.size());
-    std::cout << "Uploading " << m_numMaterials << " materials..." << std::endl;
-    
-    // Check material buffer size
-    size_t materialBufferSize = sizeof(GPUMaterial) * m_numMaterials;
-    std::cout << "Material buffer size: " << materialBufferSize << " bytes" << std::endl;
-    
-    if (m_numMaterials > 0) {
-        D3D11_BUFFER_DESC bufferDesc = {};
-        bufferDesc.ByteWidth = sizeof(GPUMaterial) * m_numMaterials;
-        bufferDesc.Usage = D3D11_USAGE_DEFAULT;
-        bufferDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        bufferDesc.StructureByteStride = sizeof(GPUMaterial);
-        bufferDesc.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
-        
-        D3D11_SUBRESOURCE_DATA initData = {};
-        initData.pSysMem = materials.data();
-        
-        hr = m_device->CreateBuffer(&bufferDesc, &initData, &m_materialBuffer);
-        if (FAILED(hr)) {
-            std::cerr << "Failed to create material buffer! HRESULT: 0x" << std::hex << hr << std::dec << std::endl;
-            std::cerr << "Buffer size: " << bufferDesc.ByteWidth << " bytes" << std::endl;
-            std::cerr << "Number of materials: " << m_numMaterials << std::endl;
-            return false;
-        }
-        std::cout << "Material buffer created successfully" << std::endl;
-        
-        D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
-        srvDesc.Format = DXGI_FORMAT_UNKNOWN;
-        srvDesc.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
-        srvDesc.Buffer.FirstElement = 0;
-        srvDesc.Buffer.NumElements = m_numMaterials;
-        
-        hr = m_device->CreateShaderResourceView(m_materialBuffer, &srvDesc, &m_materialSRV);
-        if (FAILED(hr)) {
-            std::cerr << "Failed to create material SRV" << std::endl;
-            return false;
+
+    void Renderer::LoadSceneAsync(const std::string& path) {
+        try {
+            std::cout << "[Async] Loading scene from file..." << std::endl;
+            std::cout.flush();
+            
+            m_scene = std::make_unique<Scene>();
+            m_scene->LoadFromFile(path);
+            
+            std::cout << "[Async] Creating shader resources..." << std::endl;
+            std::cout.flush();
+            
+            // Create independent command allocator for async loading
+            Microsoft::WRL::ComPtr<ID3D12CommandAllocator> loadAllocator;
+            ThrowIfFailed(m_device->CreateCommandAllocator(
+                D3D12_COMMAND_LIST_TYPE_DIRECT,
+                IID_PPV_ARGS(&loadAllocator)),
+                "Failed to create load command allocator");
+            
+            Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> tempCommandList;
+            ThrowIfFailed(m_device->CreateCommandList(
+                0,
+                D3D12_COMMAND_LIST_TYPE_DIRECT,
+                loadAllocator.Get(),
+                nullptr,
+                IID_PPV_ARGS(&tempCommandList)),
+                "Failed to create load command list");
+            
+            Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList4> loadCommandList;
+            ThrowIfFailed(tempCommandList.As(&loadCommandList),
+                "Failed to query ID3D12GraphicsCommandList4 interface");
+            
+            // Close the command list (it was created in open state)
+            ThrowIfFailed(loadCommandList->Close(), "Failed to close new command list");
+            
+            // Reset the command allocator and list to prepare for recording
+            ThrowIfFailed(loadAllocator->Reset(), "Failed to reset load allocator");
+            ThrowIfFailed(loadCommandList->Reset(loadAllocator.Get(), nullptr), "Failed to reset load command list");
+            
+            // Create resources with independent command list (no swapping needed!)
+            CreateShaderResources(loadCommandList.Get());
+            CreateAccelerationStructures(loadCommandList.Get());
+            CreateShaderBindingTable();
+            
+            // Now close and execute the command list
+            ThrowIfFailed(loadCommandList->Close(), "Failed to close load command list");
+            ID3D12CommandList* lists[] = { loadCommandList.Get() };
+            m_commandQueue->ExecuteCommandLists(1, lists);
+            
+            // Wait for all GPU operations to complete
+            WaitForGpu();
+            
+            std::cout << "[Async] Scene loaded successfully" << std::endl;
+            std::cout.flush();
+        } catch (const std::runtime_error& e) {
+            std::cerr << "[Async] Failed to load scene: " << e.what() << std::endl;
+            std::cerr.flush();
+            throw;
+        } catch (const std::exception& e) {
+            std::cerr << "[Async] Failed to load scene: " << e.what() << std::endl;
+            std::cerr.flush();
+            throw;
+        } catch (...) {
+            std::cerr << "[Async] Failed to load scene: Unknown error" << std::endl;
+            std::cerr.flush();
+            throw std::runtime_error("Unknown error occurred while loading scene");
         }
     }
-    
-    // Build and upload BVH
-    std::cout << "Building BVH for acceleration..." << std::endl;
-    BVH bvh;
-    
-    // Collect all vertices and indices
-    std::vector<glm::vec3> allVertices;
-    std::vector<uint32_t> allIndices;
-    
-    for (const auto& mesh : scene.GetMeshes()) {
-        const auto& vertices = mesh->GetVertices();
-        const auto& indices = mesh->GetIndices();
-        
-        uint32_t baseVertex = static_cast<uint32_t>(allVertices.size());
-        for (const auto& v : vertices) {
-            allVertices.push_back(v.position);
-        }
-        for (uint32_t idx : indices) {
-            allIndices.push_back(baseVertex + idx);
-        }
-    }
-    
-    auto buildStart = std::chrono::high_resolution_clock::now();
-    bvh.Build(allVertices, allIndices);
-    auto buildEnd = std::chrono::high_resolution_clock::now();
-    auto buildTime = std::chrono::duration_cast<std::chrono::milliseconds>(buildEnd - buildStart).count();
-    
-    std::cout << "BVH built in " << buildTime << " ms" << std::endl;
-    std::cout << "BVH nodes: " << bvh.GetNodeCount() << ", max depth: " << bvh.GetMaxDepth() << std::endl;
-    
-    // Upload BVH to GPU
-    const auto& bvhNodes = bvh.GetNodes();
-    m_numBVHNodes = static_cast<uint32_t>(bvhNodes.size());
-    
-    if (m_numBVHNodes > 0) {
-        // First, build a triangle index remapping array
-        // This maps BVH internal triangle indices to original GPU buffer indices
-        std::vector<int32_t> triangleIndexRemap;
-        
-        // Convert BVH nodes to GPU format
-        struct GPUBVHNode {
-            float bboxMin[3]; float _pad0;
-            float bboxMax[3]; float _pad1;
-            int32_t leftChild;
-            int32_t rightChild;
-            int32_t firstPrim;
-            int32_t primCount;
+
+    void Renderer::RenderToFile(const std::string& outputPath, int samplesPerPixel, int maxBounces) {
+        // RAII guard to ensure m_isRendering is always cleared
+        struct RenderGuard {
+            std::atomic<bool>& flag;
+            RenderGuard(std::atomic<bool>& f) : flag(f) { flag.store(true); }
+            ~RenderGuard() { flag.store(false); }
         };
+        RenderGuard guard(m_isRendering);
         
-        std::vector<GPUBVHNode> gpuNodes;
-        for (const auto& node : bvhNodes) {
-            GPUBVHNode gpuNode;
-            gpuNode.bboxMin[0] = node.bbox.min.x;
-            gpuNode.bboxMin[1] = node.bbox.min.y;
-            gpuNode.bboxMin[2] = node.bbox.min.z;
-            gpuNode._pad0 = 0.0f;
-            gpuNode.bboxMax[0] = node.bbox.max.x;
-            gpuNode.bboxMax[1] = node.bbox.max.y;
-            gpuNode.bboxMax[2] = node.bbox.max.z;
-            gpuNode._pad1 = 0.0f;
-            gpuNode.leftChild = node.leftChild;
-            gpuNode.rightChild = node.rightChild;
-            
-            // For leaf nodes, remap triangle indices from BVH internal indices
-            // to original GPU buffer indices
-            if (node.leftChild == -1) {  // Leaf node
-                gpuNode.firstPrim = static_cast<int32_t>(triangleIndexRemap.size());
-                gpuNode.primCount = node.primCount;
-                
-                // Add the original triangle indices to the remap array
-                for (int i = 0; i < node.primCount; ++i) {
-                    int bvhTriIdx = node.firstPrim + i;
-                    int originalIdx = bvh.GetTriangleOriginalIndex(bvhTriIdx);
-                    triangleIndexRemap.push_back(originalIdx);
+        try {
+            m_stopRenderRequested = false;
+            std::cout << "Starting offline render to " << outputPath << "..." << std::endl;
+            std::cout << "Resolution: " << m_width << "x" << m_height 
+                      << ", Samples: " << samplesPerPixel 
+                      << ", Bounces: " << maxBounces << std::endl;
+
+            // Ensure scene is loaded
+            if (!m_scene || m_scene->GetMeshes().empty()) {
+                throw std::runtime_error("Scene is not loaded or is empty.");
+            }
+
+            // Create independent command resources for offline rendering
+            if (!m_offlineCommandAllocator) {
+                std::cout << "Creating offline command allocator..." << std::endl;
+                HRESULT hr = m_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&m_offlineCommandAllocator));
+                if (FAILED(hr)) {
+                    char errMsg[256];
+                    sprintf_s(errMsg, "Failed to create offline command allocator (HRESULT: 0x%08X)", hr);
+                    throw std::runtime_error(errMsg);
                 }
-            } else {  // Internal node
-                gpuNode.firstPrim = 0;
-                gpuNode.primCount = 0;
             }
             
-            gpuNodes.push_back(gpuNode);
-        }
-        
-        D3D11_BUFFER_DESC bufferDesc = {};
-        bufferDesc.ByteWidth = sizeof(GPUBVHNode) * m_numBVHNodes;
-        bufferDesc.Usage = D3D11_USAGE_DEFAULT;
-        bufferDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        bufferDesc.StructureByteStride = sizeof(GPUBVHNode);
-        bufferDesc.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
-        
-        D3D11_SUBRESOURCE_DATA initData = {};
-        initData.pSysMem = gpuNodes.data();
-        
-        hr = m_device->CreateBuffer(&bufferDesc, &initData, &m_bvhBuffer);
-        if (FAILED(hr)) {
-            std::cerr << "Failed to create BVH buffer! HRESULT: 0x" << std::hex << hr << std::dec << std::endl;
-            return false;
-        }
-        
-        D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
-        srvDesc.Format = DXGI_FORMAT_UNKNOWN;
-        srvDesc.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
-        srvDesc.Buffer.FirstElement = 0;
-        srvDesc.Buffer.NumElements = m_numBVHNodes;
-        
-        hr = m_device->CreateShaderResourceView(m_bvhBuffer, &srvDesc, &m_bvhSRV);
-        if (FAILED(hr)) {
-            std::cerr << "Failed to create BVH SRV" << std::endl;
-            return false;
-        }
-        
-        std::cout << "BVH uploaded to GPU (" << (bufferDesc.ByteWidth / 1024.0) << " KB)" << std::endl;
-        
-        // Upload triangle index remapping buffer
-        m_numBVHTriangleIndices = static_cast<uint32_t>(triangleIndexRemap.size());
-        
-        if (m_numBVHTriangleIndices > 0) {
-            D3D11_BUFFER_DESC indexBufferDesc = {};
-            indexBufferDesc.ByteWidth = sizeof(int32_t) * m_numBVHTriangleIndices;
-            indexBufferDesc.Usage = D3D11_USAGE_DEFAULT;
-            indexBufferDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-            indexBufferDesc.StructureByteStride = sizeof(int32_t);
-            indexBufferDesc.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
-            
-            D3D11_SUBRESOURCE_DATA indexInitData = {};
-            indexInitData.pSysMem = triangleIndexRemap.data();
-            
-            hr = m_device->CreateBuffer(&indexBufferDesc, &indexInitData, &m_bvhTriangleIndicesBuffer);
-            if (FAILED(hr)) {
-                std::cerr << "Failed to create BVH triangle indices buffer!" << std::endl;
-                return false;
+            if (!m_offlineFence) {
+                std::cout << "Creating offline fence..." << std::endl;
+                HRESULT hr = m_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&m_offlineFence));
+                if (FAILED(hr)) {
+                    char errMsg[256];
+                    sprintf_s(errMsg, "Failed to create offline fence (HRESULT: 0x%08X)", hr);
+                    throw std::runtime_error(errMsg);
+                }
+                m_offlineFenceValue = 1;
+                m_offlineFenceEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+                if (!m_offlineFenceEvent) {
+                    throw std::runtime_error("Failed to create offline fence event");
+                }
             }
-            
-            D3D11_SHADER_RESOURCE_VIEW_DESC indexSrvDesc = {};
-            indexSrvDesc.Format = DXGI_FORMAT_UNKNOWN;
-            indexSrvDesc.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
-            indexSrvDesc.Buffer.FirstElement = 0;
-            indexSrvDesc.Buffer.NumElements = m_numBVHTriangleIndices;
-            
-            hr = m_device->CreateShaderResourceView(m_bvhTriangleIndicesBuffer, &indexSrvDesc, &m_bvhTriangleIndicesSRV);
-            if (FAILED(hr)) {
-                std::cerr << "Failed to create BVH triangle indices SRV!" << std::endl;
-                return false;
-            }
-            
-            std::cout << "BVH triangle indices uploaded: " << m_numBVHTriangleIndices << " indices (" 
-                     << (indexBufferDesc.ByteWidth / 1024.0) << " KB)" << std::endl;
-        }
-    }
-    
-    // Prepare light data (placeholder for now)
-    struct GPULight {
-        uint32_t type;
-        float color[3];
-        float intensity;
-        float position[3];
-        float direction[3];
-        float size[2];
-        uint32_t padding[2];
-    };
-    
-    std::vector<GPULight> lights;
-    for (const auto& light : scene.GetLights()) {
-        GPULight glight;
-        glight.type = static_cast<uint32_t>(light->GetType());
-        
-        glm::vec3 color = light->GetColor();
-        glight.color[0] = color.x; glight.color[1] = color.y; glight.color[2] = color.z;
-        glight.intensity = light->GetIntensity();
-        
-        // Type-specific data would go here
-        glight.position[0] = glight.position[1] = glight.position[2] = 0.0f;
-        glight.direction[0] = glight.direction[1] = glight.direction[2] = 0.0f;
-        glight.size[0] = glight.size[1] = 0.0f;
-        
-        lights.push_back(glight);
-    }
-    
-    m_numLights = static_cast<uint32_t>(lights.size());
-    
-    if (m_numLights > 0) {
-        D3D11_BUFFER_DESC bufferDesc = {};
-        bufferDesc.ByteWidth = sizeof(GPULight) * m_numLights;
-        bufferDesc.Usage = D3D11_USAGE_DEFAULT;
-        bufferDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        bufferDesc.StructureByteStride = sizeof(GPULight);
-        bufferDesc.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
-        
-        D3D11_SUBRESOURCE_DATA initData = {};
-        initData.pSysMem = lights.data();
-        
-        hr = m_device->CreateBuffer(&bufferDesc, &initData, &m_lightBuffer);
-        if (FAILED(hr)) {
-            std::cerr << "Failed to create light buffer" << std::endl;
-            return false;
-        }
-        
-        D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
-        srvDesc.Format = DXGI_FORMAT_UNKNOWN;
-        srvDesc.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
-        srvDesc.Buffer.FirstElement = 0;
-        srvDesc.Buffer.NumElements = m_numLights;
-        
-        hr = m_device->CreateShaderResourceView(m_lightBuffer, &srvDesc, &m_lightSRV);
-        if (FAILED(hr)) {
-            std::cerr << "Failed to create light SRV" << std::endl;
-            return false;
-        }
-    }
-    
-    std::cout << "Scene data uploaded successfully" << std::endl;
-    return true;
-}
 
-void Renderer::Cleanup() {
-    CleanupSceneBuffers();
-    
-    if (m_constantBuffer) {
-        m_constantBuffer->Release();
-        m_constantBuffer = nullptr;
-    }
-    
-    // Release ping-pong accumulation buffers
-    for (int i = 0; i < 2; ++i) {
-        if (m_accumulationSRV[i]) {
-            m_accumulationSRV[i]->Release();
-            m_accumulationSRV[i] = nullptr;
-        }
-        if (m_accumulationUAV[i]) {
-            m_accumulationUAV[i]->Release();
-            m_accumulationUAV[i] = nullptr;
-        }
-        if (m_accumulationTexture[i]) {
-            m_accumulationTexture[i]->Release();
-            m_accumulationTexture[i] = nullptr;
-        }
-    }
-    
-    if (m_renderTargetUAV) {
-        m_renderTargetUAV->Release();
-        m_renderTargetUAV = nullptr;
-    }
-    
-    if (m_renderTarget) {
-        m_renderTarget->Release();
-        m_renderTarget = nullptr;
-    }
-    
-    if (m_accumShader) {
-        m_accumShader->Release();
-        m_accumShader = nullptr;
-    }
-    
-    if (m_pathTracingShader) {
-        m_pathTracingShader->Release();
-        m_pathTracingShader = nullptr;
-    }
-    
-    if (m_swapChain) {
-        m_swapChain->Release();
-        m_swapChain = nullptr;
-    }
-    
-    if (m_context) {
-        m_context->Release();
-        m_context = nullptr;
-    }
-    
-    if (m_device) {
-        m_device->Release();
-        m_device = nullptr;
-    }
-    
-    std::cout << "Renderer cleaned up" << std::endl;
-}
+            // Reset and get command list
+            std::cout << "Resetting command allocator..." << std::endl;
+            HRESULT hr = m_offlineCommandAllocator->Reset();
+            if (FAILED(hr)) {
+                char errMsg[256];
+                sprintf_s(errMsg, "Failed to reset offline command allocator (HRESULT: 0x%08X)", hr);
+                throw std::runtime_error(errMsg);
+            }
+            
+            Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList4> renderCommandList;
+            std::cout << "Creating command list..." << std::endl;
+            hr = m_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, m_offlineCommandAllocator.Get(), nullptr, IID_PPV_ARGS(&renderCommandList));
+            if (FAILED(hr)) {
+                char errMsg[256];
+                sprintf_s(errMsg, "Failed to create command list (HRESULT: 0x%08X)", hr);
+                throw std::runtime_error(errMsg);
+            }
+            
+            // Set pipeline state
+            renderCommandList->SetPipelineState1(m_dxrStateObject.Get());
+            renderCommandList->SetComputeRootSignature(m_raytracingGlobalRootSignature.Get());
 
-} // namespace ACG
+            // Set heaps
+            ID3D12DescriptorHeap* ppHeaps[] = { m_srvUavHeap.Get() };
+            renderCommandList->SetDescriptorHeaps(_countof(ppHeaps), ppHeaps);
+
+            // DEBUG: Print binding info
+            std::cout << "Setting up shader bindings..." << std::endl;
+            std::cout << "  m_srvUavDescriptorSize: " << m_srvUavDescriptorSize << std::endl;
+            std::cout << "  Heap start ptr: " << m_srvUavHeap->GetGPUDescriptorHandleForHeapStart().ptr << std::endl;
+            std::cout.flush();
+
+            // Set root arguments
+            // Root parameter 0: UAV table (output texture at index 0)
+            D3D12_GPU_DESCRIPTOR_HANDLE uavHandle = m_srvUavHeap->GetGPUDescriptorHandleForHeapStart();
+            uavHandle.ptr += m_uavIndex_Output * m_srvUavDescriptorSize;
+            std::cout << "  Output UAV (index " << m_uavIndex_Output << ") ptr: " << uavHandle.ptr << std::endl;
+            std::cout.flush();
+            renderCommandList->SetComputeRootDescriptorTable(0, uavHandle);
+            
+            // Root parameter 1: TLAS (direct SRV, not a table)
+            std::cout << "  TLAS address: " << m_topLevelAS->GetGPUVirtualAddress() << std::endl;
+            std::cout.flush();
+            renderCommandList->SetComputeRootShaderResourceView(1, m_topLevelAS->GetGPUVirtualAddress());
+            
+            // Root parameter 2: Vertices SRV table (index 1)
+            D3D12_GPU_DESCRIPTOR_HANDLE verticesHandle = m_srvUavHeap->GetGPUDescriptorHandleForHeapStart();
+            verticesHandle.ptr += m_srvIndex_Vertices * m_srvUavDescriptorSize;
+            std::cout << "  Vertices SRV (index " << m_srvIndex_Vertices << ") ptr: " << verticesHandle.ptr << std::endl;
+            std::cout.flush();
+            renderCommandList->SetComputeRootDescriptorTable(2, verticesHandle);
+            
+            // Root parameter 3: Indices SRV table (index 2)
+            D3D12_GPU_DESCRIPTOR_HANDLE indicesHandle = m_srvUavHeap->GetGPUDescriptorHandleForHeapStart();
+            indicesHandle.ptr += m_srvIndex_Indices * m_srvUavDescriptorSize;
+            std::cout << "  Indices SRV (index " << m_srvIndex_Indices << ") ptr: " << indicesHandle.ptr << std::endl;
+            std::cout.flush();
+            renderCommandList->SetComputeRootDescriptorTable(3, indicesHandle);
+            
+            // Root parameter 4: Triangle materials SRV table (index 3)
+            D3D12_GPU_DESCRIPTOR_HANDLE triMatHandle = m_srvUavHeap->GetGPUDescriptorHandleForHeapStart();
+            triMatHandle.ptr += 3 * m_srvUavDescriptorSize; // Index 3
+            std::cout << "  TriangleMaterials SRV (index 3) ptr: " << triMatHandle.ptr << std::endl;
+            std::cout.flush();
+            renderCommandList->SetComputeRootDescriptorTable(4, triMatHandle);
+            
+            // Root parameter 5: Materials SRV table (index 4)
+            D3D12_GPU_DESCRIPTOR_HANDLE materialsHandle = m_srvUavHeap->GetGPUDescriptorHandleForHeapStart();
+            materialsHandle.ptr += m_srvIndex_Materials * m_srvUavDescriptorSize;
+            std::cout << "  Materials SRV (index " << m_srvIndex_Materials << ") ptr: " << materialsHandle.ptr << std::endl;
+            std::cout.flush();
+            renderCommandList->SetComputeRootDescriptorTable(5, materialsHandle);
+            
+            // Root parameter 6: Textures SRV table (not used yet, bind dummy)
+            D3D12_GPU_DESCRIPTOR_HANDLE texturesHandle = m_srvUavHeap->GetGPUDescriptorHandleForHeapStart();
+            std::cout << "  Textures SRV (dummy) ptr: " << texturesHandle.ptr << std::endl;
+            std::cout.flush();
+            renderCommandList->SetComputeRootDescriptorTable(6, texturesHandle);
+
+            // Root parameter 7: Camera constants (32-bit constants)
+            // Compute camera matrices
+            glm::vec3 pos = m_camera.GetPosition();
+            glm::vec3 dir = m_camera.GetDirection();
+            glm::vec3 right = m_camera.GetRight();
+            glm::vec3 up = m_camera.GetUp();
+            
+            // Build camera-to-world matrix (view inverse)
+            // GLM matrices are COLUMN-MAJOR, so mat[i] is the i-th COLUMN
+            glm::mat4 cameraToWorld = glm::mat4(1.0f);
+            cameraToWorld[0] = glm::vec4(right, 0.0f);      // X axis (column 0)
+            cameraToWorld[1] = glm::vec4(up, 0.0f);         // Y axis (column 1)
+            cameraToWorld[2] = glm::vec4(-dir, 0.0f);       // Z axis (column 2) - camera looks along -Z
+            cameraToWorld[3] = glm::vec4(pos, 1.0f);        // Translation (column 3)
+            
+            std::cout << "  Before transpose, column 2 (-dir): (" << cameraToWorld[2][0] << "," 
+                     << cameraToWorld[2][1] << "," << cameraToWorld[2][2] << ")" << std::endl;
+            
+            // Transpose for row-major HLSL (DirectX uses row-major by default)
+            cameraToWorld = glm::transpose(cameraToWorld);
+            
+            // Get projection matrix and invert it, then transpose
+            glm::mat4 projMatrix = m_camera.GetProjectionMatrix();
+            glm::mat4 projInverse = glm::transpose(glm::inverse(projMatrix));
+            
+            CameraConstants cameraConstants;
+            cameraConstants.viewInverse = cameraToWorld;
+            cameraConstants.projInverse = projInverse;
+            cameraConstants.frameIndex = static_cast<uint32_t>(m_accumulatedSamples);
+            cameraConstants.maxBounces = static_cast<uint32_t>(m_maxBounces);
+            cameraConstants.environmentLightIntensity = m_environmentLightIntensity;
+            cameraConstants.padding = 0.0f;
+            
+            std::cout << "  Camera constants: frameIndex=" << cameraConstants.frameIndex 
+                     << ", maxBounces=" << cameraConstants.maxBounces 
+                     << ", envLight=" << cameraConstants.environmentLightIntensity << std::endl;
+            std::cout << "  Camera pos: (" << pos.x << "," << pos.y << "," << pos.z << ")" << std::endl;
+            std::cout << "  Camera dir: (" << dir.x << "," << dir.y << "," << dir.z << ")" << std::endl;
+            std::cout << "  Camera right: (" << right.x << "," << right.y << "," << right.z << ")" << std::endl;
+            std::cout << "  Camera up: (" << up.x << "," << up.y << "," << up.z << ")" << std::endl;
+            
+            // Print camera matrices for debugging
+            std::cout << "  cameraToWorld matrix:" << std::endl;
+            for (int i = 0; i < 4; i++) {
+                std::cout << "    [" << cameraToWorld[i][0] << ", " << cameraToWorld[i][1] << ", " 
+                         << cameraToWorld[i][2] << ", " << cameraToWorld[i][3] << "]" << std::endl;
+            }
+            std::cout.flush();
+            
+            // Set root constants (144 bytes = 36 DWORDs)
+            renderCommandList->SetComputeRoot32BitConstants(7, sizeof(CameraConstants) / 4, &cameraConstants, 0);
+
+            std::cout << "All bindings set, dispatching rays..." << std::endl;
+            std::cout.flush();
+
+            // Dispatch rays with accumulation
+            D3D12_DISPATCH_RAYS_DESC dispatchDesc = {};
+            dispatchDesc.RayGenerationShaderRecord.StartAddress = m_sbtBuffer->GetGPUVirtualAddress() + m_sbtRayGenOffset;
+            dispatchDesc.RayGenerationShaderRecord.SizeInBytes = m_sbtEntrySize;
+            dispatchDesc.MissShaderTable.StartAddress = m_sbtBuffer->GetGPUVirtualAddress() + m_sbtMissOffset;
+            dispatchDesc.MissShaderTable.SizeInBytes = m_sbtEntrySize; // Assuming one miss shader
+            dispatchDesc.MissShaderTable.StrideInBytes = m_sbtEntrySize;
+            dispatchDesc.HitGroupTable.StartAddress = m_sbtBuffer->GetGPUVirtualAddress() + m_sbtHitGroupOffset;
+            dispatchDesc.HitGroupTable.SizeInBytes = m_sbtEntrySize; // Single hit group for all geometry
+            dispatchDesc.HitGroupTable.StrideInBytes = m_sbtEntrySize;
+            dispatchDesc.Width = m_width;
+            dispatchDesc.Height = m_height;
+            dispatchDesc.Depth = 1;
+
+            std::cout << "Starting progressive rendering loop..." << std::endl;
+            
+            // Reset accumulated samples counter
+            m_accumulatedSamples = 0;
+
+            for (int sampleIdx = 0; sampleIdx < samplesPerPixel; ++sampleIdx) {
+                // Check if stop was requested
+                if (m_stopRenderRequested) {
+                    std::cout << "Render stopped by user at sample " << (sampleIdx + 1) << "/" << samplesPerPixel << std::endl;
+                    std::cout.flush();
+                    renderCommandList->Close();
+                    return;
+                }
+                
+                // Progress output with flush to ensure visibility
+                if (sampleIdx == 0 || (sampleIdx + 1) % 10 == 0 || sampleIdx == samplesPerPixel - 1) {
+                    std::cout << "  Sample " << (sampleIdx + 1) << "/" << samplesPerPixel << " starting..." << std::endl;
+                    std::cout.flush();
+                }
+                
+                // Clear output texture before first sample to ensure clean start
+                if (sampleIdx == 0) {
+                    D3D12_RECT clearRect = { 0, 0, (LONG)m_width, (LONG)m_height };
+                    float clearColor[] = { 0.0f, 0.0f, 0.0f, 0.0f };
+                    renderCommandList->ClearUnorderedAccessViewFloat(
+                        m_srvUavHeap->GetGPUDescriptorHandleForHeapStart(),
+                        CD3DX12_CPU_DESCRIPTOR_HANDLE(m_srvUavHeap->GetCPUDescriptorHandleForHeapStart(), m_uavIndex_Output, m_srvUavDescriptorSize),
+                        m_outputTexture.Get(),
+                        clearColor,
+                        1, &clearRect
+                    );
+                    
+                    // Barrier after clear
+                    D3D12_RESOURCE_BARRIER uavBarrier = {};
+                    uavBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                    uavBarrier.UAV.pResource = m_outputTexture.Get();
+                    renderCommandList->ResourceBarrier(1, &uavBarrier);
+                }
+                
+                // Update frameIndex for this sample (already set camera constants earlier)
+                // Just need to update frameIndex via root constants
+                uint32_t currentFrameIndex = static_cast<uint32_t>(sampleIdx);
+                // SetComputeRoot32BitConstants can update part of the constants
+                // frameIndex is at offset 32 (after two 4x4 matrices = 32 floats = 128 bytes)
+                renderCommandList->SetComputeRoot32BitConstants(7, 1, &currentFrameIndex, 32);
+                
+                // Dispatch rays for this sample
+                renderCommandList->DispatchRays(&dispatchDesc);
+                
+                // Update progress counter
+                m_accumulatedSamples = sampleIdx + 1;
+                
+                // Add UAV barrier to ensure this sample completes before next
+                D3D12_RESOURCE_BARRIER uavBarrier = {};
+                uavBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                uavBarrier.UAV.pResource = m_outputTexture.Get();
+                renderCommandList->ResourceBarrier(1, &uavBarrier);
+            }
+            std::cout << "All samples dispatched successfully" << std::endl;
+            std::cout.flush();
+
+            // Transition output texture to copy source
+            std::cout << "Transitioning output texture..." << std::endl;
+            D3D12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::Transition(
+                m_outputTexture.Get(),
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COPY_SOURCE
+            );
+            renderCommandList->ResourceBarrier(1, &barrier);
+
+            // Create readback buffer
+            std::cout << "Creating readback buffer..." << std::endl;
+            D3D12_RESOURCE_DESC textureDesc = m_outputTexture->GetDesc();
+            UINT64 textureSize;
+            m_device->GetCopyableFootprints(&textureDesc, 0, 1, 0, nullptr, nullptr, nullptr, &textureSize);
+            
+            std::cout << "Texture size for readback: " << textureSize << " bytes" << std::endl;
+            std::cout << "Texture format: " << textureDesc.Format 
+                      << ", Width: " << textureDesc.Width 
+                      << ", Height: " << textureDesc.Height << std::endl;
+
+            Microsoft::WRL::ComPtr<ID3D12Resource> readbackBuffer;
+            HRESULT hrReadback = m_device->CreateCommittedResource(
+                &CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_READBACK),
+                D3D12_HEAP_FLAG_NONE,
+                &CD3DX12_RESOURCE_DESC::Buffer(textureSize),
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                nullptr,
+                IID_PPV_ARGS(&readbackBuffer));
+            
+            if (FAILED(hrReadback)) {
+                char errorMsg[256];
+                sprintf_s(errorMsg, "Failed to create readback buffer (HRESULT: 0x%08X, size: %llu bytes)", hrReadback, textureSize);
+                ThrowIfFailed(hrReadback, errorMsg);
+            }
+
+            // Copy texture to readback buffer
+            std::cout << "Copying to readback buffer..." << std::endl;
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint;
+            m_device->GetCopyableFootprints(&textureDesc, 0, 1, 0, &footprint, nullptr, nullptr, nullptr);
+        
+        D3D12_TEXTURE_COPY_LOCATION dst = {};
+        dst.pResource = readbackBuffer.Get();
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        dst.PlacedFootprint = footprint;
+
+        D3D12_TEXTURE_COPY_LOCATION src = {};
+        src.pResource = m_outputTexture.Get();
+        src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        src.SubresourceIndex = 0;
+
+            renderCommandList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+
+            // Transition back to UAV
+            std::cout << "Transitioning back to UAV..." << std::endl;
+            barrier = CD3DX12_RESOURCE_BARRIER::Transition(
+                m_outputTexture.Get(),
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+            );
+            renderCommandList->ResourceBarrier(1, &barrier);
+
+            // Execute and wait
+            std::cout << "Closing command list..." << std::endl;
+            hr = renderCommandList->Close();
+            if (FAILED(hr)) {
+                char errMsg[256];
+                sprintf_s(errMsg, "Failed to close render command list (HRESULT: 0x%08X)", hr);
+                throw std::runtime_error(errMsg);
+            }
+            
+            std::cout << "Executing command list..." << std::endl;
+            ID3D12CommandList* lists[] = { renderCommandList.Get() };
+            m_commandQueue->ExecuteCommandLists(1, lists);
+            
+            // Wait for offline rendering to complete using independent fence
+            std::cout << "Waiting for GPU..." << std::endl;
+            std::cout.flush();
+            
+            const UINT64 fence = m_offlineFenceValue;
+            hr = m_commandQueue->Signal(m_offlineFence.Get(), fence);
+            if (FAILED(hr)) {
+                char errMsg[256];
+                sprintf_s(errMsg, "Failed to signal fence (HRESULT: 0x%08X)", hr);
+                throw std::runtime_error(errMsg);
+            }
+            std::cout << "Fence signaled: " << fence << std::endl;
+            std::cout.flush();
+            m_offlineFenceValue++;
+            
+            // Check current fence value
+            UINT64 currentValue = m_offlineFence->GetCompletedValue();
+            std::cout << "Current fence value: " << currentValue << ", waiting for: " << fence << std::endl;
+            std::cout.flush();
+            
+            if (currentValue < fence) {
+                std::cout << "GPU not done yet, setting event..." << std::endl;
+                std::cout.flush();
+                
+                hr = m_offlineFence->SetEventOnCompletion(fence, m_offlineFenceEvent);
+                if (FAILED(hr)) {
+                    char errMsg[256];
+                    sprintf_s(errMsg, "Failed to set fence event (HRESULT: 0x%08X)", hr);
+                    throw std::runtime_error(errMsg);
+                }
+                
+                std::cout << "Waiting for fence event..." << std::endl;
+                std::cout.flush();
+                
+                // Wait with timeout (5 seconds instead of 10)
+                DWORD waitResult = WaitForSingleObject(m_offlineFenceEvent, 5000);
+                if (waitResult == WAIT_TIMEOUT) {
+                    std::cerr << "ERROR: GPU wait timeout after 5 seconds!" << std::endl;
+                    std::cerr << "Current fence value: " << m_offlineFence->GetCompletedValue() << std::endl;
+                    std::cerr.flush();
+                    // Force cleanup and throw
+                    if (readbackBuffer) {
+                        readbackBuffer->Release();
+                        readbackBuffer = nullptr;
+                    }
+                    throw std::runtime_error("GPU timeout - render operation took too long");
+                } else if (waitResult == WAIT_OBJECT_0) {
+                    std::cout << "GPU work completed successfully" << std::endl;
+                    std::cout.flush();
+                } else {
+                    std::cerr << "ERROR: WaitForSingleObject failed with result: " << waitResult << std::endl;
+                    std::cerr.flush();
+                    throw std::runtime_error("GPU wait failed unexpectedly");
+                }
+            } else {
+                std::cout << "GPU already completed" << std::endl;
+                std::cout.flush();
+            }
+
+            // Read back data and save to PPM
+            std::cout << "Reading back data..." << std::endl;
+            void* mappedData;
+            ThrowIfFailed(readbackBuffer->Map(0, nullptr, &mappedData), "Failed to map readback buffer");
+
+            // DEBUG: Check first few pixels with proper flushing
+            const uint8_t* pixels = static_cast<const uint8_t*>(mappedData);
+            std::cout << "First 10 pixels (RGBA): " << std::endl;
+            std::cout.flush();
+            for (int i = 0; i < 10; i++) {
+                std::cout << "  Pixel " << i << ": (" 
+                         << (int)pixels[i*4] << "," 
+                         << (int)pixels[i*4+1] << "," 
+                         << (int)pixels[i*4+2] << "," 
+                         << (int)pixels[i*4+3] << ")" << std::endl;
+            }
+            std::cout.flush();
+            
+            // Check middle of image
+            int midOffset = (m_height / 2) * footprint.Footprint.RowPitch + (m_width / 2) * 4;
+            std::cout << "Middle pixel: (" 
+                     << (int)pixels[midOffset] << "," 
+                     << (int)pixels[midOffset+1] << "," 
+                     << (int)pixels[midOffset+2] << "," 
+                     << (int)pixels[midOffset+3] << ")" << std::endl;
+            std::cout.flush();
+
+            // Write PPM file
+            std::cout << "Writing PPM file..." << std::endl;
+            std::ofstream file(outputPath, std::ios::binary);
+            if (!file.is_open()) {
+                readbackBuffer->Unmap(0, nullptr);
+                throw std::runtime_error("Failed to open output file: " + outputPath);
+            }
+
+            file << "P6\n" << m_width << " " << m_height << "\n255\n";
+
+            for (UINT y = 0; y < m_height; ++y) {
+                const uint8_t* row = pixels + y * footprint.Footprint.RowPitch;
+                for (UINT x = 0; x < m_width; ++x) {
+                    // RGBA8 format
+                    const uint8_t* pixel = row + x * 4;
+                    file.write(reinterpret_cast<const char*>(pixel), 3); // Write RGB only
+                }
+            }
+
+            file.close();
+            readbackBuffer->Unmap(0, nullptr);
+
+            std::cout << "Render complete: " << outputPath << std::endl;
+        }
+        catch (const com_exception& e) {
+            char errMsg[512];
+            sprintf_s(errMsg, "RenderToFile DirectX error (HRESULT: 0x%08X): %s", e.get_result(), e.what());
+            std::cerr << errMsg << std::endl;
+            throw std::runtime_error(errMsg);
+        }
+        catch (const std::exception& e) {
+            std::string errMsg = std::string("RenderToFile exception: ") + (e.what() ? e.what() : "Unknown error");
+            std::cerr << errMsg << std::endl;
+            throw std::runtime_error(errMsg);
+        }
+        catch (...) {
+            std::cerr << "RenderToFile: Unknown exception caught" << std::endl;
+            throw std::runtime_error("Unknown error in RenderToFile");
+        }
+    }
+
+
+    void Renderer::InitPipeline(HWND hwnd) {
+        CreateDevice();
+        CreateCommandQueueAndList();
+        CreateSwapChain(hwnd);
+        CreateDescriptorHeaps();
+        CreateRenderTargets();
+
+        // Create synchronization objects
+        ThrowIfFailed(m_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&m_fence)));
+        m_fenceValue = 1;
+        m_fenceEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+        if (m_fenceEvent == nullptr) {
+            ThrowIfFailed(HRESULT_FROM_WIN32(GetLastError()));
+        }
+
+        std::cout << "DX12 pipeline initialized successfully" << std::endl;
+    }
+
+    void Renderer::CreateDevice() {
+#ifdef _DEBUG
+        // Enable the D3D12 debug layer
+        Microsoft::WRL::ComPtr<ID3D12Debug> debugController;
+        if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debugController)))) {
+            debugController->EnableDebugLayer();
+            std::cout << "D3D12 Debug Layer enabled" << std::endl;
+        }
+#endif
+        m_adapter = GetAdapter(false);
+        ThrowIfFailed(D3D12CreateDevice(m_adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&m_device)));
+    }
+
+    void Renderer::CreateCommandQueueAndList() {
+        D3D12_COMMAND_QUEUE_DESC queueDesc = {};
+        queueDesc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
+        queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        ThrowIfFailed(m_device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&m_commandQueue)));
+
+        // Create one command allocator per frame to avoid conflicts
+        for (UINT i = 0; i < FrameCount; i++) {
+            ThrowIfFailed(m_device->CreateCommandAllocator(
+                D3D12_COMMAND_LIST_TYPE_DIRECT, 
+                IID_PPV_ARGS(&m_commandAllocators[i])));
+        }
+
+        // Create command list using first allocator
+        ThrowIfFailed(m_device->CreateCommandList(
+            0, 
+            D3D12_COMMAND_LIST_TYPE_DIRECT, 
+            m_commandAllocators[0].Get(), 
+            nullptr, 
+            IID_PPV_ARGS(&m_commandList)));
+        ThrowIfFailed(m_commandList->Close());
+    }
+
+    void Renderer::CreateSwapChain(HWND hwnd) {
+        Microsoft::WRL::ComPtr<IDXGIFactory4> factory;
+        ThrowIfFailed(CreateDXGIFactory2(DXGI_CREATE_FACTORY_DEBUG, IID_PPV_ARGS(&factory)));
+
+        DXGI_SWAP_CHAIN_DESC1 swapChainDesc = {};
+        swapChainDesc.BufferCount = FrameCount;
+        swapChainDesc.Width = m_width;
+        swapChainDesc.Height = m_height;
+        swapChainDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        swapChainDesc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        swapChainDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        swapChainDesc.SampleDesc.Count = 1;
+
+        Microsoft::WRL::ComPtr<IDXGISwapChain1> swapChain;
+        ThrowIfFailed(factory->CreateSwapChainForHwnd(
+            m_commandQueue.Get(),
+            hwnd,
+            &swapChainDesc,
+            nullptr,
+            nullptr,
+            &swapChain
+        ));
+
+        ThrowIfFailed(factory->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER));
+        ThrowIfFailed(swapChain.As(&m_swapChain));
+        m_frameIndex = m_swapChain->GetCurrentBackBufferIndex();
+
+        std::cout << "SwapChain created successfully" << std::endl;
+    }
+
+    void Renderer::CreateDescriptorHeaps() {
+        D3D12_DESCRIPTOR_HEAP_DESC rtvHeapDesc = {};
+        rtvHeapDesc.NumDescriptors = FrameCount;
+        rtvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+        rtvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+        ThrowIfFailed(m_device->CreateDescriptorHeap(&rtvHeapDesc, IID_PPV_ARGS(&m_rtvHeap)));
+
+        m_rtvDescriptorSize = m_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+
+        // Create SRV/UAV heap for DXR (raytracing resources)
+        D3D12_DESCRIPTOR_HEAP_DESC srvUavHeapDesc = {};
+        srvUavHeapDesc.NumDescriptors = 11; // UAV(output) + SRV(TLAS, vertices, indices, triangleMaterials, materials, textures)
+        srvUavHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        srvUavHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        ThrowIfFailed(m_device->CreateDescriptorHeap(&srvUavHeapDesc, IID_PPV_ARGS(&m_srvUavHeap)));
+        
+        // Create separate SRV heap for ImGui (to avoid conflicts with offline rendering)
+        D3D12_DESCRIPTOR_HEAP_DESC imguiHeapDesc = {};
+        imguiHeapDesc.NumDescriptors = 1; // ImGui only needs 1 descriptor for font texture
+        imguiHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        imguiHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        ThrowIfFailed(m_device->CreateDescriptorHeap(&imguiHeapDesc, IID_PPV_ARGS(&m_imguiSrvHeap)));
+
+        std::cout << "Descriptor heaps created successfully" << std::endl;
+    }
+
+    void Renderer::CreateRenderTargets() {
+        D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = m_rtvHeap->GetCPUDescriptorHandleForHeapStart();
+
+        for (UINT i = 0; i < FrameCount; i++) {
+            ThrowIfFailed(m_swapChain->GetBuffer(i, IID_PPV_ARGS(&m_renderTargets[i])));
+            m_device->CreateRenderTargetView(m_renderTargets[i].Get(), nullptr, rtvHandle);
+            rtvHandle.ptr += m_rtvDescriptorSize;
+        }
+
+        std::cout << "Render targets created successfully" << std::endl;
+    }
+
+    void Renderer::CreateRaytracingPipeline() {
+        // Check for DXR support first
+        if (!m_dxrSupported) {
+            return;
+        }
+
+        try {
+            std::cout << "Compiling shader library..." << std::endl;
+            // Compile shader library
+            m_raytracingShaderLibrary = CompileShader(L"shaders/Raytracing.hlsl");
+            
+            if (!m_raytracingShaderLibrary) {
+                throw std::runtime_error("Shader compilation returned null");
+            }
+            std::cout << "Shader compiled successfully (" << m_raytracingShaderLibrary->GetBufferSize() << " bytes)" << std::endl;
+            
+            // Create root signature
+            std::cout << "Creating root signature..." << std::endl;
+            CreateRaytracingRootSignature();
+            
+            // Create DXR pipeline state object
+            CD3DX12_STATE_OBJECT_DESC raytracingPipeline{ D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE };
+
+            // 1. DXIL Library
+            auto lib = raytracingPipeline.CreateSubobject<CD3DX12_DXIL_LIBRARY_SUBOBJECT>();
+            D3D12_SHADER_BYTECODE libdxil = {};
+            libdxil.BytecodeLength = m_raytracingShaderLibrary->GetBufferSize();
+            libdxil.pShaderBytecode = m_raytracingShaderLibrary->GetBufferPointer();
+            lib->SetDXILLibrary(&libdxil);
+            const WCHAR* shaderExports[] = { L"RayGen", L"Miss", L"ClosestHit" };
+            lib->DefineExports(shaderExports);
+
+            // 2. Hit Group
+            auto hitGroup = raytracingPipeline.CreateSubobject<CD3DX12_HIT_GROUP_SUBOBJECT>();
+            hitGroup->SetClosestHitShaderImport(L"ClosestHit");
+            hitGroup->SetHitGroupExport(L"HitGroup");
+            hitGroup->SetHitGroupType(D3D12_HIT_GROUP_TYPE_TRIANGLES);
+
+            // 3. Shader Config
+            auto shaderConfig = raytracingPipeline.CreateSubobject<CD3DX12_RAYTRACING_SHADER_CONFIG_SUBOBJECT>();
+            // RadiancePayload: 4x float3 (radiance, throughput, nextOrigin, nextDirection) + 2x uint (rngState, terminated) = 56 bytes
+            UINT payloadSize = 4 * 3 * sizeof(float) + 2 * sizeof(UINT);
+            UINT attributeSize = 2 * sizeof(float); // BuiltInTriangleIntersectionAttributes: float2 barycentrics
+            shaderConfig->Config(payloadSize, attributeSize);
+
+            // 4. Global Root Signature
+            auto globalRootSignature = raytracingPipeline.CreateSubobject<CD3DX12_GLOBAL_ROOT_SIGNATURE_SUBOBJECT>();
+            globalRootSignature->SetRootSignature(m_raytracingGlobalRootSignature.Get());
+
+            // 7. Pipeline Config
+            auto pipelineConfig = raytracingPipeline.CreateSubobject<CD3DX12_RAYTRACING_PIPELINE_CONFIG_SUBOBJECT>();
+            UINT maxRecursionDepth = 1; // No recursion - iterative path tracing in RayGen
+            pipelineConfig->Config(maxRecursionDepth);
+
+            std::cout << "Creating DXR state object..." << std::endl;
+            
+            // Create the state object
+            HRESULT hr = m_device->CreateStateObject(raytracingPipeline, IID_PPV_ARGS(&m_dxrStateObject));
+            if (FAILED(hr)) {
+                char errorMsg[256];
+                sprintf_s(errorMsg, "Failed to create DXR state object (HRESULT: 0x%08X)", hr);
+                throw std::runtime_error(errorMsg);
+            }
+                
+            std::cout << "DXR state object created successfully" << std::endl;
+            std::cout << "DXR pipeline created successfully" << std::endl;
+            
+        } catch (const std::exception& e) {
+            std::cerr << "Failed to create raytracing pipeline: " << e.what() << std::endl;
+            m_dxrSupported = false;
+        }
+    }
+
+    void Renderer::CheckRaytracingSupport() {
+        D3D12_FEATURE_DATA_D3D12_OPTIONS5 features = {};
+        HRESULT hr = m_device->CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS5,
+            &features,
+            sizeof(features)
+        );
+
+        if (FAILED(hr) || features.RaytracingTier == D3D12_RAYTRACING_TIER_NOT_SUPPORTED) {
+            m_dxrSupported = false;
+            std::cerr << "DirectX Raytracing is not supported on this device" << std::endl;
+            return;
+        }
+
+        m_dxrSupported = true;
+        std::cout << "DirectX Raytracing supported (Tier ";
+        switch (features.RaytracingTier) {
+            case D3D12_RAYTRACING_TIER_1_0:
+                std::cout << "1.0";
+                break;
+            case D3D12_RAYTRACING_TIER_1_1:
+                std::cout << "1.1";
+                break;
+            default:
+                std::cout << "Unknown";
+                break;
+        }
+        std::cout << ")" << std::endl;
+    }
+
+    Microsoft::WRL::ComPtr<IDxcBlob> Renderer::CompileShader(const std::wstring& filename) {
+        // Initialize DXC compiler
+        Microsoft::WRL::ComPtr<IDxcUtils> utils;
+        Microsoft::WRL::ComPtr<IDxcCompiler3> compiler;
+        ThrowIfFailed(DxcCreateInstance(CLSID_DxcUtils, IID_PPV_ARGS(&utils)));
+        ThrowIfFailed(DxcCreateInstance(CLSID_DxcCompiler, IID_PPV_ARGS(&compiler)));
+
+        // Create default include handler
+        Microsoft::WRL::ComPtr<IDxcIncludeHandler> includeHandler;
+        ThrowIfFailed(utils->CreateDefaultIncludeHandler(&includeHandler));
+
+        // Load shader source
+        Microsoft::WRL::ComPtr<IDxcBlobEncoding> sourceBlob;
+        ThrowIfFailed(utils->LoadFile(filename.c_str(), nullptr, &sourceBlob));
+
+        // Compile arguments
+        std::vector<LPCWSTR> arguments = {
+            filename.c_str(),
+            L"-E", L"",  // No entry point for library
+            L"-T", L"lib_6_3",
+            L"-I", L"shaders",  // Include directory
+            L"-HV", L"2021",
+#ifdef _DEBUG
+            L"-Zi",
+            L"-Od",
+#else
+            L"-O3",
+#endif
+        };
+
+        DxcBuffer sourceBuffer = {};
+        sourceBuffer.Ptr = sourceBlob->GetBufferPointer();
+        sourceBuffer.Size = sourceBlob->GetBufferSize();
+        sourceBuffer.Encoding = 0;
+
+        Microsoft::WRL::ComPtr<IDxcResult> result;
+        ThrowIfFailed(compiler->Compile(
+            &sourceBuffer,
+            arguments.data(),
+            (UINT32)arguments.size(),
+            includeHandler.Get(),
+            IID_PPV_ARGS(&result)
+        ));
+
+        // Check for errors
+        Microsoft::WRL::ComPtr<IDxcBlobUtf8> errors;
+        result->GetOutput(DXC_OUT_ERRORS, IID_PPV_ARGS(&errors), nullptr);
+        if (errors && errors->GetStringLength() > 0) {
+            std::cerr << "Shader compilation warnings/errors:\n" << errors->GetStringPointer() << std::endl;
+        }
+
+        HRESULT hrStatus;
+        result->GetStatus(&hrStatus);
+        ThrowIfFailed(hrStatus, "Shader compilation failed");
+
+        Microsoft::WRL::ComPtr<IDxcBlob> shader;
+        result->GetOutput(DXC_OUT_OBJECT, IID_PPV_ARGS(&shader), nullptr);
+        
+        std::wcout << L"Shader compiled successfully: " << filename << std::endl;
+        return shader;
+    }
+
+    void Renderer::CreateRaytracingRootSignature() {
+        // Create a root signature with global resources
+        CD3DX12_DESCRIPTOR_RANGE1 ranges[7];
+        ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0); // u0: output texture
+        ranges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0); // t0: acceleration structure
+        ranges[2].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1, 0); // t1 space0: vertices
+        ranges[3].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1, 1); // t1 space1: indices
+        ranges[4].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1, 2); // t1 space2: triangle material indices
+        ranges[5].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 2); // t2: materials
+        ranges[6].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 3); // t3: textures
+
+        // Static sampler for texture sampling
+        CD3DX12_STATIC_SAMPLER_DESC samplerDesc(0, D3D12_FILTER_MIN_MAG_MIP_LINEAR);
+
+        CD3DX12_ROOT_PARAMETER1 rootParameters[8];
+        rootParameters[0].InitAsDescriptorTable(1, &ranges[0]); // Output UAV
+        rootParameters[1].InitAsShaderResourceView(0); // Acceleration structure (SRV)
+        rootParameters[2].InitAsDescriptorTable(1, &ranges[2]); // Vertices (t1, space0)
+        rootParameters[3].InitAsDescriptorTable(1, &ranges[3]); // Indices (t1, space1)
+        rootParameters[4].InitAsDescriptorTable(1, &ranges[4]); // Triangle material indices (t1, space2)
+        rootParameters[5].InitAsDescriptorTable(1, &ranges[5]); // Materials (t2)
+        rootParameters[6].InitAsDescriptorTable(1, &ranges[6]); // Textures (t3)
+        // Scene constants (b0): view and projection matrices
+        rootParameters[7].InitAsConstants(sizeof(CameraConstants) / 4, 0);
+
+        CD3DX12_VERSIONED_ROOT_SIGNATURE_DESC rootSignatureDesc;
+        rootSignatureDesc.Init_1_1(_countof(rootParameters), rootParameters, 1, &samplerDesc,
+            D3D12_ROOT_SIGNATURE_FLAG_NONE);
+
+        Microsoft::WRL::ComPtr<ID3DBlob> signature;
+        Microsoft::WRL::ComPtr<ID3DBlob> error;
+        ThrowIfFailed(D3D12SerializeVersionedRootSignature(&rootSignatureDesc, &signature, &error),
+            "Failed to serialize root signature");
+        ThrowIfFailed(m_device->CreateRootSignature(0, signature->GetBufferPointer(),
+            signature->GetBufferSize(), IID_PPV_ARGS(&m_raytracingGlobalRootSignature)),
+            "Failed to create root signature");
+            
+        std::cout << "Root signature created" << std::endl;
+        rootParameters[7].InitAsConstants(sizeof(CameraConstants) / 4, 0);
+    }
+
+    void Renderer::CreateAccelerationStructures(ID3D12GraphicsCommandList4* cmdList) {
+        if (!m_dxrSupported) {
+            std::cout << "Skipping AS creation: DXR not supported" << std::endl;
+            return;
+        }
+        if (!m_scene) {
+            std::cout << "Skipping AS creation: Scene not loaded" << std::endl;
+            return;
+        }
+        if (!m_vertexBuffer) {
+            std::cout << "Skipping AS creation: Vertex buffer not ready" << std::endl;
+            return;
+        }
+        if (!m_indexBuffer) {
+            std::cout << "Skipping AS creation: Index buffer not ready" << std::endl;
+            return;
+        }
+
+        std::cout << "Building acceleration structures..." << std::endl;
+        
+        // CRITICAL: Ensure vertex and index data are fully uploaded before building AS
+        // The buffers were transitioned to GENERIC_READ in CreateDefaultBuffer
+        // Add UAV barrier to ensure all copy operations complete before AS build
+        D3D12_RESOURCE_BARRIER copyBarriers[2] = {};
+        copyBarriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        copyBarriers[0].UAV.pResource = nullptr;  // Global UAV barrier
+        copyBarriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        copyBarriers[1].UAV.pResource = nullptr;
+        cmdList->ResourceBarrier(1, &copyBarriers[0]);
+        
+        // For simplicity, we'll create a single BLAS for all geometry
+        // In production, you'd create one BLAS per mesh for better culling
+        
+        // Count total triangles
+        UINT totalTriangles = 0;
+        for (const auto& mesh : m_scene->GetMeshes()) {
+            totalTriangles += static_cast<UINT>(mesh->GetIndices().size() / 3);
+        }
+
+        try {
+            // Build Bottom Level AS (BLAS)
+            D3D12_RAYTRACING_GEOMETRY_DESC geometryDesc = {};
+            geometryDesc.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
+            geometryDesc.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
+            
+            // Vertex buffer view
+            geometryDesc.Triangles.VertexBuffer.StartAddress = m_vertexBuffer->GetGPUVirtualAddress();
+            geometryDesc.Triangles.VertexBuffer.StrideInBytes = 48; // sizeof(GPUVertex): 3*4 + 3*4 + 2*4 + 3*4 + 1*4 = 48
+            geometryDesc.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
+            
+            // Count vertices
+            UINT totalVertices = 0;
+            for (const auto& mesh : m_scene->GetMeshes()) {
+                totalVertices += static_cast<UINT>(mesh->GetVertices().size());
+            }
+            geometryDesc.Triangles.VertexCount = totalVertices;
+            
+            // Index buffer view
+            geometryDesc.Triangles.IndexBuffer = m_indexBuffer->GetGPUVirtualAddress();
+            geometryDesc.Triangles.IndexFormat = DXGI_FORMAT_R32_UINT;
+            geometryDesc.Triangles.IndexCount = totalTriangles * 3;
+            
+            std::cout << "  Geometry info:" << std::endl;
+            std::cout << "    Vertex buffer GPU address: " << geometryDesc.Triangles.VertexBuffer.StartAddress << std::endl;
+            std::cout << "    Vertex count: " << geometryDesc.Triangles.VertexCount << std::endl;
+            std::cout << "    Vertex stride: " << geometryDesc.Triangles.VertexBuffer.StrideInBytes << std::endl;
+            std::cout << "    Index buffer GPU address: " << geometryDesc.Triangles.IndexBuffer << std::endl;
+            std::cout << "    Index count: " << geometryDesc.Triangles.IndexCount << std::endl;
+            std::cout << "    Total triangles: " << totalTriangles << std::endl;
+
+            // Get required sizes for BLAS
+            D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS blasInputs = {};
+            blasInputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
+            blasInputs.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+            blasInputs.NumDescs = 1;
+            blasInputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+            blasInputs.pGeometryDescs = &geometryDesc;
+
+            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO blasPrebuildInfo = {};
+            m_device->GetRaytracingAccelerationStructurePrebuildInfo(&blasInputs, &blasPrebuildInfo);
+
+            // Align scratch buffer size
+            UINT64 scratchBufferSize = (blasPrebuildInfo.ScratchDataSizeInBytes + 255) & ~255;
+            UINT64 blasBufferSize = (blasPrebuildInfo.ResultDataMaxSizeInBytes + 255) & ~255;
+
+            // Create scratch buffer for BLAS build (save as member to keep alive)
+            HRESULT hr = m_device->CreateCommittedResource(
+                &CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT),
+                D3D12_HEAP_FLAG_NONE,
+                &CD3DX12_RESOURCE_DESC::Buffer(scratchBufferSize, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+                D3D12_RESOURCE_STATE_COMMON,
+                nullptr,
+                IID_PPV_ARGS(&m_blasScratchBuffer));
+            if (FAILED(hr)) {
+                char errorMsg[512];
+                if (hr == DXGI_ERROR_DEVICE_REMOVED) {
+                    HRESULT removedReason = m_device->GetDeviceRemovedReason();
+                    sprintf_s(errorMsg, "Failed to create BLAS scratch buffer - Device Removed (HRESULT: 0x%08X, Removed Reason: 0x%08X)", hr, removedReason);
+                } else {
+                    sprintf_s(errorMsg, "Failed to create BLAS scratch buffer (HRESULT: 0x%08X)", hr);
+                }
+                std::cerr << errorMsg << std::endl;
+                throw std::runtime_error(errorMsg);
+            }
+
+            // Create BLAS buffer
+            ThrowIfFailed(m_device->CreateCommittedResource(
+                &CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT),
+                D3D12_HEAP_FLAG_NONE,
+                &CD3DX12_RESOURCE_DESC::Buffer(blasBufferSize, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+                D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE,
+                nullptr,
+                IID_PPV_ARGS(&m_bottomLevelAS)), 
+                "Failed to create BLAS buffer");
+
+            // Build BLAS
+        D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC blasDesc = {};
+        blasDesc.Inputs = blasInputs;
+        blasDesc.ScratchAccelerationStructureData = m_blasScratchBuffer->GetGPUVirtualAddress();
+        blasDesc.DestAccelerationStructureData = m_bottomLevelAS->GetGPUVirtualAddress();
+
+        cmdList->BuildRaytracingAccelerationStructure(&blasDesc, 0, nullptr);
+
+        // UAV barrier for BLAS
+        D3D12_RESOURCE_BARRIER uavBarrier = {};
+        uavBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        uavBarrier.UAV.pResource = m_bottomLevelAS.Get();
+        cmdList->ResourceBarrier(1, &uavBarrier);
+
+        // Build Top Level AS (TLAS)
+        D3D12_RAYTRACING_INSTANCE_DESC instanceDesc = {};
+        // Identity transform
+        instanceDesc.Transform[0][0] = instanceDesc.Transform[1][1] = instanceDesc.Transform[2][2] = 1.0f;
+        instanceDesc.InstanceID = 0;
+        instanceDesc.InstanceMask = 0xFF;
+        instanceDesc.InstanceContributionToHitGroupIndex = 0;
+        instanceDesc.Flags = D3D12_RAYTRACING_INSTANCE_FLAG_NONE;
+        instanceDesc.AccelerationStructure = m_bottomLevelAS->GetGPUVirtualAddress();
+
+        // Upload instance descriptor (save as member to keep alive)
+        ThrowIfFailed(m_device->CreateCommittedResource(
+            &CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD),
+            D3D12_HEAP_FLAG_NONE,
+            &CD3DX12_RESOURCE_DESC::Buffer(sizeof(D3D12_RAYTRACING_INSTANCE_DESC)),
+            D3D12_RESOURCE_STATE_GENERIC_READ,
+            nullptr,
+            IID_PPV_ARGS(&m_instanceDescBuffer)));
+
+        void* mappedData;
+        m_instanceDescBuffer->Map(0, nullptr, &mappedData);
+        memcpy(mappedData, &instanceDesc, sizeof(D3D12_RAYTRACING_INSTANCE_DESC));
+        m_instanceDescBuffer->Unmap(0, nullptr);
+
+        // Get TLAS prebuild info
+        D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS tlasInputs = {};
+        tlasInputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
+        tlasInputs.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+        tlasInputs.NumDescs = 1;
+        tlasInputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+        tlasInputs.InstanceDescs = m_instanceDescBuffer->GetGPUVirtualAddress();
+
+        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO tlasPrebuildInfo = {};
+        m_device->GetRaytracingAccelerationStructurePrebuildInfo(&tlasInputs, &tlasPrebuildInfo);
+
+        UINT64 tlasScratchSize = (tlasPrebuildInfo.ScratchDataSizeInBytes + 255) & ~255;
+        UINT64 tlasBufferSize = (tlasPrebuildInfo.ResultDataMaxSizeInBytes + 255) & ~255;
+
+        // Create TLAS scratch buffer (save as member to keep alive)
+        ThrowIfFailed(m_device->CreateCommittedResource(
+            &CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT),
+            D3D12_HEAP_FLAG_NONE,
+            &CD3DX12_RESOURCE_DESC::Buffer(tlasScratchSize, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+            D3D12_RESOURCE_STATE_COMMON,
+            nullptr,
+            IID_PPV_ARGS(&m_tlasScratchBuffer)));
+
+        // Create TLAS buffer
+        ThrowIfFailed(m_device->CreateCommittedResource(
+            &CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT),
+            D3D12_HEAP_FLAG_NONE,
+            &CD3DX12_RESOURCE_DESC::Buffer(tlasBufferSize, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+            D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE,
+            nullptr,
+            IID_PPV_ARGS(&m_topLevelAS)));
+
+        // Build TLAS
+        D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC tlasDesc = {};
+        tlasDesc.Inputs = tlasInputs;
+        tlasDesc.ScratchAccelerationStructureData = m_tlasScratchBuffer->GetGPUVirtualAddress();
+        tlasDesc.DestAccelerationStructureData = m_topLevelAS->GetGPUVirtualAddress();
+
+        cmdList->BuildRaytracingAccelerationStructure(&tlasDesc, 0, nullptr);
+
+        // UAV barrier for TLAS
+        uavBarrier.UAV.pResource = m_topLevelAS.Get();
+        cmdList->ResourceBarrier(1, &uavBarrier);
+
+        // Create SRV for TLAS (descriptor index 4)
+        D3D12_SHADER_RESOURCE_VIEW_DESC srvTLASDesc = {};
+        srvTLASDesc.ViewDimension = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE;
+        srvTLASDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srvTLASDesc.RaytracingAccelerationStructure.Location = m_topLevelAS->GetGPUVirtualAddress();
+        
+        D3D12_CPU_DESCRIPTOR_HANDLE srvHandle = m_srvUavHeap->GetCPUDescriptorHandleForHeapStart();
+        UINT descriptorSize = m_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        D3D12_CPU_DESCRIPTOR_HANDLE tlasSrvHandle = { srvHandle.ptr + descriptorSize * 4 };
+        m_device->CreateShaderResourceView(nullptr, &srvTLASDesc, tlasSrvHandle);
+
+        // Note: Do NOT close or execute here - caller will handle command list execution
+
+        std::cout << "Acceleration structures built: " << totalTriangles << " triangles, "
+                  << totalVertices << " vertices" << std::endl;
+        } catch (const std::exception& e) {
+            std::cerr << "Failed to create acceleration structures: " << e.what() << std::endl;
+            throw;
+        }
+    }
+
+    void Renderer::CreateShaderResources(ID3D12GraphicsCommandList4* cmdList) {
+        // Create output texture, vertex/index/material buffers and upload to GPU
+        if (!m_scene) return;
+
+        // Note: Command list should be ready (opened) by caller
+        // Do NOT reset allocator here - it may be in use
+
+        // Flatten vertices and indices from all meshes into single buffers
+        struct GPUVertex { 
+            float position[3]; 
+            float normal[3]; 
+            float texCoord[2]; 
+            float tangent[3];  // Must match HLSL Vertex struct
+            float _pad;        // Padding to align to 16 bytes (44 -> 48)
+        };
+        std::vector<GPUVertex> vertices;
+        std::vector<uint32_t> indices;
+        std::vector<uint32_t> triangleMaterialIndices; // Material index per triangle
+
+        for (const auto& mesh : m_scene->GetMeshes()) {
+            const auto& meshVerts = mesh->GetVertices();
+            const auto& meshIdx = mesh->GetIndices();
+            uint32_t baseVertex = static_cast<uint32_t>(vertices.size());
+            int meshMaterialIdx = mesh->GetMaterialIndex();
+            std::cout << "Mesh: " << meshVerts.size() << " vertices, " << meshIdx.size()/3 << " triangles, materialIndex=" << meshMaterialIdx << std::endl;
+            
+            // append vertices
+            for (const auto& v : meshVerts) {
+                GPUVertex outV = {};
+                outV.position[0] = v.position.x; outV.position[1] = v.position.y; outV.position[2] = v.position.z;
+                outV.normal[0] = v.normal.x; outV.normal[1] = v.normal.y; outV.normal[2] = v.normal.z;
+                outV.texCoord[0] = v.texCoord.x; outV.texCoord[1] = v.texCoord.y;
+                outV.tangent[0] = 0.0f; outV.tangent[1] = 0.0f; outV.tangent[2] = 0.0f;
+                outV._pad = 0.0f;
+                vertices.push_back(outV);
+            }
+            // append indices with base offset
+            for (uint32_t idx : meshIdx) {
+                indices.push_back(baseVertex + idx);
+            }
+            // Store material index for each triangle in this mesh
+            uint32_t numTriangles = static_cast<uint32_t>(meshIdx.size() / 3);
+            for (uint32_t i = 0; i < numTriangles; i++) {
+                triangleMaterialIndices.push_back(meshMaterialIdx);
+            }
+        }
+        
+        // DEBUG: Print first few triangle material indices
+        std::cout << "Triangle material indices (first 10):";
+        for (size_t i = 0; i < std::min(size_t(10), triangleMaterialIndices.size()); i++) {
+            std::cout << " " << triangleMaterialIndices[i];
+        }
+        std::cout << std::endl;
+
+        // Create GPU buffers using helper CreateDefaultBuffer
+        // CRITICAL: Upload buffers MUST be kept alive until GPU executes the copy!
+        size_t vertexBufferSize = sizeof(GPUVertex) * vertices.size();
+        if (vertexBufferSize > 0) {
+            m_vertexBuffer = CreateDefaultBuffer(m_device.Get(), cmdList, vertices.data(), vertexBufferSize, m_vertexUpload);
+            std::cout << "Vertex buffer created: " << vertices.size() << " vertices (" << vertexBufferSize << " bytes)" << std::endl;
+            
+            // DEBUG: Print first few vertices
+            std::cout << "First 3 vertices:" << std::endl;
+            for (size_t i = 0; i < std::min(size_t(3), vertices.size()); i++) {
+                std::cout << "  v[" << i << "]: pos=(" << vertices[i].position[0] << "," 
+                         << vertices[i].position[1] << "," << vertices[i].position[2] << ")" << std::endl;
+            }
+        }
+
+        size_t indexBufferSize = sizeof(uint32_t) * indices.size();
+        if (indexBufferSize > 0) {
+            m_indexBuffer = CreateDefaultBuffer(m_device.Get(), cmdList, indices.data(), indexBufferSize, m_indexUpload);
+            std::cout << "Index buffer created: " << indices.size() << " indices (" << indexBufferSize << " bytes)" << std::endl;
+        }
+
+        // Create triangle material index buffer (one material ID per triangle)
+        size_t triangleMaterialBufferSize = sizeof(uint32_t) * triangleMaterialIndices.size();
+        if (triangleMaterialBufferSize > 0) {
+            m_triangleMaterialBuffer = CreateDefaultBuffer(m_device.Get(), cmdList, 
+                triangleMaterialIndices.data(), triangleMaterialBufferSize, m_triangleMaterialUpload);
+            std::cout << "Triangle material buffer created: " << triangleMaterialIndices.size() << " triangles" << std::endl;
+        }
+
+        // Create GPU-side material buffer
+        std::vector<GPUMaterial> materialsCPU;
+        if (m_scene->GetMaterials().empty()) {
+            // Add a default material if none are loaded
+            GPUMaterial mat = {};
+            mat.albedo = glm::vec4(0.8f, 0.8f, 0.8f, 1.0f);
+            mat.type = 0; // Diffuse
+            materialsCPU.push_back(mat);
+        } else {
+            for (const auto& m : m_scene->GetMaterials()) {
+                GPUMaterial mat = {};
+                glm::vec3 alb = m->GetAlbedo();
+                mat.albedo = glm::vec4(alb.x, alb.y, alb.z, 1.0f);
+
+                glm::vec3 emi = m->GetEmission();
+                mat.emission = glm::vec4(emi.x, emi.y, emi.z, 1.0f);
+                
+                glm::vec3 spec = m->GetSpecular();
+                mat.specular = glm::vec4(spec.x, spec.y, spec.z, 1.0f);
+                
+                mat.type = static_cast<uint32_t>(m->GetType());
+                mat.metallic = m->GetMetallic();
+                mat.roughness = m->GetRoughness();
+                mat.ior = m->GetIOR();
+                mat.transmission = m->GetTransmission();
+                mat.albedoTextureIndex = -1;
+                mat.illum = m->GetIllum();
+                mat.albedoTextureSize = glm::vec2(0.0f, 0.0f);
+                mat.padding[0] = mat.padding[1] = mat.padding[2] = 0.0f;
+                materialsCPU.push_back(mat);
+                
+                // DEBUG: Print material data
+                std::cout << "  Material[" << materialsCPU.size()-1 << "]: albedo=(" << mat.albedo.x << "," << mat.albedo.y << "," << mat.albedo.z 
+                         << "), emission=(" << mat.emission.x << "," << mat.emission.y << "," << mat.emission.z
+                         << "), type=" << mat.type << std::endl;
+            }
+        }
+
+        size_t materialBufferSize = sizeof(GPUMaterial) * materialsCPU.size();
+        std::cout << "Creating material buffer: " << materialsCPU.size() << " materials, " 
+                  << materialBufferSize << " bytes total, " << sizeof(GPUMaterial) << " bytes per material." << std::endl;
+        std::cout << "  GPUMaterial structure offsets:" << std::endl;
+        std::cout << "    albedo offset: " << offsetof(GPUMaterial, albedo) << std::endl;
+        std::cout << "    emission offset: " << offsetof(GPUMaterial, emission) << std::endl;
+        std::cout << "    specular offset: " << offsetof(GPUMaterial, specular) << std::endl;
+        std::cout << "    type offset: " << offsetof(GPUMaterial, type) << std::endl;
+        std::cout << "    padding offset: " << offsetof(GPUMaterial, padding) << std::endl;
+        std::cout << "  First material albedo in CPU buffer: (" << materialsCPU[0].albedo.x << "," 
+                 << materialsCPU[0].albedo.y << "," << materialsCPU[0].albedo.z << "," << materialsCPU[0].albedo.w << ")" << std::endl;
+        if (materialBufferSize > 0) {
+            m_materialBuffer = CreateDefaultBuffer(m_device.Get(), cmdList, materialsCPU.data(), materialBufferSize, m_materialUpload);
+            std::cout << "  Material buffer created: GPU address = " << m_materialBuffer->GetGPUVirtualAddress() << std::endl;
+        } else {
+            std::cout << "  ERROR: Material buffer size is 0!" << std::endl;
+        }
+
+        // Create output texture (UAV)
+        D3D12_RESOURCE_DESC texDesc = {};
+        texDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        texDesc.Alignment = 0;
+        texDesc.Width = m_width;
+        texDesc.Height = m_height;
+        texDesc.DepthOrArraySize = 1;
+        texDesc.MipLevels = 1;
+        texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        texDesc.SampleDesc.Count = 1;
+        texDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        texDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+
+        ThrowIfFailed(m_device->CreateCommittedResource(
+            &CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT),
+            D3D12_HEAP_FLAG_NONE,
+            &texDesc,
+            D3D12_RESOURCE_STATE_COMMON,
+            nullptr,
+            IID_PPV_ARGS(&m_outputTexture)));
+
+        // Create UAV descriptor for output
+        D3D12_CPU_DESCRIPTOR_HANDLE srvHandle = m_srvUavHeap->GetCPUDescriptorHandleForHeapStart();
+        m_srvUavDescriptorSize = m_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+        // Keep descriptor indices
+        m_uavIndex_Output = 0;
+        D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
+        uavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        uavDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        uavDesc.Texture2D.MipSlice = 0;
+        uavDesc.Texture2D.PlaneSlice = 0;
+
+        D3D12_CPU_DESCRIPTOR_HANDLE uavHandle = srvHandle;
+        m_device->CreateUnorderedAccessView(m_outputTexture.Get(), nullptr, &uavDesc, uavHandle);
+
+        // Create SRV for vertex buffer (structured buffer)
+        m_srvIndex_Vertices = 1;
+        D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+        srvDesc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        srvDesc.Format = DXGI_FORMAT_UNKNOWN;
+        srvDesc.Buffer.FirstElement = 0;
+        srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srvDesc.Buffer.NumElements = static_cast<UINT>(vertices.size());
+        srvDesc.Buffer.StructureByteStride = sizeof(GPUVertex);
+        D3D12_CPU_DESCRIPTOR_HANDLE srvVertHandle = { srvHandle.ptr + m_srvUavDescriptorSize * m_srvIndex_Vertices };
+        m_device->CreateShaderResourceView(m_vertexBuffer.Get(), &srvDesc, srvVertHandle);
+
+        // Create SRV for index buffer (typed buffer - don't set StructureByteStride)
+        m_srvIndex_Indices = 2;
+        D3D12_SHADER_RESOURCE_VIEW_DESC srvIdxDesc = {};
+        srvIdxDesc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        srvIdxDesc.Format = DXGI_FORMAT_R32_UINT;
+        srvIdxDesc.Buffer.FirstElement = 0;
+        srvIdxDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srvIdxDesc.Buffer.NumElements = static_cast<UINT>(indices.size());
+        // For typed buffers, StructureByteStride must be 0
+        D3D12_CPU_DESCRIPTOR_HANDLE srvIdxHandle = { srvHandle.ptr + m_srvUavDescriptorSize * m_srvIndex_Indices };
+        m_device->CreateShaderResourceView(m_indexBuffer.Get(), &srvIdxDesc, srvIdxHandle);
+
+        // Create SRV for triangle material indices (typed buffer)
+        UINT srvIndex_TriangleMaterials = 3;
+        D3D12_SHADER_RESOURCE_VIEW_DESC srvTriMatDesc = {};
+        srvTriMatDesc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        srvTriMatDesc.Format = DXGI_FORMAT_R32_UINT;
+        srvTriMatDesc.Buffer.FirstElement = 0;
+        srvTriMatDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srvTriMatDesc.Buffer.NumElements = static_cast<UINT>(triangleMaterialIndices.size());
+        D3D12_CPU_DESCRIPTOR_HANDLE srvTriMatHandle = { srvHandle.ptr + m_srvUavDescriptorSize * srvIndex_TriangleMaterials };
+        m_device->CreateShaderResourceView(m_triangleMaterialBuffer.Get(), &srvTriMatDesc, srvTriMatHandle);
+
+        // Create SRV for materials (use RAW buffer for ByteAddressBuffer access)
+        m_srvIndex_Materials = 4;
+        if (!m_materialBuffer) {
+            std::cout << "  ERROR: Material buffer is null, cannot create SRV!" << std::endl;
+        } else {
+            D3D12_SHADER_RESOURCE_VIEW_DESC srvMatDesc = {};
+            srvMatDesc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+            srvMatDesc.Format = DXGI_FORMAT_R32_TYPELESS;  // Raw buffer format
+            srvMatDesc.Buffer.FirstElement = 0;
+            srvMatDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            srvMatDesc.Buffer.NumElements = static_cast<UINT>(materialBufferSize / 4);  // Number of DWORDs
+            srvMatDesc.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;  // Enable RAW access
+            D3D12_CPU_DESCRIPTOR_HANDLE srvMatHandle = { srvHandle.ptr + m_srvUavDescriptorSize * m_srvIndex_Materials };
+            m_device->CreateShaderResourceView(m_materialBuffer.Get(), &srvMatDesc, srvMatHandle);
+            std::cout << "  Material SRV created as RAW buffer: " << (materialBufferSize / 4) << " DWORDs" << std::endl;
+        }
+
+        // Transition output texture to UAV state
+        cmdList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(m_outputTexture.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
+
+        // Note: Do NOT close or execute here - caller will handle command list execution
+        // Upload buffers are kept alive inside CreateDefaultBuffer until command list is executed
+        
+        // Check device status
+        HRESULT deviceStatus = m_device->GetDeviceRemovedReason();
+        if (FAILED(deviceStatus)) {
+            char errorMsg[256];
+            sprintf_s(errorMsg, "Device was removed after shader resource creation (HRESULT: 0x%08X)", deviceStatus);
+            std::cerr << errorMsg << std::endl;
+            throw std::runtime_error(errorMsg);
+        }
+
+        std::cout << "Shader resources uploaded: vertices=" << vertices.size() << " indices=" << indices.size() << " materials=" << materialsCPU.size() << std::endl;
+    }
+
+    void Renderer::CreateShaderBindingTable() {
+        if (!m_dxrSupported || !m_dxrStateObject) {
+            std::cout << "Skipping SBT creation: DXR not supported or state object missing" << std::endl;
+            return;
+        }
+
+        // Get shader identifiers from state object
+        Microsoft::WRL::ComPtr<ID3D12StateObjectProperties> stateObjectProps;
+        ThrowIfFailed(m_dxrStateObject.As(&stateObjectProps));
+
+        void* rayGenID = stateObjectProps->GetShaderIdentifier(L"RayGen");
+        void* missID = stateObjectProps->GetShaderIdentifier(L"Miss");
+        void* hitGroupID = stateObjectProps->GetShaderIdentifier(L"HitGroup");
+
+        if (!rayGenID || !missID || !hitGroupID) {
+            throw std::runtime_error("Failed to get shader identifiers");
+        }
+
+        // Shader record size: identifier (D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES = 32) + optional root arguments
+        const UINT shaderIdentifierSize = D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES; // 32 bytes
+        const UINT shaderRecordSize = shaderIdentifierSize; // No root arguments for now
+        
+        // Align to D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT (64 bytes)
+        const UINT shaderRecordAlignedSize = (shaderRecordSize + D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT - 1) 
+                                            & ~(D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT - 1);
+
+        // Store entry size for later use
+        m_sbtEntrySize = shaderRecordAlignedSize;
+
+        // Calculate offsets
+        m_sbtRayGenOffset = 0;
+        m_sbtMissOffset = m_sbtRayGenOffset + shaderRecordAlignedSize;
+        m_sbtHitGroupOffset = m_sbtMissOffset + shaderRecordAlignedSize;
+        
+        UINT sbtSize = m_sbtHitGroupOffset + shaderRecordAlignedSize;
+
+        // Create SBT upload buffer
+        ThrowIfFailed(m_device->CreateCommittedResource(
+            &CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD),
+            D3D12_HEAP_FLAG_NONE,
+            &CD3DX12_RESOURCE_DESC::Buffer(sbtSize),
+            D3D12_RESOURCE_STATE_GENERIC_READ,
+            nullptr,
+            IID_PPV_ARGS(&m_sbtBuffer)));
+
+        // Map and write shader records
+        uint8_t* mappedData;
+        ThrowIfFailed(m_sbtBuffer->Map(0, nullptr, reinterpret_cast<void**>(&mappedData)));
+        
+        // Write RayGen record
+        memcpy(mappedData + m_sbtRayGenOffset, rayGenID, shaderIdentifierSize);
+        
+        // Write Miss record
+        memcpy(mappedData + m_sbtMissOffset, missID, shaderIdentifierSize);
+        
+        // Write HitGroup record
+        memcpy(mappedData + m_sbtHitGroupOffset, hitGroupID, shaderIdentifierSize);
+        
+        m_sbtBuffer->Unmap(0, nullptr);
+
+        std::cout << "Shader Binding Table created: RayGen@" << m_sbtRayGenOffset 
+                  << " Miss@" << m_sbtMissOffset 
+                  << " HitGroup@" << m_sbtHitGroupOffset 
+                  << " EntrySize=" << m_sbtEntrySize << std::endl;
+    }
+
+    void Renderer::OnUpdate() {
+        // Update camera, animations, etc.
+    }
+
+    void Renderer::OnRender() {
+        // If offline rendering is in progress, skip all GPU operations
+        // Just return immediately to keep main thread responsive
+        if (m_isRendering.load()) {
+            // Sleep briefly to reduce CPU usage
+            std::this_thread::sleep_for(std::chrono::milliseconds(16));
+            return;
+        }
+        
+        // Normal rendering when not doing offline render
+        try {
+            PopulateCommandList();
+            ID3D12CommandList* ppCommandLists[] = { m_commandList.Get() };
+            m_commandQueue->ExecuteCommandLists(_countof(ppCommandLists), ppCommandLists);
+            m_swapChain->Present(1, 0);
+            MoveToNextFrame();
+        } catch (...) {
+            // Completely suppress all errors
+        }
+    }
+
+    void Renderer::PopulateCommandList() {
+        try {
+            // Wait for GPU to finish with this frame's command allocator
+            const UINT64 completedValue = m_fence->GetCompletedValue();
+            const UINT64 expectedValue = m_fenceValue - 1;
+            
+            if (completedValue < expectedValue) {
+                m_fence->SetEventOnCompletion(expectedValue, m_fenceEvent);
+                WaitForSingleObject(m_fenceEvent, INFINITE);
+            }
+            
+            // Reset command allocator and list
+            m_commandAllocators[m_frameIndex]->Reset();
+            m_commandList->Reset(m_commandAllocators[m_frameIndex].Get(), nullptr);
+
+            // NO RAYTRACING - Only clear background and render ImGui
+            // All raytracing is done offline in RenderToFile()
+            
+            // Transition render target to render target state
+            D3D12_RESOURCE_BARRIER rtBarrier = {};
+            rtBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            rtBarrier.Transition.pResource = m_renderTargets[m_frameIndex].Get();
+            rtBarrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+            rtBarrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            rtBarrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            m_commandList->ResourceBarrier(1, &rtBarrier);
+            
+            // Clear render target to a dark gray background
+            D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = m_rtvHeap->GetCPUDescriptorHandleForHeapStart();
+            rtvHandle.ptr += m_frameIndex * m_rtvDescriptorSize;
+            const float clearColor[] = { 0.1f, 0.1f, 0.1f, 1.0f };
+            m_commandList->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
+            
+            // Set render target for ImGui
+            m_commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
+            
+            // Render ImGui
+            {
+            // Transition to render target
+            D3D12_RESOURCE_BARRIER barrier = {};
+            barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            barrier.Transition.pResource = m_renderTargets[m_frameIndex].Get();
+            barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+            barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            m_commandList->ResourceBarrier(1, &barrier);
+
+            D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = m_rtvHeap->GetCPUDescriptorHandleForHeapStart();
+            rtvHandle.ptr += m_frameIndex * m_rtvDescriptorSize;
+            const float clearColor[] = { 0.1f, 0.2f, 0.4f, 1.0f };
+            m_commandList->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
+            
+            // Render ImGui on top
+            m_commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
+            ID3D12DescriptorHeap* imguiHeaps[] = { m_imguiSrvHeap.Get() };
+            m_commandList->SetDescriptorHeaps(1, imguiHeaps);
+            ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), m_commandList.Get());
+
+            barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+            m_commandList->ResourceBarrier(1, &barrier);
+        }
+
+        ThrowIfFailed(m_commandList->Close(), "Failed to close command list");
+        
+        } catch (const std::exception& e) {
+            std::cerr << "[PopulateCommandList] Exception: " << e.what() << std::endl;
+            throw;
+        } catch (...) {
+            std::cerr << "[PopulateCommandList] Unknown exception" << std::endl;
+            throw std::runtime_error("Unknown exception in PopulateCommandList");
+        }
+    }
+
+
+
+    void Renderer::OnDestroy() {
+        WaitForGpu();
+        if (m_fenceEvent) {
+            CloseHandle(m_fenceEvent);
+            m_fenceEvent = nullptr;
+        }
+        std::cout << "Renderer destroyed" << std::endl;
+    }
+
+    void Renderer::OnResize(UINT width, UINT height) {
+        if (width == 0 || height == 0 || width == m_width && height == m_height) {
+            return;
+        }
+
+        m_width = width;
+        m_height = height;
+
+        WaitForGpu();
+
+        // Release old render targets
+        for (UINT i = 0; i < FrameCount; i++) {
+            m_renderTargets[i].Reset();
+        }
+
+        // Resize swap chain buffers
+        ThrowIfFailed(m_swapChain->ResizeBuffers(
+            FrameCount,
+            m_width,
+            m_height,
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            0
+        ));
+
+        m_frameIndex = m_swapChain->GetCurrentBackBufferIndex();
+
+        // Recreate render targets
+        CreateRenderTargets();
+
+        std::cout << "Window resized to " << m_width << "x" << m_height << std::endl;
+    }
+
+    void Renderer::WaitForGpu() {
+        if (m_fence && m_commandQueue) {
+            // Use a separate fence value to avoid interfering with frame synchronization
+            const UINT64 fenceValue = m_fenceValue;
+            ThrowIfFailed(m_commandQueue->Signal(m_fence.Get(), fenceValue), "Failed to signal fence");
+            m_fenceValue++;
+
+            // Wait for the fence to be signaled
+            if (m_fence->GetCompletedValue() < fenceValue) {
+                ThrowIfFailed(m_fence->SetEventOnCompletion(fenceValue, m_fenceEvent), "Failed to set fence event");
+                WaitForSingleObject(m_fenceEvent, INFINITE);
+            }
+        }
+    }
+
+    void Renderer::MoveToNextFrame() {
+        const UINT64 currentFenceValue = m_fenceValue;
+        ThrowIfFailed(m_commandQueue->Signal(m_fence.Get(), currentFenceValue), "Failed to signal fence in MoveToNextFrame");
+        m_fenceValue++;
+
+        // Update frame index
+        m_frameIndex = m_swapChain->GetCurrentBackBufferIndex();
+
+        // Wait for the previous frame's commands to complete
+        if (m_fence->GetCompletedValue() < currentFenceValue) {
+            ThrowIfFailed(m_fence->SetEventOnCompletion(currentFenceValue, m_fenceEvent), "Failed to set fence event in MoveToNextFrame");
+            WaitForSingleObject(m_fenceEvent, INFINITE);
+        }
+    }
+}

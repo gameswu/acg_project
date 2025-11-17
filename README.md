@@ -8,6 +8,8 @@ This repository contains the code and resources for the Advanced Computer Graphi
 ## Targets and Course Requirements
 
 We are planning to implement a GPU-based renderer that meets the following course requirements:
+<details>
+<summary>Click to expand the requirements</summary>
 
 - Base: Implement a path tracing algorithm that correctly handles diffuse and specular materials. (basic)
 - Scene creation: Build a custom scene with aesthetic considerations, using geometry that you create from scratch or find online (ensure the source is credited). (basic, tidiness and attractiveness 1pt)
@@ -39,6 +41,7 @@ We are planning to implement a GPU-based renderer that meets the following cours
     - Environment lighting with HDR, such as skybox (2pts)
 - Anti-aliasing: Implement an anti-aliasing algorithm (basic)
 - Simulation-based content creation: Up to 2pts
+</details>
 
 Details of each requirement can be found in the [project description document](/docs/ACG_2025_Project_Announcement.pdf).
 
@@ -67,7 +70,7 @@ acg_project/
 │   ├── Material.cpp
 │   ├── MathUtils.cpp
 │   ├── Mesh.cpp
-│   ├── Renderer.cpp
+│   ├── Renderer.cpp·
 │   ├── Sampler.cpp
 │   ├── Scene.cpp
 │   ├── Texture.cpp
@@ -79,7 +82,7 @@ acg_project/
 │   └── Structures.hlsli # HLSL shader structures
 │
 ├── docs/                # Documentation directory
-├── tests/               # Test code directory
+├── tests/               # Test scenes and scripts
 ├── CMakeLists.txt       # CMake build configuration
 ├── vcpkg.json           # vcpkg dependency configuration
 └── README.md            # Project description
@@ -90,7 +93,7 @@ acg_project/
 We provide a GUI for users to configure rendering settings and load scenes. The GUI allows you to adjust parameters such as samples per pixel, maximum bounces, and load different 3D models.
 
 <div align="center">
-    <img src="docs/gui.png" alt="GUI Screenshot" width="800"/>
+    <img src="docs/images/gui.png" alt="GUI Screenshot" width="800"/>
 </div>
 
 - **Render Settings:** Adjust output resolution, sampling parameters, lighting intensity, and scene model paths.
@@ -116,11 +119,7 @@ To build the project, follow these steps:
     git clone https://github.com/gameswu/acg_project.git
     cd acg_project
     ```
-2. Install dependencies using vcpkg:
-    ```bash
-    vcpkg install
-    ```
-3. Configure and build the project using CMake:
+2. Configure and build the project using CMake:
     ```bash
     cmake -B build -S . -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
     cmake --build build --config Release
@@ -135,3 +134,11 @@ python -m venv .venv
 pip install -r requirements.txt
 python tests/download.py
 ```
+
+| Test Scene | Targeted Feature |
+|------------|------------------|
+| CornellBox | Basic rendering test |
+| breakfast_room | Texture mapping |
+| sponza | Large scene |
+| lpshead | Head model |
+| hairball | Hair model |

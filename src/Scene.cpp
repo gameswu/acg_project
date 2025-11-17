@@ -9,7 +9,8 @@
 namespace ACG {
 
 Scene::Scene() 
-    : m_bboxMin(std::numeric_limits<float>::max())
+    : m_name("Untitled Scene")
+    , m_bboxMin(std::numeric_limits<float>::max())
     , m_bboxMax(std::numeric_limits<float>::lowest())
 {
 }
@@ -31,6 +32,24 @@ void Scene::AddLight(std::shared_ptr<Light> light) {
 
 bool Scene::LoadFromFile(const std::string& filename) {
     std::cout << "Loading scene from: " << filename << std::endl;
+    
+    // Extract directory from filename for texture loading and scene name
+    std::string directory;
+    size_t lastSlash = filename.find_last_of("/\\");
+    if (lastSlash != std::string::npos) {
+        directory = filename.substr(0, lastSlash + 1);
+        
+        // 从文件路径提取场景名称
+        size_t lastDot = filename.find_last_of(".");
+        if (lastDot != std::string::npos && lastDot > lastSlash) {
+            m_name = filename.substr(lastSlash + 1, lastDot - lastSlash - 1);
+        } else {
+            m_name = "Unnamed Scene";
+        }
+    } else {
+        m_name = "Unnamed Scene";
+    }
+    
     Assimp::Importer importer;
     const aiScene* ascene = importer.ReadFile(
         filename,
@@ -46,7 +65,7 @@ bool Scene::LoadFromFile(const std::string& filename) {
 
     m_meshes.clear();
     m_materials.clear();
-
+    
     // Load materials from aiScene
     for (unsigned int i = 0; i < ascene->mNumMaterials; ++i) {
         aiMaterial* aiMat = ascene->mMaterials[i];
@@ -84,18 +103,67 @@ bool Scene::LoadFromFile(const std::string& filename) {
             mat->SetType(MaterialType::Emissive);
             mat->SetAlbedo(albedo);
             mat->SetEmission(emissive);
+            mat->SetSpecular(glm::vec3(specular.r, specular.g, specular.b));
+            mat->SetIllum(illum);
             std::cout << "Material[" << i << "] \"" << name.C_Str() << "\": Emissive (Ke=" 
                      << emissive.x << "," << emissive.y << "," << emissive.z << ")" << std::endl;
         } else if (specularIntensity > 0.5f || illum == 5) {
             // Specular/Mirror material (illum 5 is mirror reflection)
             mat = std::make_shared<SpecularMaterial>(albedo, 0.0f); // 0.0f roughness = perfect mirror
+            mat->SetSpecular(glm::vec3(specular.r, specular.g, specular.b));
+            mat->SetIllum(illum);
             std::cout << "Material[" << i << "] \"" << name.C_Str() << "\": Specular/Mirror (Ks=" 
                      << specular.r << "," << specular.g << "," << specular.b << ", illum=" << illum << ")" << std::endl;
         } else {
             // Diffuse material
             mat = std::make_shared<DiffuseMaterial>(albedo);
+            mat->SetSpecular(glm::vec3(specular.r, specular.g, specular.b));
+            mat->SetIllum(illum);
             std::cout << "Material[" << i << "] \"" << name.C_Str() << "\": Diffuse (Kd=" 
-                     << albedo.x << "," << albedo.y << "," << albedo.z << ")" << std::endl;
+                     << albedo.x << "," << albedo.y << "," << albedo.z << ")";
+        }
+        
+        // Load textures
+        if (aiMat->GetTextureCount(aiTextureType_DIFFUSE) > 0) {
+            aiString texPath;
+            if (aiMat->GetTexture(aiTextureType_DIFFUSE, 0, &texPath) == AI_SUCCESS) {
+                std::string fullPath = directory + texPath.C_Str();
+                std::cout << "\n  Loading diffuse texture: " << fullPath << std::endl;
+                auto texture = TextureManager::Instance().Load(fullPath);
+                if (texture) {
+                    mat->SetAlbedoTexture(texture);
+                    std::cout << "  Texture loaded: " << texture->GetWidth() << "x" << texture->GetHeight() 
+                             << " (" << texture->GetChannels() << " channels)" << std::endl;
+                } else {
+                    std::cerr << "  ERROR: Failed to load texture!" << std::endl;
+                }
+            }
+        } else {
+            std::cout << std::endl;  // End the material line
+        }
+        
+        // Load normal map
+        if (aiMat->GetTextureCount(aiTextureType_NORMALS) > 0) {
+            aiString texPath;
+            if (aiMat->GetTexture(aiTextureType_NORMALS, 0, &texPath) == AI_SUCCESS) {
+                std::string fullPath = directory + texPath.C_Str();
+                auto texture = TextureManager::Instance().Load(fullPath);
+                if (texture) {
+                    mat->SetNormalTexture(texture);
+                }
+            }
+        }
+        
+        // Load roughness map
+        if (aiMat->GetTextureCount(aiTextureType_SHININESS) > 0) {
+            aiString texPath;
+            if (aiMat->GetTexture(aiTextureType_SHININESS, 0, &texPath) == AI_SUCCESS) {
+                std::string fullPath = directory + texPath.C_Str();
+                auto texture = TextureManager::Instance().Load(fullPath);
+                if (texture) {
+                    mat->SetRoughnessTexture(texture);
+                }
+            }
         }
         
         m_materials.push_back(mat);
@@ -153,6 +221,25 @@ bool Scene::LoadFromFile(const std::string& filename) {
 
     ComputeBoundingBox();
     std::cout << "Loaded meshes: " << m_meshes.size() << ", materials: " << m_materials.size() << std::endl;
+    std::cout << "Scene bounding box: min=(" << m_bboxMin.x << ", " << m_bboxMin.y << ", " << m_bboxMin.z << ")"
+             << " max=(" << m_bboxMax.x << ", " << m_bboxMax.y << ", " << m_bboxMax.z << ")" << std::endl;
+    
+    // Calculate scene center and size
+    glm::vec3 center = (m_bboxMin + m_bboxMax) * 0.5f;
+    glm::vec3 size = m_bboxMax - m_bboxMin;
+    float maxDim = std::max({size.x, size.y, size.z});
+    
+    std::cout << "Scene center: (" << center.x << ", " << center.y << ", " << center.z << ")" << std::endl;
+    std::cout << "Scene size: " << size.x << " x " << size.y << " x " << size.z 
+             << " (max: " << maxDim << ")" << std::endl;
+    
+    // Give camera positioning hints
+    if (maxDim < 1.0f) {
+        std::cout << "HINT: This is a small scene. Recommended camera distance: " << (maxDim * 2.0f) << std::endl;
+    } else if (maxDim > 100.0f) {
+        std::cout << "HINT: This is a large scene. Recommended camera distance: " << (maxDim * 1.5f) << std::endl;
+    }
+    
     return true;
 }
 

@@ -23,6 +23,7 @@ public:
     
     // 获取相机参数
     glm::vec3 GetPosition() const { return m_position; }
+    glm::vec3 GetTarget() const { return m_target; }
     glm::vec3 GetDirection() const { return m_direction; }
     glm::vec3 GetRight() const { return m_right; }
     glm::vec3 GetUp() const { return m_up; }
@@ -30,6 +31,8 @@ public:
     float GetAperture() const { return m_aperture; }
     float GetFocusDistance() const { return m_focusDistance; }
     
+    glm::mat4 GetProjectionMatrix() const;
+
     // 生成光线（用于路径追踪）
     void GenerateRay(float u, float v, glm::vec3& origin, glm::vec3& direction) const;
     
@@ -39,6 +42,7 @@ public:
 
 private:
     glm::vec3 m_position;
+    glm::vec3 m_target;
     glm::vec3 m_direction;
     glm::vec3 m_right;
     glm::vec3 m_up;
