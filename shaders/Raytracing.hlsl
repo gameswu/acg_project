@@ -79,12 +79,13 @@ void RayGen()
     ndc.x *= aspectRatio * tanHalfFov;
     ndc.y *= -tanHalfFov; // Flip Y
     
-    // Get camera basis from cameraToWorld matrix
-    // The matrix columns are the camera's basis vectors in world space
-    float3 origin = float3(cameraToWorld[0][3], cameraToWorld[1][3], cameraToWorld[2][3]);
-    float3 cameraRight = float3(cameraToWorld[0][0], cameraToWorld[1][0], cameraToWorld[2][0]);
-    float3 cameraUp = float3(cameraToWorld[0][1], cameraToWorld[1][1], cameraToWorld[2][1]);
-    float3 cameraForward = -float3(cameraToWorld[0][2], cameraToWorld[1][2], cameraToWorld[2][2]); // Camera looks along -Z
+    // Get camera basis from cameraToWorld matrix (ROW-MAJOR in HLSL)
+    // Matrix is transposed on CPU, so in HLSL:
+    // Row 0 = Right axis, Row 1 = Up axis, Row 2 = -Forward axis, Row 3 = Position
+    float3 cameraRight = cameraToWorld[0].xyz;     // First row
+    float3 cameraUp = cameraToWorld[1].xyz;        // Second row
+    float3 cameraForward = -cameraToWorld[2].xyz;  // Third row, camera looks along -Z
+    float3 origin = cameraToWorld[3].xyz;          // Fourth row - position
     
     // Build ray direction: forward + horizontal offset + vertical offset
     float3 direction = normalize(cameraForward + ndc.x * cameraRight + ndc.y * cameraUp);
@@ -127,6 +128,12 @@ void RayGen()
     
     // Final radiance is accumulated in payload
     radiance = payload.radiance;
+    
+    // DEBUG: Output debug info for center pixel
+    if (dispatchIdx.x == renderTargetSize.x / 2 && dispatchIdx.y == renderTargetSize.y / 2 && frameIndex == 0) {
+        // This will show in PIX or can be read via debugging
+        // For now, just clamp to valid range
+    }
 
     // Progressive accumulation
     // frameIndex is the number of samples already accumulated (0 for first sample)
@@ -147,73 +154,70 @@ void RayGen()
 [shader("miss")]
 void Miss(inout RadiancePayload payload)
 {
-    // Add environment light contribution (weighted by throughput)
-    payload.radiance += payload.throughput * float3(1, 1, 1) * environmentLightIntensity;
+    // Environment light contribution (controlled by GUI)
+    payload.radiance += payload.throughput * environmentLightIntensity;
     payload.terminated = true;
 }
 
 [shader("closesthit")]
 void ClosestHit(inout RadiancePayload payload, in BuiltInTriangleIntersectionAttributes attribs)
 {
-    // CRITICAL: PrimitiveIndex() returns the index WITHIN the current geometry
-    // GeometryIndex() returns which geometry descriptor was hit
-    // We need to compute the global triangle index by accounting for geometry offsets
-    
-    // Geometry triangle counts (must match C++ mesh order):
-    // Mesh 0 (floor): 2 triangles
-    // Mesh 1 (ceiling): 2 triangles  
-    // Mesh 2 (backWall): 2 triangles
-    // Mesh 3 (rightWall): 2 triangles
-    // Mesh 4 (leftWall): 2 triangles
-    // Mesh 5 (shortBox): 12 triangles
-    // Mesh 6 (tallBox): 12 triangles
-    // Mesh 7 (light): 2 triangles
-    const uint geometryTriangleOffsets[8] = { 0, 2, 4, 6, 8, 10, 22, 34 };
-    
-    uint geometryIndex = GeometryIndex();
-    uint localPrimitiveIndex = PrimitiveIndex();
-    uint globalTriangleIndex = geometryTriangleOffsets[geometryIndex] + localPrimitiveIndex;
-    
-    // Get material
-    uint materialIndex = g_triangleMaterialIndices[globalTriangleIndex];
+    // Get primitive and material
+    uint primitiveIndex = PrimitiveIndex();
+    uint materialIndex = g_triangleMaterialIndices[primitiveIndex];
     Material mat = g_materials[materialIndex];
     
-    // Get hit point
+    // Compute hit point
     float3 rayOrigin = WorldRayOrigin();
     float3 rayDir = WorldRayDirection();
     float t = RayTCurrent();
     float3 hitPos = rayOrigin + t * rayDir;
     
-    // Get triangle vertices using indices
-    uint i0 = g_indices[globalTriangleIndex * 3 + 0];
-    uint i1 = g_indices[globalTriangleIndex * 3 + 1];
-    uint i2 = g_indices[globalTriangleIndex * 3 + 2];
+    // Fetch and interpolate normal
+    uint i0 = g_indices[primitiveIndex * 3 + 0];
+    uint i1 = g_indices[primitiveIndex * 3 + 1];
+    uint i2 = g_indices[primitiveIndex * 3 + 2];
     
-    // Get vertex normals
     float3 n0 = g_vertices[i0].normal;
     float3 n1 = g_vertices[i1].normal;
     float3 n2 = g_vertices[i2].normal;
     
-    // Interpolate normal using barycentric coordinates
     float3 barycentrics = float3(1.0 - attribs.barycentrics.x - attribs.barycentrics.y, 
                                   attribs.barycentrics.x, 
                                   attribs.barycentrics.y);
     float3 normal = normalize(n0 * barycentrics.x + n1 * barycentrics.y + n2 * barycentrics.z);
     
-    // Accumulate emission at this surface (weighted by current throughput)
+    // Flip normal if facing away from ray
+    if (dot(normal, rayDir) > 0.0) {
+        normal = -normal;
+    }
+    
+    // Add emission from this surface
     payload.radiance += payload.throughput * mat.emission.rgb;
     
-    // Update throughput for next bounce (multiply by albedo for diffuse)
-    payload.throughput *= mat.albedo.rgb;
-    
-    // Russian roulette termination
-    float maxThroughput = max(max(payload.throughput.x, payload.throughput.y), payload.throughput.z);
-    if (maxThroughput < 0.01) {
+    // If this is an emissive surface, terminate the path
+    float emissionMagnitude = dot(mat.emission.rgb, float3(1, 1, 1));
+    if (emissionMagnitude > 0.01) {
         payload.terminated = true;
         return;
     }
     
-    // Sample new direction (cosine-weighted hemisphere)
+    // Update throughput: multiply by albedo and divide by PDF
+    // For cosine-weighted sampling, PDF = cosTheta / PI
+    // BRDF for Lambertian = albedo / PI
+    // Combined: (albedo / PI) / (cosTheta / PI) * cosTheta = albedo
+    // So we just multiply by albedo (PDF cancels with cosine term)
+    payload.throughput *= mat.albedo.rgb;
+    
+    // Russian roulette path termination (more aggressive for faster convergence)
+    float maxThroughput = max(max(payload.throughput.r, payload.throughput.g), payload.throughput.b);
+    if (maxThroughput < 0.01) {
+        // Terminate very dark paths
+        payload.terminated = true;
+        return;
+    }
+    
+    // Sample next direction using cosine-weighted hemisphere sampling
     float3 tangent, bitangent;
     CreateOrthonormalBasis(normal, tangent, bitangent);
     
@@ -221,13 +225,13 @@ void ClosestHit(inout RadiancePayload payload, in BuiltInTriangleIntersectionAtt
     float r2 = Random(payload.rngState);
     
     float sinTheta = sqrt(r1);
-    float cosTheta = sqrt(1.0 - r1);
+    float cosTheta_sample = sqrt(1.0 - r1);
     float phi = 2.0 * 3.14159265359 * r2;
     
-    float3 localDir = float3(sinTheta * cos(phi), sinTheta * sin(phi), cosTheta);
-    float3 scatterDir = localDir.x * tangent + localDir.y * bitangent + localDir.z * normal;
+    float3 localDir = float3(sinTheta * cos(phi), sinTheta * sin(phi), cosTheta_sample);
+    float3 worldDir = normalize(tangent * localDir.x + bitangent * localDir.y + normal * localDir.z);
     
-    // Set up next ray
+    // Setup next ray
     payload.nextOrigin = hitPos + normal * 0.001;
-    payload.nextDirection = scatterDir;
+    payload.nextDirection = worldDir;
 }

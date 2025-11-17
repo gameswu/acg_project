@@ -20,3 +20,7 @@ tests/scenes/
 
 # ImGui settings
 imgui.ini
+
+# Lib bin and build files
+!lib/**/bin
+!lib/**/build/

@@ -14,6 +14,14 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_SOURCE_DIR}/bin)
 # 添加头文件目录
 include_directories(include)
 
+# PIX for Windows support (DEBUG only)
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    include_directories(${CMAKE_SOURCE_DIR}/lib/WinPixEventRuntime/Include)
+    message(STATUS "PIX enabled for Debug build")
+else()
+    message(STATUS "PIX disabled for Release build")
+endif()
+
 # 收集所有源文件
 file(GLOB_RECURSE SRC_FILES 
     "src/*.cpp"
@@ -53,6 +61,24 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     d3dcompiler.lib # 着色器编译器
     dxguid.lib     # DirectX GUIDs
 )
+
+# 链接 PIX 调试库 (DEBUG only)
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    target_link_libraries(${PROJECT_NAME} PRIVATE
+        ${CMAKE_SOURCE_DIR}/lib/WinPixEventRuntime/bin/x64/WinPixEventRuntime.lib
+    )
+    target_compile_definitions(${PROJECT_NAME} PRIVATE USE_PIX=1)
+endif()
+
+# 复制 PIX DLL 到输出目录 (DEBUG only)
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        ${CMAKE_SOURCE_DIR}/lib/WinPixEventRuntime/bin/x64/WinPixEventRuntime.dll
+        ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/WinPixEventRuntime.dll
+        COMMENT "Copying WinPixEventRuntime.dll (Debug)"
+    )
+endif()
 
 # 复制 shader 文件到 bin 目录
 file(GLOB SHADER_FILES "${CMAKE_SOURCE_DIR}/shaders/*.hlsl" "${CMAKE_SOURCE_DIR}/shaders/*.hlsli")

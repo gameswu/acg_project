@@ -49,9 +49,8 @@ Details of each requirement can be found in the [project description document](/
 ```
 acg_project/
 ├── include/             # Header directory
-│   ├── BVH.h            # BVH acceleration structure
 │   ├── Camera.h         # Camera system
-│   ├── GUI.h            # GUI system (using ImGui)
+│   ├── DX12Helper.h     # DirectX 12 helper functions
 │   ├── Light.h          # Lighting system (point light, area light, environment light)
 │   ├── LogRedirector.h  # Redirect console output to GUI log panel
 │   ├── Material.h       # Material system (diffuse, specular, transmissive, PBR)
@@ -63,9 +62,7 @@ acg_project/
 │   └── Texture.h        # Texture system (supports Mipmap)
 │
 ├── src/                 # Source files directory
-│   ├── BVH.cpp
 │   ├── Camera.cpp
-│   ├── GUI.cpp
 │   ├── Light.cpp
 │   ├── Material.cpp
 │   ├── MathUtils.cpp
@@ -77,10 +74,12 @@ acg_project/
 │   └── main.cpp         # Main program entry point
 │
 ├── shaders/             # Shader files directory
-│   ├── PathTracing.hlsl # HLSL shader for path tracing
+│   ├── Raytracing.hlsl  # HLSL shader for ray tracing
 │   ├── Random.hlsli     # HLSL shader for random number generation
 │   └── Structures.hlsli # HLSL shader structures
 │
+├── lib/                 # Third-party libraries
+│   └── WinPixEventRuntime/ # PIX for Windows library
 ├── docs/                # Documentation directory
 ├── tests/               # Test scenes and scripts
 ├── CMakeLists.txt       # CMake build configuration

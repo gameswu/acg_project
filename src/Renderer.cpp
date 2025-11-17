@@ -13,6 +13,16 @@
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtx/string_cast.hpp>
 
+// PIX support for GPU debugging (DEBUG only)
+#if defined(_DEBUG) && defined(USE_PIX)
+#include <pix3.h>
+#else
+// Define PIX macros as no-ops if PIX is not available
+#define PIXBeginEvent(...)
+#define PIXEndEvent(...)
+#define PIXSetMarker(...)
+#endif
+
 #pragma comment(lib, "dxcompiler.lib")
 
 // Note: The DXR helper includes have been removed for now to resolve compilation issues.
@@ -243,55 +253,36 @@ namespace ACG {
             renderCommandList->SetDescriptorHeaps(_countof(ppHeaps), ppHeaps);
 
             // DEBUG: Print binding info
-            std::cout << "Setting up shader bindings..." << std::endl;
-            std::cout << "  m_srvUavDescriptorSize: " << m_srvUavDescriptorSize << std::endl;
-            std::cout << "  Heap start ptr: " << m_srvUavHeap->GetGPUDescriptorHandleForHeapStart().ptr << std::endl;
-            std::cout.flush();
-
             // Set root arguments
             // Root parameter 0: UAV table (output texture at index 0)
             D3D12_GPU_DESCRIPTOR_HANDLE uavHandle = m_srvUavHeap->GetGPUDescriptorHandleForHeapStart();
             uavHandle.ptr += m_uavIndex_Output * m_srvUavDescriptorSize;
-            std::cout << "  Output UAV (index " << m_uavIndex_Output << ") ptr: " << uavHandle.ptr << std::endl;
-            std::cout.flush();
             renderCommandList->SetComputeRootDescriptorTable(0, uavHandle);
             
             // Root parameter 1: TLAS (direct SRV, not a table)
-            std::cout << "  TLAS address: " << m_topLevelAS->GetGPUVirtualAddress() << std::endl;
-            std::cout.flush();
             renderCommandList->SetComputeRootShaderResourceView(1, m_topLevelAS->GetGPUVirtualAddress());
             
             // Root parameter 2: Vertices SRV table (index 1)
             D3D12_GPU_DESCRIPTOR_HANDLE verticesHandle = m_srvUavHeap->GetGPUDescriptorHandleForHeapStart();
             verticesHandle.ptr += m_srvIndex_Vertices * m_srvUavDescriptorSize;
-            std::cout << "  Vertices SRV (index " << m_srvIndex_Vertices << ") ptr: " << verticesHandle.ptr << std::endl;
-            std::cout.flush();
             renderCommandList->SetComputeRootDescriptorTable(2, verticesHandle);
             
             // Root parameter 3: Indices SRV table (index 2)
             D3D12_GPU_DESCRIPTOR_HANDLE indicesHandle = m_srvUavHeap->GetGPUDescriptorHandleForHeapStart();
             indicesHandle.ptr += m_srvIndex_Indices * m_srvUavDescriptorSize;
-            std::cout << "  Indices SRV (index " << m_srvIndex_Indices << ") ptr: " << indicesHandle.ptr << std::endl;
-            std::cout.flush();
             renderCommandList->SetComputeRootDescriptorTable(3, indicesHandle);
             
             // Root parameter 4: Triangle materials SRV table (index 3)
             D3D12_GPU_DESCRIPTOR_HANDLE triMatHandle = m_srvUavHeap->GetGPUDescriptorHandleForHeapStart();
-            triMatHandle.ptr += 3 * m_srvUavDescriptorSize; // Index 3
-            std::cout << "  TriangleMaterials SRV (index 3) ptr: " << triMatHandle.ptr << std::endl;
-            std::cout.flush();
+            triMatHandle.ptr += 3 * m_srvUavDescriptorSize;
             renderCommandList->SetComputeRootDescriptorTable(4, triMatHandle);
             
             // Root parameter 5: Materials SRV (direct root descriptor)
             D3D12_GPU_VIRTUAL_ADDRESS materialsAddress = m_materialBuffer->GetGPUVirtualAddress();
-            std::cout << "  Materials SRV (direct) address: " << materialsAddress << std::endl;
-            std::cout.flush();
             renderCommandList->SetComputeRootShaderResourceView(5, materialsAddress);
             
             // Root parameter 6: Textures SRV table (not used yet, bind dummy)
             D3D12_GPU_DESCRIPTOR_HANDLE texturesHandle = m_srvUavHeap->GetGPUDescriptorHandleForHeapStart();
-            std::cout << "  Textures SRV (dummy) ptr: " << texturesHandle.ptr << std::endl;
-            std::cout.flush();
             renderCommandList->SetComputeRootDescriptorTable(6, texturesHandle);
 
             // Root parameter 7: Camera constants (32-bit constants)
@@ -309,9 +300,6 @@ namespace ACG {
             cameraToWorld[2] = glm::vec4(-dir, 0.0f);       // Z axis (column 2) - camera looks along -Z
             cameraToWorld[3] = glm::vec4(pos, 1.0f);        // Translation (column 3)
             
-            std::cout << "  Before transpose, column 2 (-dir): (" << cameraToWorld[2][0] << "," 
-                     << cameraToWorld[2][1] << "," << cameraToWorld[2][2] << ")" << std::endl;
-            
             // Transpose for row-major HLSL (DirectX uses row-major by default)
             cameraToWorld = glm::transpose(cameraToWorld);
             
@@ -327,27 +315,8 @@ namespace ACG {
             cameraConstants.environmentLightIntensity = m_environmentLightIntensity;
             cameraConstants.padding = 0.0f;
             
-            std::cout << "  Camera constants: frameIndex=" << cameraConstants.frameIndex 
-                     << ", maxBounces=" << cameraConstants.maxBounces 
-                     << ", envLight=" << cameraConstants.environmentLightIntensity << std::endl;
-            std::cout << "  Camera pos: (" << pos.x << "," << pos.y << "," << pos.z << ")" << std::endl;
-            std::cout << "  Camera dir: (" << dir.x << "," << dir.y << "," << dir.z << ")" << std::endl;
-            std::cout << "  Camera right: (" << right.x << "," << right.y << "," << right.z << ")" << std::endl;
-            std::cout << "  Camera up: (" << up.x << "," << up.y << "," << up.z << ")" << std::endl;
-            
-            // Print camera matrices for debugging
-            std::cout << "  cameraToWorld matrix:" << std::endl;
-            for (int i = 0; i < 4; i++) {
-                std::cout << "    [" << cameraToWorld[i][0] << ", " << cameraToWorld[i][1] << ", " 
-                         << cameraToWorld[i][2] << ", " << cameraToWorld[i][3] << "]" << std::endl;
-            }
-            std::cout.flush();
-            
             // Set root constants (144 bytes = 36 DWORDs)
             renderCommandList->SetComputeRoot32BitConstants(7, sizeof(CameraConstants) / 4, &cameraConstants, 0);
-
-            std::cout << "All bindings set, dispatching rays..." << std::endl;
-            std::cout.flush();
 
             // Dispatch rays with accumulation
             D3D12_DISPATCH_RAYS_DESC dispatchDesc = {};
@@ -364,6 +333,9 @@ namespace ACG {
             dispatchDesc.Depth = 1;
 
             std::cout << "Starting progressive rendering loop..." << std::endl;
+            
+            // PIX: Mark render loop start
+            PIXBeginEvent(renderCommandList.Get(), PIX_COLOR_INDEX(1), "Path Tracing Loop");
             
             // Clear output texture before first sample to ensure clean start
             D3D12_RECT clearRect = { 0, 0, (LONG)m_width, (LONG)m_height };
@@ -385,6 +357,9 @@ namespace ACG {
             // Reset accumulated samples counter
             m_accumulatedSamples = 0;
 
+            // Render in batches to allow progress updates
+            const int batchSize = 10; // Execute GPU work every 10 samples
+            
             for (int sampleIdx = 0; sampleIdx < samplesPerPixel; ++sampleIdx) {
                 // Check if stop was requested
                 if (m_stopRenderRequested) {
@@ -401,26 +376,130 @@ namespace ACG {
                 }
                 
                 // Update frameIndex for this sample
-                // frameIndex represents the number of samples already accumulated (0 for first sample)
                 uint32_t currentFrameIndex = static_cast<uint32_t>(sampleIdx);
-                // SetComputeRoot32BitConstants can update part of the constants
-                // frameIndex is at offset 32 (after two 4x4 matrices = 32 floats = 128 bytes)
                 renderCommandList->SetComputeRoot32BitConstants(7, 1, &currentFrameIndex, 32);
+                
+                // PIX: Mark individual sample
+                PIXBeginEvent(renderCommandList.Get(), PIX_COLOR_INDEX(2), "Sample %d", sampleIdx + 1);
                 
                 // Dispatch rays for this sample
                 renderCommandList->DispatchRays(&dispatchDesc);
                 
-                // Update progress counter
-                m_accumulatedSamples = sampleIdx + 1;
+                PIXEndEvent(renderCommandList.Get());
                 
                 // Add UAV barrier to ensure this sample completes before next
                 D3D12_RESOURCE_BARRIER uavBarrier = {};
                 uavBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
                 uavBarrier.UAV.pResource = m_outputTexture.Get();
                 renderCommandList->ResourceBarrier(1, &uavBarrier);
+                
+                // Execute GPU work periodically to allow progress updates
+                bool isLastSample = (sampleIdx == samplesPerPixel - 1);
+                bool shouldExecute = ((sampleIdx + 1) % batchSize == 0) || isLastSample;
+                
+                if (shouldExecute) {
+                    // Close and execute command list
+                    ThrowIfFailed(renderCommandList->Close());
+                    ID3D12CommandList* lists[] = { renderCommandList.Get() };
+                    m_commandQueue->ExecuteCommandLists(1, lists);
+                    
+                    // Signal and wait for GPU
+                    const UINT64 currentFence = m_offlineFenceValue;
+                    ThrowIfFailed(m_commandQueue->Signal(m_offlineFence.Get(), currentFence));
+                    m_offlineFenceValue++;
+                    
+                    if (m_offlineFence->GetCompletedValue() < currentFence) {
+                        ThrowIfFailed(m_offlineFence->SetEventOnCompletion(currentFence, m_offlineFenceEvent));
+                        WaitForSingleObject(m_offlineFenceEvent, INFINITE);
+                    }
+                    
+                    // Update progress counter AFTER GPU completes
+                    m_accumulatedSamples = sampleIdx + 1;
+                    
+                    // If not last sample, reset command list for next batch
+                    if (!isLastSample) {
+                        ThrowIfFailed(m_offlineCommandAllocator->Reset());
+                        ThrowIfFailed(renderCommandList->Reset(m_offlineCommandAllocator.Get(), nullptr));
+                        
+                        // Re-setup pipeline state
+                        renderCommandList->SetPipelineState1(m_dxrStateObject.Get());
+                        renderCommandList->SetComputeRootSignature(m_raytracingGlobalRootSignature.Get());
+                        
+                        // Set descriptor heaps
+                        ID3D12DescriptorHeap* descriptorHeaps[] = { m_srvUavHeap.Get() };
+                        renderCommandList->SetDescriptorHeaps(_countof(descriptorHeaps), descriptorHeaps);
+                        
+                        // Re-bind all resources
+                        // Root parameter 0: Output UAV
+                        D3D12_GPU_DESCRIPTOR_HANDLE uavHandle = m_srvUavHeap->GetGPUDescriptorHandleForHeapStart();
+                        uavHandle.ptr += m_uavIndex_Output * m_srvUavDescriptorSize;
+                        renderCommandList->SetComputeRootDescriptorTable(0, uavHandle);
+                        
+                        // Root parameter 1: TLAS
+                        renderCommandList->SetComputeRootShaderResourceView(1, m_topLevelAS->GetGPUVirtualAddress());
+                        
+                        // Root parameter 2: Vertices SRV table
+                        D3D12_GPU_DESCRIPTOR_HANDLE verticesHandle = m_srvUavHeap->GetGPUDescriptorHandleForHeapStart();
+                        verticesHandle.ptr += m_srvIndex_Vertices * m_srvUavDescriptorSize;
+                        renderCommandList->SetComputeRootDescriptorTable(2, verticesHandle);
+                        
+                        // Root parameter 3: Indices SRV table
+                        D3D12_GPU_DESCRIPTOR_HANDLE indicesHandle = m_srvUavHeap->GetGPUDescriptorHandleForHeapStart();
+                        indicesHandle.ptr += m_srvIndex_Indices * m_srvUavDescriptorSize;
+                        renderCommandList->SetComputeRootDescriptorTable(3, indicesHandle);
+                        
+                        // Root parameter 4: Triangle materials SRV table
+                        D3D12_GPU_DESCRIPTOR_HANDLE triMatHandle = m_srvUavHeap->GetGPUDescriptorHandleForHeapStart();
+                        triMatHandle.ptr += 3 * m_srvUavDescriptorSize;
+                        renderCommandList->SetComputeRootDescriptorTable(4, triMatHandle);
+                        
+                        // Root parameter 5: Materials SRV
+                        D3D12_GPU_VIRTUAL_ADDRESS materialsAddress = m_materialBuffer->GetGPUVirtualAddress();
+                        renderCommandList->SetComputeRootShaderResourceView(5, materialsAddress);
+                        
+                        // Root parameter 6: Textures SRV table
+                        D3D12_GPU_DESCRIPTOR_HANDLE texturesHandle = m_srvUavHeap->GetGPUDescriptorHandleForHeapStart();
+                        renderCommandList->SetComputeRootDescriptorTable(6, texturesHandle);
+                        
+                        // Root parameter 7: Camera constants
+                        glm::vec3 pos = m_camera.GetPosition();
+                        glm::vec3 dir = m_camera.GetDirection();
+                        glm::vec3 right = m_camera.GetRight();
+                        glm::vec3 up = m_camera.GetUp();
+                        
+                        glm::mat4 cameraToWorld = glm::mat4(1.0f);
+                        cameraToWorld[0] = glm::vec4(right, 0.0f);
+                        cameraToWorld[1] = glm::vec4(up, 0.0f);
+                        cameraToWorld[2] = glm::vec4(-dir, 0.0f);
+                        cameraToWorld[3] = glm::vec4(pos, 1.0f);
+                        cameraToWorld = glm::transpose(cameraToWorld);
+                        
+                        glm::mat4 projMatrix = m_camera.GetProjectionMatrix();
+                        glm::mat4 projInverse = glm::transpose(glm::inverse(projMatrix));
+                        
+                        CameraConstants cameraConstants;
+                        cameraConstants.viewInverse = cameraToWorld;
+                        cameraConstants.projInverse = projInverse;
+                        cameraConstants.frameIndex = static_cast<uint32_t>(m_accumulatedSamples);
+                        cameraConstants.maxBounces = static_cast<uint32_t>(m_maxBounces);
+                        cameraConstants.environmentLightIntensity = m_environmentLightIntensity;
+                        cameraConstants.padding = 0.0f;
+                        
+                        renderCommandList->SetComputeRoot32BitConstants(7, sizeof(CameraConstants) / 4, &cameraConstants, 0);
+                        
+                        PIXBeginEvent(renderCommandList.Get(), PIX_COLOR_INDEX(1), "Path Tracing Loop");
+                    }
+                }
             }
+            
+            PIXEndEvent(renderCommandList.Get());  // End "Path Tracing Loop"
+            
             std::cout << "All samples dispatched successfully" << std::endl;
             std::cout.flush();
+
+            // Create new command list for readback operations
+            ThrowIfFailed(m_offlineCommandAllocator->Reset());
+            ThrowIfFailed(renderCommandList->Reset(m_offlineCommandAllocator.Get(), nullptr));
 
             // Transition output texture to copy source
             std::cout << "Transitioning output texture..." << std::endl;
@@ -483,7 +562,7 @@ namespace ACG {
             );
             renderCommandList->ResourceBarrier(1, &barrier);
 
-            // Execute and wait
+            // Execute readback command list
             std::cout << "Closing command list..." << std::endl;
             hr = renderCommandList->Close();
             if (FAILED(hr)) {
@@ -492,12 +571,12 @@ namespace ACG {
                 throw std::runtime_error(errMsg);
             }
             
-            std::cout << "Executing command list..." << std::endl;
+            std::cout << "Executing readback command list..." << std::endl;
             ID3D12CommandList* lists[] = { renderCommandList.Get() };
             m_commandQueue->ExecuteCommandLists(1, lists);
             
-            // Wait for offline rendering to complete using independent fence
-            std::cout << "Waiting for GPU..." << std::endl;
+            // Wait for readback to complete
+            std::cout << "Waiting for GPU readback..." << std::endl;
             std::cout.flush();
             
             const UINT64 fence = m_offlineFenceValue;
@@ -560,27 +639,7 @@ namespace ACG {
             void* mappedData;
             ThrowIfFailed(readbackBuffer->Map(0, nullptr, &mappedData), "Failed to map readback buffer");
 
-            // DEBUG: Check first few pixels with proper flushing
             const uint8_t* pixels = static_cast<const uint8_t*>(mappedData);
-            std::cout << "First 10 pixels (RGBA): " << std::endl;
-            std::cout.flush();
-            for (int i = 0; i < 10; i++) {
-                std::cout << "  Pixel " << i << ": (" 
-                         << (int)pixels[i*4] << "," 
-                         << (int)pixels[i*4+1] << "," 
-                         << (int)pixels[i*4+2] << "," 
-                         << (int)pixels[i*4+3] << ")" << std::endl;
-            }
-            std::cout.flush();
-            
-            // Check middle of image
-            int midOffset = (m_height / 2) * footprint.Footprint.RowPitch + (m_width / 2) * 4;
-            std::cout << "Middle pixel: (" 
-                     << (int)pixels[midOffset] << "," 
-                     << (int)pixels[midOffset+1] << "," 
-                     << (int)pixels[midOffset+2] << "," 
-                     << (int)pixels[midOffset+3] << ")" << std::endl;
-            std::cout.flush();
 
             // Write PPM file
             std::cout << "Writing PPM file..." << std::endl;
@@ -868,7 +927,7 @@ namespace ACG {
         std::vector<LPCWSTR> arguments = {
             filename.c_str(),
             L"-E", L"",  // No entry point for library
-            L"-T", L"lib_6_3",
+            L"-T", L"lib_6_6",  // Shader model 6.6 for GeometryIndex() support
             L"-I", L"shaders",  // Include directory
             L"-HV", L"2021",
 #ifdef _DEBUG
@@ -982,65 +1041,49 @@ namespace ACG {
         copyBarriers[1].UAV.pResource = nullptr;
         cmdList->ResourceBarrier(1, &copyBarriers[0]);
         
-        // Create a geometry descriptor for each mesh
-        // IMPORTANT: Since indices are already adjusted to global vertex indices in CreateShaderResources,
-        // all geometry descriptors must use the SAME vertex buffer start address (no offset)
-        std::vector<D3D12_RAYTRACING_GEOMETRY_DESC> geometryDescs;
-        UINT indexOffset = 0;
+        // INDUSTRY STANDARD: Single geometry descriptor with unified vertex/index buffers
+        // This is the recommended approach for static scenes in production engines
+        // (Unity, Unreal, and most ray tracers use this method)
+        
+        // Count total triangles and vertices
         UINT totalTriangles = 0;
         UINT totalVertices = 0;
-
-        // Count total vertices first
         for (const auto& mesh : m_scene->GetMeshes()) {
+            totalTriangles += static_cast<UINT>(mesh->GetIndices().size() / 3);
             totalVertices += static_cast<UINT>(mesh->GetVertices().size());
         }
 
-        std::cout << "  Creating geometry descriptors for " << m_scene->GetMeshes().size() << " meshes:" << std::endl;
+        std::cout << "  Creating single unified geometry descriptor:" << std::endl;
+        std::cout << "    Total: " << totalTriangles << " triangles, " 
+                  << totalVertices << " vertices" << std::endl;
         
-        for (size_t i = 0; i < m_scene->GetMeshes().size(); ++i) {
-            const auto& mesh = m_scene->GetMeshes()[i];
-            UINT meshIndexCount = static_cast<UINT>(mesh->GetIndices().size());
-            UINT meshTriangleCount = meshIndexCount / 3;
-
-            D3D12_RAYTRACING_GEOMETRY_DESC geometryDesc = {};
-            geometryDesc.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
-            geometryDesc.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_NONE;
-            
-            // CRITICAL: Use the SAME vertex buffer start for all geometries
-            // because indices are global (already offset by baseVertex in CreateShaderResources)
-            geometryDesc.Triangles.Transform3x4 = 0;
-            geometryDesc.Triangles.VertexBuffer.StartAddress = m_vertexBuffer->GetGPUVirtualAddress();
-            geometryDesc.Triangles.VertexBuffer.StrideInBytes = 48;
-            geometryDesc.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
-            geometryDesc.Triangles.VertexCount = totalVertices; // All vertices accessible
-            
-            // Index buffer with offset for this mesh
-            geometryDesc.Triangles.IndexBuffer = 
-                m_indexBuffer->GetGPUVirtualAddress() + (indexOffset * sizeof(uint32_t));
-            geometryDesc.Triangles.IndexFormat = DXGI_FORMAT_R32_UINT;
-            geometryDesc.Triangles.IndexCount = meshIndexCount;
-            
-            geometryDescs.push_back(geometryDesc);
-            
-            std::cout << "    Mesh " << i << ": " << meshTriangleCount << " triangles, "
-                      << meshIndexCount << " indices (IndexByteOffset: " << (indexOffset * sizeof(uint32_t)) << ")" << std::endl;
-            
-            indexOffset += meshIndexCount;
-            totalTriangles += meshTriangleCount;
-        }
+        // Single geometry descriptor encompassing all meshes
+        D3D12_RAYTRACING_GEOMETRY_DESC geometryDesc = {};
+        geometryDesc.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
+        geometryDesc.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_NONE;
+        
+        // Unified vertex buffer (all meshes, global indices)
+        geometryDesc.Triangles.Transform3x4 = 0;
+        geometryDesc.Triangles.VertexBuffer.StartAddress = m_vertexBuffer->GetGPUVirtualAddress();
+        geometryDesc.Triangles.VertexBuffer.StrideInBytes = 48;
+        geometryDesc.Triangles.VertexFormat = DXGI_FORMAT_R32G32B32_FLOAT;
+        geometryDesc.Triangles.VertexCount = totalVertices;
+        
+        // Unified index buffer (global indices, already offset by baseVertex)
+        geometryDesc.Triangles.IndexBuffer = m_indexBuffer->GetGPUVirtualAddress();
+        geometryDesc.Triangles.IndexFormat = DXGI_FORMAT_R32_UINT;
+        geometryDesc.Triangles.IndexCount = totalTriangles * 3;
 
         try {
-            // Build Bottom Level AS (BLAS) with all geometry descriptors
-            std::cout << "  Total geometry: " << totalTriangles << " triangles, "
-                      << totalVertices << " vertices" << std::endl;
-
+            // Build Bottom Level AS (BLAS) with single geometry
+            
             // Get required sizes for BLAS
             D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS blasInputs = {};
             blasInputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
             blasInputs.Flags = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
-            blasInputs.NumDescs = static_cast<UINT>(geometryDescs.size());
+            blasInputs.NumDescs = 1;  // Single unified geometry
             blasInputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
-            blasInputs.pGeometryDescs = geometryDescs.data();
+            blasInputs.pGeometryDescs = &geometryDesc;
 
             D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO blasPrebuildInfo = {};
             m_device->GetRaytracingAccelerationStructurePrebuildInfo(&blasInputs, &blasPrebuildInfo);
@@ -1178,10 +1221,9 @@ namespace ACG {
 
         // Note: Do NOT close or execute here - caller will handle command list execution
 
-        std::cout << "Acceleration structures built successfully with " 
-                  << geometryDescs.size() << " geometry descriptors, "
+        std::cout << "Acceleration structures built successfully: "
                   << totalTriangles << " triangles, "
-                  << totalVertices << " vertices" << std::endl;
+                  << totalVertices << " vertices (single unified geometry)" << std::endl;
         } catch (const std::exception& e) {
             std::cerr << "Failed to create acceleration structures: " << e.what() << std::endl;
             throw;
@@ -1234,13 +1276,6 @@ namespace ACG {
                 triangleMaterialIndices.push_back(meshMaterialIdx);
             }
         }
-        
-        // DEBUG: Print first few triangle material indices
-        std::cout << "Triangle material indices (first 10):";
-        for (size_t i = 0; i < std::min(size_t(10), triangleMaterialIndices.size()); i++) {
-            std::cout << " " << triangleMaterialIndices[i];
-        }
-        std::cout << std::endl;
 
         // Create GPU buffers using helper CreateDefaultBuffer
         // CRITICAL: Upload buffers MUST be kept alive until GPU executes the copy!
@@ -1248,13 +1283,6 @@ namespace ACG {
         if (vertexBufferSize > 0) {
             m_vertexBuffer = CreateDefaultBuffer(m_device.Get(), cmdList, vertices.data(), vertexBufferSize, m_vertexUpload);
             std::cout << "Vertex buffer created: " << vertices.size() << " vertices (" << vertexBufferSize << " bytes)" << std::endl;
-            
-            // DEBUG: Print first few vertices
-            std::cout << "First 3 vertices:" << std::endl;
-            for (size_t i = 0; i < std::min(size_t(3), vertices.size()); i++) {
-                std::cout << "  v[" << i << "]: pos=(" << vertices[i].position[0] << "," 
-                         << vertices[i].position[1] << "," << vertices[i].position[2] << ")" << std::endl;
-            }
         }
 
         size_t indexBufferSize = sizeof(uint32_t) * indices.size();
@@ -1317,26 +1345,12 @@ namespace ACG {
                 mat.params3 = glm::vec4(0.0f, 0.0f, 0.0f, 0.0f);  // albedoTextureSize + padding
                 
                 materialsCPU.push_back(mat);
-                
-                // DEBUG: Print material data
-                std::cout << "  Material[" << materialsCPU.size()-1 << "]: albedo=(" << mat.albedo.x << "," << mat.albedo.y << "," << mat.albedo.z 
-                         << "), emission=(" << mat.emission.x << "," << mat.emission.y << "," << mat.emission.z
-                         << "), type=" << static_cast<int>(m->GetType()) << std::endl;
             }
         }
 
         size_t materialBufferSize = sizeof(GPUMaterial) * materialsCPU.size();
         std::cout << "Creating material buffer: " << materialsCPU.size() << " materials, " 
                   << materialBufferSize << " bytes total, " << sizeof(GPUMaterial) << " bytes per material." << std::endl;
-        std::cout << "  GPUMaterial structure (vec4 only):" << std::endl;
-        std::cout << "    albedo offset: " << offsetof(GPUMaterial, albedo) << std::endl;
-        std::cout << "    emission offset: " << offsetof(GPUMaterial, emission) << std::endl;
-        std::cout << "    specular offset: " << offsetof(GPUMaterial, specular) << std::endl;
-        std::cout << "    params1 offset: " << offsetof(GPUMaterial, params1) << std::endl;
-        std::cout << "    params2 offset: " << offsetof(GPUMaterial, params2) << std::endl;
-        std::cout << "    params3 offset: " << offsetof(GPUMaterial, params3) << std::endl;
-        std::cout << "  First material albedo in CPU buffer: (" << materialsCPU[0].albedo.x << "," 
-                 << materialsCPU[0].albedo.y << "," << materialsCPU[0].albedo.z << "," << materialsCPU[0].albedo.w << ")" << std::endl;
         if (materialBufferSize > 0) {
             m_materialBuffer = CreateDefaultBuffer(m_device.Get(), cmdList, materialsCPU.data(), materialBufferSize, m_materialUpload);
             std::cout << "  Material buffer created: GPU address = " << m_materialBuffer->GetGPUVirtualAddress() << std::endl;
