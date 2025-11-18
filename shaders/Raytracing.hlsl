@@ -196,10 +196,15 @@ void ClosestHit(inout RadiancePayload payload, in BuiltInTriangleIntersectionAtt
         faceNormal = -faceNormal;
     }
     
-    // For simple geometry like Cornell Box, use geometric normal for both offset and shading
-    // This avoids issues with inconsistent vertex normals
+    // Use geometric normal for ray offset to avoid self-intersections
     float3 geometricNormal = faceNormal;
-    float3 normal = faceNormal;  // Use geometric normal for shading to ensure correctness
+    // Use barycentric-weighted interpolated vertex normal for smooth shading
+    float3 normal = interpolatedNormal;
+    // Ensure the shading normal is oriented to the same hemisphere as the geometric normal
+    if (dot(normal, faceNormal) < 0.0) {
+        normal = -normal;
+    }
+    normal = normalize(normal);
     
     // Add emission from this surface
     payload.radiance += payload.throughput * mat.emission.rgb;
