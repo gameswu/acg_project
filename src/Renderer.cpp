@@ -1340,6 +1340,14 @@ namespace ACG {
             }
             
             std::cout << "Collected " << textures.size() << " textures from materials" << std::endl;
+
+            // Compute atlas maximum dimensions (used to store normalized scale for each texture)
+            int atlasMaxWidth = 1;
+            int atlasMaxHeight = 1;
+            for (const auto& t : textures) {
+                atlasMaxWidth = std::max<int>(atlasMaxWidth, t->GetWidth());
+                atlasMaxHeight = std::max<int>(atlasMaxHeight, t->GetHeight());
+            }
             
             // Second pass: create material data
             for (const auto& m : m_scene->GetMaterials()) {
@@ -1387,11 +1395,15 @@ namespace ACG {
                     0.0f
                 );
                 
-                // Set texture size if texture exists
+                // Set texture size and normalized scale if texture exists
                 if (texIdx >= 0 && texIdx < textures.size()) {
                     float texWidth = static_cast<float>(textures[texIdx]->GetWidth());
                     float texHeight = static_cast<float>(textures[texIdx]->GetHeight());
-                    mat.params3 = glm::vec4(texWidth, texHeight, 0.0f, 0.0f);
+                    float scaleX = (atlasMaxWidth > 0) ? texWidth / static_cast<float>(atlasMaxWidth) : 1.0f;
+                    float scaleY = (atlasMaxHeight > 0) ? texHeight / static_cast<float>(atlasMaxHeight) : 1.0f;
+                    // params3.xy = original texture pixel size
+                    // params3.zw = normalized scale within texture array slice
+                    mat.params3 = glm::vec4(texWidth, texHeight, scaleX, scaleY);
                 } else {
                     mat.params3 = glm::vec4(0.0f, 0.0f, 0.0f, 0.0f);
                 }
