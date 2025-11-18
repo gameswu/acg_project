@@ -375,9 +375,15 @@ namespace ACG {
                     std::cout.flush();
                 }
                 
-                // Update frameIndex for this sample
-                uint32_t currentFrameIndex = static_cast<uint32_t>(sampleIdx);
-                renderCommandList->SetComputeRoot32BitConstants(7, 1, &currentFrameIndex, 32);
+                // Update camera constants with current sample index
+                CameraConstants cameraConstants;
+                cameraConstants.viewInverse = cameraToWorld;
+                cameraConstants.projInverse = projInverse;
+                cameraConstants.frameIndex = static_cast<uint32_t>(sampleIdx); // Current sample index for accumulation
+                cameraConstants.maxBounces = static_cast<uint32_t>(maxBounces);
+                cameraConstants.environmentLightIntensity = m_environmentLightIntensity;
+                cameraConstants.padding = 0.0f;
+                renderCommandList->SetComputeRoot32BitConstants(7, sizeof(CameraConstants) / 4, &cameraConstants, 0);
                 
                 // PIX: Mark individual sample
                 PIXBeginEvent(renderCommandList.Get(), PIX_COLOR_INDEX(2), "Sample %d", sampleIdx + 1);
@@ -461,31 +467,17 @@ namespace ACG {
                         D3D12_GPU_DESCRIPTOR_HANDLE texturesHandle = m_srvUavHeap->GetGPUDescriptorHandleForHeapStart();
                         renderCommandList->SetComputeRootDescriptorTable(6, texturesHandle);
                         
-                        // Root parameter 7: Camera constants
-                        glm::vec3 pos = m_camera.GetPosition();
-                        glm::vec3 dir = m_camera.GetDirection();
-                        glm::vec3 right = m_camera.GetRight();
-                        glm::vec3 up = m_camera.GetUp();
+                        // Root parameter 7: Camera constants (need to update frameIndex for next batch)
+                        // Note: Next batch starts at sampleIdx + 1
+                        CameraConstants nextCameraConstants;
+                        nextCameraConstants.viewInverse = cameraToWorld;
+                        nextCameraConstants.projInverse = projInverse;
+                        nextCameraConstants.frameIndex = static_cast<uint32_t>(sampleIdx + 1); // Next sample index
+                        nextCameraConstants.maxBounces = static_cast<uint32_t>(maxBounces);
+                        nextCameraConstants.environmentLightIntensity = m_environmentLightIntensity;
+                        nextCameraConstants.padding = 0.0f;
                         
-                        glm::mat4 cameraToWorld = glm::mat4(1.0f);
-                        cameraToWorld[0] = glm::vec4(right, 0.0f);
-                        cameraToWorld[1] = glm::vec4(up, 0.0f);
-                        cameraToWorld[2] = glm::vec4(-dir, 0.0f);
-                        cameraToWorld[3] = glm::vec4(pos, 1.0f);
-                        cameraToWorld = glm::transpose(cameraToWorld);
-                        
-                        glm::mat4 projMatrix = m_camera.GetProjectionMatrix();
-                        glm::mat4 projInverse = glm::transpose(glm::inverse(projMatrix));
-                        
-                        CameraConstants cameraConstants;
-                        cameraConstants.viewInverse = cameraToWorld;
-                        cameraConstants.projInverse = projInverse;
-                        cameraConstants.frameIndex = static_cast<uint32_t>(m_accumulatedSamples);
-                        cameraConstants.maxBounces = static_cast<uint32_t>(m_maxBounces);
-                        cameraConstants.environmentLightIntensity = m_environmentLightIntensity;
-                        cameraConstants.padding = 0.0f;
-                        
-                        renderCommandList->SetComputeRoot32BitConstants(7, sizeof(CameraConstants) / 4, &cameraConstants, 0);
+                        renderCommandList->SetComputeRoot32BitConstants(7, sizeof(CameraConstants) / 4, &nextCameraConstants, 0);
                         
                         PIXBeginEvent(renderCommandList.Get(), PIX_COLOR_INDEX(1), "Path Tracing Loop");
                     }
@@ -639,7 +631,7 @@ namespace ACG {
             void* mappedData;
             ThrowIfFailed(readbackBuffer->Map(0, nullptr, &mappedData), "Failed to map readback buffer");
 
-            const uint8_t* pixels = static_cast<const uint8_t*>(mappedData);
+            const float* pixels = static_cast<const float*>(mappedData); // Now reading float data
 
             // Write PPM file
             std::cout << "Writing PPM file..." << std::endl;
@@ -651,12 +643,29 @@ namespace ACG {
 
             file << "P6\n" << m_width << " " << m_height << "\n255\n";
 
+            // Divide by sample count and convert to 8-bit
+            float invSamples = 1.0f / static_cast<float>(samplesPerPixel);
+            
             for (UINT y = 0; y < m_height; ++y) {
-                const uint8_t* row = pixels + y * footprint.Footprint.RowPitch;
+                const float* row = reinterpret_cast<const float*>(
+                    reinterpret_cast<const uint8_t*>(pixels) + y * footprint.Footprint.RowPitch
+                );
                 for (UINT x = 0; x < m_width; ++x) {
-                    // RGBA8 format
-                    const uint8_t* pixel = row + x * 4;
-                    file.write(reinterpret_cast<const char*>(pixel), 3); // Write RGB only
+                    // RGBA float format: 4 floats per pixel
+                    const float* pixel = row + x * 4;
+                    
+                    // Average and tone map
+                    float r = pixel[0] * invSamples;
+                    float g = pixel[1] * invSamples;
+                    float b = pixel[2] * invSamples;
+                    
+                    // Clamp and convert to 8-bit
+                    uint8_t rgb[3];
+                    rgb[0] = static_cast<uint8_t>(std::min(255.0f, std::max(0.0f, r * 255.0f)));
+                    rgb[1] = static_cast<uint8_t>(std::min(255.0f, std::max(0.0f, g * 255.0f)));
+                    rgb[2] = static_cast<uint8_t>(std::min(255.0f, std::max(0.0f, b * 255.0f)));
+                    
+                    file.write(reinterpret_cast<const char*>(rgb), 3);
                 }
             }
 
@@ -801,8 +810,6 @@ namespace ACG {
             m_device->CreateRenderTargetView(m_renderTargets[i].Get(), nullptr, rtvHandle);
             rtvHandle.ptr += m_rtvDescriptorSize;
         }
-
-        std::cout << "Render targets created successfully" << std::endl;
     }
 
     void Renderer::CreateRaytracingPipeline() {
@@ -1366,7 +1373,7 @@ namespace ACG {
         texDesc.Height = m_height;
         texDesc.DepthOrArraySize = 1;
         texDesc.MipLevels = 1;
-        texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        texDesc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT; // Use float format for accumulation
         texDesc.SampleDesc.Count = 1;
         texDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
         texDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
@@ -1387,7 +1394,7 @@ namespace ACG {
         m_uavIndex_Output = 0;
         D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
         uavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-        uavDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        uavDesc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT; // Match texture format
         uavDesc.Texture2D.MipSlice = 0;
         uavDesc.Texture2D.PlaneSlice = 0;
 
@@ -1668,8 +1675,6 @@ namespace ACG {
 
         // Recreate render targets
         CreateRenderTargets();
-
-        std::cout << "Window resized to " << m_width << "x" << m_height << std::endl;
     }
 
     void Renderer::WaitForGpu() {

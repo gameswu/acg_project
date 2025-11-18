@@ -6,13 +6,20 @@ namespace ACG {
 
 Material::Material()
     : m_type(MaterialType::Diffuse)
-    , m_albedo(0.8f, 0.8f, 0.8f)
-    , m_emission(0.0f, 0.0f, 0.0f)
-    , m_specular(0.0f, 0.0f, 0.0f)
-    , m_illum(2)
+    // MTL specification defaults
+    , m_ambient(0.0f, 0.0f, 0.0f)          // Ka: No ambient by default
+    , m_albedo(0.8f, 0.8f, 0.8f)           // Kd: Standard gray diffuse
+    , m_specular(0.0f, 0.0f, 0.0f)         // Ks: No specular by default
+    , m_emission(0.0f, 0.0f, 0.0f)         // Ke: Non-emissive
+    , m_transmissionFilter(1.0f, 1.0f, 1.0f) // Tf: No filtering (white)
+    , m_specularExponent(0.0f)             // Ns: No highlight
+    , m_dissolve(1.0f)                     // d: Fully opaque
+    , m_opticalDensity(1.5f)               // Ni: Glass IOR
+    , m_illum(2)                           // illum: Diffuse+Specular (most common)
+    // PBR-converted properties
     , m_metallic(0.0f)
     , m_roughness(0.5f)
-    , m_ior(1.45f)
+    , m_ior(1.5f)
     , m_transmission(0.0f)
     , m_subsurfaceRadius(0.0f)
     , m_subsurfaceColor(1.0f)

@@ -67,7 +67,7 @@ acg_project/
 │   ├── Material.cpp
 │   ├── MathUtils.cpp
 │   ├── Mesh.cpp
-│   ├── Renderer.cpp·
+│   ├── Renderer.cpp
 │   ├── Sampler.cpp
 │   ├── Scene.cpp
 │   ├── Texture.cpp
@@ -89,6 +89,10 @@ acg_project/
 
 ## Usage
 
+> [!NOTE]
+>
+> We only support DX12 on Windows, and the hardware supports DirectX Raytracing (DXR).
+
 We provide a GUI for users to configure rendering settings and load scenes. The GUI allows you to adjust parameters such as samples per pixel, maximum bounces, and load different 3D models.
 
 <div align="center">
@@ -109,6 +113,10 @@ This project requires the following dependencies:
 - A C++17 compatible compiler
 - vcpkg for managing third-party libraries
 - Windows SDK for DirectX libraries
+
+For debugging and performance analysis, we use [PIX for Windows](https://devblogs.microsoft.com/pix/).
+
+[MTL format](https://paulbourke.net/dataformats/mtl/) and [OBJ format](https://paulbourke.net/dataformats/obj/obj_spec.pdf) are used for material and model files, respectively.
 
 ### Building the Project
 

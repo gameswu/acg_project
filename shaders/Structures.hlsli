@@ -10,18 +10,41 @@ struct Vertex {
     float _pad;       // 4 bytes padding -> total 48 bytes (aligned to 16)
 };
 
-// Simplified Material structure - only float4 fields to avoid alignment issues
-// This matches C++ GPUMaterial but forces 16-byte alignment for all fields
+// Material structure designed for GPU path tracing
+// Layout follows Wavefront MTL specification (v4.2, October 1995)
+// All fields are float4 (16-byte aligned) for consistent memory access
+//
+// MTL Material Properties Mapping:
+// - albedo.rgb  = Kd (Diffuse reflectivity, 0.0-1.0)
+// - albedo.a    = d (Dissolve factor, 1.0=opaque)
+// - emission.rgb = Ke (Emissive color, 0.0+)
+// - specular.rgb = Ks (Specular reflectivity, 0.0-1.0)
+// - specular.a  = Ns (Specular exponent, 0-1000)
+// - params1.w   = Ni (Optical density/IOR, 0.001-10)
+// - params2.z   = illum (Illumination model, 0-10)
+//
+// Illumination Models (MTL spec):
+// 0  = Flat color (no lighting)
+// 1  = Diffuse (Lambertian)
+// 2  = Diffuse + Specular (Blinn-Phong) [most common]
+// 3  = Reflection (ray traced)
+// 4  = Glass (transparency + reflection)
+// 5  = Fresnel Mirror (perfect reflection)
+// 6  = Refraction (Fresnel off)
+// 7  = Refraction + Fresnel (realistic glass)
+// 8  = Reflection (no ray trace)
+// 9  = Glass (no ray trace)
+// 10 = Shadow matte
 struct Material {
-    float4 albedo;              // 0-15: 16 bytes
-    float4 emission;            // 16-31: 16 bytes
-    float4 specular;            // 32-47: 16 bytes
-    float4 params1;             // 48-63: type, metallic, roughness, ior
-    float4 params2;             // 64-79: transmission, albedoTextureIndex, illum, (unused)
-    float4 params3;             // 80-95: albedoTextureSize.xy, padding.xy
+    float4 albedo;              // 0-15: Kd (RGB) + d (A)
+    float4 emission;            // 16-31: Ke (RGB) + intensity (A)
+    float4 specular;            // 32-47: Ks (RGB) + Ns (A)
+    float4 params1;             // 48-63: type, metallic, roughness, Ni
+    float4 params2;             // 64-79: transmission, albedoTextureIndex, illum, subsurface
+    float4 params3;             // 80-95: albedoTextureSize.xy, anisotropic, sheen
     // Total: 96 bytes (6 * 16) - guaranteed aligned
     
-    // Helper accessors
+    // Helper accessors for type-safe parameter access
     uint GetType() { return asuint(params1.x); }
     float GetMetallic() { return params1.y; }
     float GetRoughness() { return params1.z; }
@@ -29,7 +52,13 @@ struct Material {
     float GetTransmission() { return params2.x; }
     int GetAlbedoTextureIndex() { return asint(params2.y); }
     int GetIllum() { return asint(params2.z); }
+    float GetSubsurface() { return params2.w; }
     float2 GetAlbedoTextureSize() { return params3.xy; }
+    float GetAnisotropic() { return params3.z; }
+    float GetSheen() { return params3.w; }
+    
+    // Texture sampling helpers (for future use)
+    bool HasAlbedoTexture() { return GetAlbedoTextureIndex() >= 0; }
 };
 
 struct Light {

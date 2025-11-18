@@ -52,7 +52,7 @@ void CreateOrthonormalBasis(float3 normal, out float3 tangent, out float3 bitang
     // Choose a helper vector that's not parallel to normal
     float3 helper = abs(normal.x) > 0.99 ? float3(0, 1, 0) : float3(1, 0, 0);
     tangent = normalize(cross(normal, helper));
-    bitangent = cross(normal, tangent);
+    bitangent = normalize(cross(normal, tangent)); // Ensure normalization
 }
 
 [shader("raygeneration")]
@@ -61,11 +61,13 @@ void RayGen()
     uint2 dispatchIdx = DispatchRaysIndex().xy;
     uint2 renderTargetSize = DispatchRaysDimensions().xy;
 
-    // Initialize RNG for this pixel
-    uint rngState = InitRNG(dispatchIdx, frameIndex);
+    // Initialize RNG for this pixel with per-sample variation
+    // CRITICAL: Each sample must have different seed to generate different random sequences
+    uint rngState = InitRNG(dispatchIdx, frameIndex, frameIndex * 17);
     
-    // Generate ray from camera with slight jitter for anti-aliasing
-    float2 pixelCenter = (float2)dispatchIdx + float2(0.5, 0.5); // No jitter for now
+    // For pinhole camera, NO pixel jitter - always sample pixel center
+    // Variance comes from random bounce directions in path tracing
+    float2 pixelCenter = (float2)dispatchIdx + float2(0.5, 0.5);
     float2 uv = pixelCenter / (float2)renderTargetSize; // [0,1]
     
     // Simple pinhole camera model
@@ -128,27 +130,11 @@ void RayGen()
     
     // Final radiance is accumulated in payload
     radiance = payload.radiance;
-    
-    // DEBUG: Output debug info for center pixel
-    if (dispatchIdx.x == renderTargetSize.x / 2 && dispatchIdx.y == renderTargetSize.y / 2 && frameIndex == 0) {
-        // This will show in PIX or can be read via debugging
-        // For now, just clamp to valid range
-    }
 
-    // Progressive accumulation
-    // frameIndex is the number of samples already accumulated (0 for first sample)
-    if (frameIndex == 0) {
-        // First sample: directly write
-        g_output[dispatchIdx] = float4(radiance, 1.0);
-    } else {
-        // Subsequent samples: accumulate with running average
-        // Formula: newAverage = (oldAverage * n + newSample) / (n + 1)
-        // where n = frameIndex (number of samples already in the average)
-        float4 currentValue = g_output[dispatchIdx];
-        float n = float(frameIndex);
-        float3 newAverage = (currentValue.rgb * n + radiance) / (n + 1.0);
-        g_output[dispatchIdx] = float4(newAverage, 1.0);
-    }
+    // Simple additive accumulation - each sample adds its contribution
+    // The final division by sample count happens on CPU during readback
+    // This avoids read-modify-write race conditions in the shader
+    g_output[dispatchIdx] += float4(radiance, 1.0);
 }
 
 [shader("miss")]
@@ -173,10 +159,14 @@ void ClosestHit(inout RadiancePayload payload, in BuiltInTriangleIntersectionAtt
     float t = RayTCurrent();
     float3 hitPos = rayOrigin + t * rayDir;
     
-    // Fetch and interpolate normal
+    // Fetch vertex positions and normals
     uint i0 = g_indices[primitiveIndex * 3 + 0];
     uint i1 = g_indices[primitiveIndex * 3 + 1];
     uint i2 = g_indices[primitiveIndex * 3 + 2];
+    
+    float3 v0 = g_vertices[i0].position;
+    float3 v1 = g_vertices[i1].position;
+    float3 v2 = g_vertices[i2].position;
     
     float3 n0 = g_vertices[i0].normal;
     float3 n1 = g_vertices[i1].normal;
@@ -185,12 +175,24 @@ void ClosestHit(inout RadiancePayload payload, in BuiltInTriangleIntersectionAtt
     float3 barycentrics = float3(1.0 - attribs.barycentrics.x - attribs.barycentrics.y, 
                                   attribs.barycentrics.x, 
                                   attribs.barycentrics.y);
-    float3 normal = normalize(n0 * barycentrics.x + n1 * barycentrics.y + n2 * barycentrics.z);
     
-    // Flip normal if facing away from ray
-    if (dot(normal, rayDir) > 0.0) {
-        normal = -normal;
+    // Calculate true geometric normal from triangle edges
+    float3 edge1 = v1 - v0;
+    float3 edge2 = v2 - v0;
+    float3 faceNormal = normalize(cross(edge1, edge2));
+    
+    // Interpolated shading normal
+    float3 interpolatedNormal = normalize(n0 * barycentrics.x + n1 * barycentrics.y + n2 * barycentrics.z);
+    
+    // Ensure face normal points away from the ray (outward from the surface)
+    if (dot(faceNormal, rayDir) > 0.0) {
+        faceNormal = -faceNormal;
     }
+    
+    // For simple geometry like Cornell Box, use geometric normal for both offset and shading
+    // This avoids issues with inconsistent vertex normals
+    float3 geometricNormal = faceNormal;
+    float3 normal = faceNormal;  // Use geometric normal for shading to ensure correctness
     
     // Add emission from this surface
     payload.radiance += payload.throughput * mat.emission.rgb;
@@ -202,36 +204,122 @@ void ClosestHit(inout RadiancePayload payload, in BuiltInTriangleIntersectionAtt
         return;
     }
     
-    // Update throughput: multiply by albedo and divide by PDF
-    // For cosine-weighted sampling, PDF = cosTheta / PI
-    // BRDF for Lambertian = albedo / PI
-    // Combined: (albedo / PI) / (cosTheta / PI) * cosTheta = albedo
-    // So we just multiply by albedo (PDF cancels with cosine term)
-    payload.throughput *= mat.albedo.rgb;
+    // ========== MTL ILLUMINATION MODEL CLASSIFICATION ==========
+    // Get illum model (authoritative material type identifier)
+    int illum = mat.GetIllum();
+    uint materialType = mat.GetType();
     
-    // Russian roulette path termination (more aggressive for faster convergence)
-    float maxThroughput = max(max(payload.throughput.r, payload.throughput.g), payload.throughput.b);
-    if (maxThroughput < 0.01) {
-        // Terminate very dark paths
-        payload.terminated = true;
+    // MTL Specification: Illumination Models (page 5-7)
+    // illum 0: Flat color (no lighting)
+    // illum 1: Diffuse (Lambertian)
+    // illum 2: Diffuse + Specular (Blinn-Phong) [MOST COMMON]
+    // illum 3: Reflection (ray traced mirror)
+    // illum 4: Glass (transparency + reflection)
+    // illum 5: Fresnel Mirror (perfect reflection)
+    // illum 6: Refraction (glass without Fresnel)
+    // illum 7: Refraction + Fresnel (realistic glass)
+    // illum 8: Reflection (no ray trace)
+    // illum 9: Glass (no ray trace)
+    // illum 10: Shadow matte
+    
+    // Handle refractive/transmissive materials (illum 4, 6, 7, 9)
+    if (illum == 4 || illum == 6 || illum == 7 || illum == 9 || materialType == 2) {
+        // Glass material with reflection and refraction
+        float ior = mat.GetIOR();
+        float3 N = normal;
+        float cosI = -dot(rayDir, N);
+        float etaI = 1.0; // Air
+        float etaT = ior;  // Material
+        
+        // Determine if we're entering or exiting the material
+        if (cosI < 0.0) {
+            // Exiting the material
+            cosI = -cosI;
+            N = -N;
+            float temp = etaI;
+            etaI = etaT;
+            etaT = temp;
+        }
+        
+        float eta = etaI / etaT;
+        float k = 1.0 - eta * eta * (1.0 - cosI * cosI);
+        
+        // Fresnel reflectance (Schlick's approximation)
+        float F0 = ((etaI - etaT) / (etaI + etaT));
+        F0 = F0 * F0;
+        float fresnel = F0 + (1.0 - F0) * pow(1.0 - cosI, 5.0);
+        
+        // Russian roulette between reflection and refraction
+        float rand = Random(payload.rngState);
+        
+        if (rand < fresnel || k < 0.0) {
+            // Total internal reflection or Fresnel reflection
+            float3 reflectDir = reflect(rayDir, N);
+            payload.nextOrigin = hitPos + geometricNormal * 0.001;
+            payload.nextDirection = reflectDir;
+            // No throughput reduction for perfect specular
+        } else {
+            // Refraction
+            float3 refractDir = eta * rayDir + (eta * cosI - sqrt(k)) * N;
+            payload.nextOrigin = hitPos - geometricNormal * 0.001; // Go inside
+            payload.nextDirection = refractDir;
+            payload.throughput *= mat.albedo.rgb; // Color filtering through material
+        }
         return;
     }
-    
-    // Sample next direction using cosine-weighted hemisphere sampling
-    float3 tangent, bitangent;
-    CreateOrthonormalBasis(normal, tangent, bitangent);
-    
-    float r1 = Random(payload.rngState);
-    float r2 = Random(payload.rngState);
-    
-    float sinTheta = sqrt(r1);
-    float cosTheta_sample = sqrt(1.0 - r1);
-    float phi = 2.0 * 3.14159265359 * r2;
-    
-    float3 localDir = float3(sinTheta * cos(phi), sinTheta * sin(phi), cosTheta_sample);
-    float3 worldDir = normalize(tangent * localDir.x + bitangent * localDir.y + normal * localDir.z);
-    
-    // Setup next ray
-    payload.nextOrigin = hitPos + normal * 0.001;
-    payload.nextDirection = worldDir;
+    // Handle mirror/reflective materials (illum 3, 5, 8)
+    else if (illum == 3 || illum == 5 || illum == 8 || materialType == 1) {
+        // Perfect mirror reflection using Ks (specular reflectivity)
+        float3 reflectDir = reflect(rayDir, normal);
+        
+        // Use Ks (specular color) as reflectance
+        float3 reflectance = mat.specular.rgb;
+        float specularMag = max(max(reflectance.r, reflectance.g), reflectance.b);
+        
+        // Fallback for undefined mirrors (ensure visible reflection)
+        if (specularMag < 0.1) {
+            reflectance = float3(0.95, 0.95, 0.95);
+        }
+        
+        payload.throughput *= reflectance;
+        payload.nextOrigin = hitPos + geometricNormal * 0.001;
+        payload.nextDirection = reflectDir;
+        return;
+    }
+    // Handle standard diffuse materials (illum 0, 1, 2, default)
+    else {
+        // Lambertian diffuse BRDF
+        // MTL spec: illum 0 = flat color, illum 1 = diffuse, illum 2 = diffuse+specular
+        
+        // For path tracing with cosine-weighted sampling:
+        // BRDF = albedo / PI
+        // PDF = cosTheta / PI
+        // Combined factor: (albedo / PI) * cosTheta / (cosTheta / PI) = albedo
+        payload.throughput *= mat.albedo.rgb;
+        
+        // Russian roulette path termination
+        float maxThroughput = max(max(payload.throughput.r, payload.throughput.g), payload.throughput.b);
+        if (maxThroughput < 0.001) {
+            payload.terminated = true;
+            return;
+        }
+        
+        // Sample next direction using cosine-weighted hemisphere sampling
+        float3 tangent, bitangent;
+        CreateOrthonormalBasis(normal, tangent, bitangent);
+        
+        float r1 = Random(payload.rngState);
+        float r2 = Random(payload.rngState);
+        
+        float sinTheta = sqrt(r1);
+        float cosTheta = sqrt(1.0 - r1);
+        float phi = 2.0 * 3.14159265359 * r2;
+        
+        float3 localDir = float3(sinTheta * cos(phi), sinTheta * sin(phi), cosTheta);
+        float3 worldDir = normalize(tangent * localDir.x + bitangent * localDir.y + normal * localDir.z);
+        
+        payload.nextOrigin = hitPos + geometricNormal * 0.001;
+        payload.nextDirection = worldDir;
+        return;
+    }
 }

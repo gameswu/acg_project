@@ -70,57 +70,145 @@ bool Scene::LoadFromFile(const std::string& filename) {
     for (unsigned int i = 0; i < ascene->mNumMaterials; ++i) {
         aiMaterial* aiMat = ascene->mMaterials[i];
         
+        // ========== MTL SPECIFICATION COMPLIANT MATERIAL LOADING ==========
+        // Reference: Wavefront MTL Format Specification v4.2, October 1995
+        
         // Get material name
         aiString name;
         aiMat->Get(AI_MATKEY_NAME, name);
         
-        // Get diffuse color (Kd)
-        aiColor3D diffuse(0.8f, 0.8f, 0.8f);
-        aiMat->Get(AI_MATKEY_COLOR_DIFFUSE, diffuse);
-        glm::vec3 albedo(diffuse.r, diffuse.g, diffuse.b);
+        // Read all MTL color properties (specification section 5)
+        // Ka: Ambient reflectivity (RGB 0.0-1.0)
+        aiColor3D Ka(0.0f, 0.0f, 0.0f);
+        aiMat->Get(AI_MATKEY_COLOR_AMBIENT, Ka);
+        glm::vec3 ambient(Ka.r, Ka.g, Ka.b);
         
-        // Get emission (Ke)
-        aiColor3D emission(0.0f, 0.0f, 0.0f);
-        aiMat->Get(AI_MATKEY_COLOR_EMISSIVE, emission);
-        glm::vec3 emissive(emission.r, emission.g, emission.b);
+        // Kd: Diffuse reflectivity (RGB 0.0-1.0)
+        aiColor3D Kd(0.8f, 0.8f, 0.8f);
+        aiMat->Get(AI_MATKEY_COLOR_DIFFUSE, Kd);
+        glm::vec3 diffuse(Kd.r, Kd.g, Kd.b);
         
-        // Get specular properties
-        aiColor3D specular(0.0f, 0.0f, 0.0f);
-        aiMat->Get(AI_MATKEY_COLOR_SPECULAR, specular);
-        float shininess = 0.0f;
-        aiMat->Get(AI_MATKEY_SHININESS, shininess);
-        int illum = 0;
+        // Ks: Specular reflectivity (RGB 0.0-1.0)
+        aiColor3D Ks(0.0f, 0.0f, 0.0f);
+        aiMat->Get(AI_MATKEY_COLOR_SPECULAR, Ks);
+        glm::vec3 specular(Ks.r, Ks.g, Ks.b);
+        
+        // Ke: Emissive color (RGB 0.0+, typically 0.0-1.0)
+        aiColor3D Ke(0.0f, 0.0f, 0.0f);
+        aiMat->Get(AI_MATKEY_COLOR_EMISSIVE, Ke);
+        glm::vec3 emission(Ke.r, Ke.g, Ke.b);
+        
+        // Tf: Transmission filter (RGB 0.0-1.0) - filters light passing through
+        // Note: Assimp stores this as COLOR_TRANSPARENT
+        aiColor3D Tf(1.0f, 1.0f, 1.0f);
+        aiMat->Get(AI_MATKEY_COLOR_TRANSPARENT, Tf);
+        glm::vec3 transmissionFilter(Tf.r, Tf.g, Tf.b);
+        
+        // Ns: Specular exponent (0-1000, typical range)
+        // Higher values = tighter, more focused highlights
+        float Ns = 0.0f;
+        aiMat->Get(AI_MATKEY_SHININESS, Ns);
+        
+        // d: Dissolve factor (0.0-1.0)
+        // 1.0 = fully opaque, 0.0 = fully transparent
+        float d = 1.0f;
+        aiMat->Get(AI_MATKEY_OPACITY, d);
+        
+        // Ni: Optical density / Index of Refraction (0.001-10)
+        // Air=1.0, Glass≈1.5, Water≈1.33, Diamond≈2.42
+        // Only meaningful for refractive materials (illum 4,6,7,9)
+        float Ni = 1.5f;
+        aiMat->Get(AI_MATKEY_REFRACTI, Ni);
+        if (Ni < 0.001f) Ni = 1.5f; // Clamp to valid range
+        if (Ni > 10.0f) Ni = 10.0f;
+        
+        // illum: Illumination model (0-10)
+        // This is THE authoritative property for material classification
+        int illum = 2; // Default: Diffuse + Specular (most common)
         aiMat->Get(AI_MATKEY_SHADING_MODEL, illum);
         
-        // Create material based on properties
-        std::shared_ptr<Material> mat;
-        float emissiveIntensity = glm::length(emissive);
-        float specularIntensity = (specular.r + specular.g + specular.b) / 3.0f;
+        // ========== MTL ILLUMINATION MODEL CLASSIFICATION ==========
+        // Reference: MTL Specification page 5-7
+        // 
+        // illum 0: Color on, Ambient off (flat color, no lighting)
+        // illum 1: Color on, Ambient on (Lambertian diffuse)
+        // illum 2: Highlight on (Diffuse + Blinn-Phong specular) [MOST COMMON]
+        // illum 3: Reflection on, Ray trace on (reflective metal/mirror)
+        // illum 4: Transparency: Glass on, Reflection: Ray trace on
+        // illum 5: Reflection: Fresnel on, Ray trace on (perfect mirror)
+        // illum 6: Transparency: Refraction on, Reflection: Fresnel off, Ray trace on
+        // illum 7: Transparency: Refraction on, Reflection: Fresnel on, Ray trace on (realistic glass)
+        // illum 8: Reflection on, Ray trace off (fake reflection)
+        // illum 9: Transparency: Glass on, Reflection: Ray trace off (fake glass)
+        // illum 10: Casts shadows onto invisible surfaces (shadow matte)
         
-        if (emissiveIntensity > 0.01f) {
-            // Emissive material (light source)
+        std::shared_ptr<Material> mat;
+        
+        // Calculate emission intensity for detection
+        float emissionIntensity = std::max(std::max(emission.r, emission.g), emission.b);
+        
+        // CLASSIFICATION PRIORITY (strict illum-based):
+        
+        // 1. Emissive materials (any illum with Ke > 0)
+        if (emissionIntensity > 0.01f) {
             mat = std::make_shared<Material>();
             mat->SetType(MaterialType::Emissive);
-            mat->SetAlbedo(albedo);
-            mat->SetEmission(emissive);
-            mat->SetSpecular(glm::vec3(specular.r, specular.g, specular.b));
+            mat->SetAlbedo(diffuse);  // Use Kd as base color
+            mat->SetEmission(emission);
+            mat->SetSpecular(specular);
             mat->SetIllum(illum);
-            std::cout << "Material[" << i << "] \"" << name.C_Str() << "\": Emissive (Ke=" 
-                     << emissive.x << "," << emissive.y << "," << emissive.z << ")" << std::endl;
-        } else if (specularIntensity > 0.5f || illum == 5) {
-            // Specular/Mirror material (illum 5 is mirror reflection)
-            mat = std::make_shared<SpecularMaterial>(albedo, 0.0f); // 0.0f roughness = perfect mirror
-            mat->SetSpecular(glm::vec3(specular.r, specular.g, specular.b));
+            std::cout << "Material[" << i << "] \"" << name.C_Str() << "\": Emissive" << std::endl;
+            std::cout << "  illum=" << illum << ", Ke=(" << emission.x << "," << emission.y << "," << emission.z << ")" << std::endl;
+        }
+        // 2. Refractive/Transmissive materials (illum 4, 6, 7, 9)
+        else if (illum == 4 || illum == 6 || illum == 7 || illum == 9) {
+            mat = std::make_shared<TransmissiveMaterial>(diffuse, Ni);
+            mat->SetAlbedo(diffuse);
+            mat->SetSpecular(specular);
+            mat->SetIOR(Ni);
+            mat->SetTransmission(1.0f - d); // Dissolve to transmission
+            mat->SetRoughness(Ns > 0.0f ? std::sqrt(2.0f / (Ns + 2.0f)) : 0.05f);
             mat->SetIllum(illum);
-            std::cout << "Material[" << i << "] \"" << name.C_Str() << "\": Specular/Mirror (Ks=" 
-                     << specular.r << "," << specular.g << "," << specular.b << ", illum=" << illum << ")" << std::endl;
-        } else {
-            // Diffuse material
-            mat = std::make_shared<DiffuseMaterial>(albedo);
-            mat->SetSpecular(glm::vec3(specular.r, specular.g, specular.b));
+            std::cout << "Material[" << i << "] \"" << name.C_Str() << "\": Transmissive (Glass/Refractive)" << std::endl;
+            std::cout << "  illum=" << illum << ", Ni=" << Ni << ", d=" << d << ", Ns=" << Ns << std::endl;
+        }
+        // 3. Mirror/Reflective materials (illum 3, 5, 8)
+        else if (illum == 3 || illum == 5 || illum == 8) {
+            mat = std::make_shared<SpecularMaterial>(specular, 0.0f);
+            mat->SetAlbedo(diffuse);  // For colored mirrors
+            mat->SetSpecular(specular); // Mirror reflectance color
+            mat->SetRoughness(0.0f);  // Perfect mirror
+            mat->SetMetallic(1.0f);
             mat->SetIllum(illum);
-            std::cout << "Material[" << i << "] \"" << name.C_Str() << "\": Diffuse (Kd=" 
-                     << albedo.x << "," << albedo.y << "," << albedo.z << ")";
+            std::cout << "Material[" << i << "] \"" << name.C_Str() << "\": Mirror/Reflective" << std::endl;
+            std::cout << "  illum=" << illum << ", Ks=(" << specular.x << "," << specular.y << "," << specular.z << ")" << std::endl;
+        }
+        // 4. Standard Diffuse/Specular materials (illum 0, 1, 2, default)
+        else {
+            mat = std::make_shared<DiffuseMaterial>(diffuse);
+            mat->SetAlbedo(diffuse);
+            mat->SetSpecular(specular);
+            // Convert Phong exponent (Ns) to roughness for PBR
+            // Formula from Disney: roughness = sqrt(2/(Ns+2))
+            float roughness = (Ns > 0.0f) ? std::sqrt(2.0f / (Ns + 2.0f)) : 0.5f;
+            mat->SetRoughness(roughness);
+            mat->SetMetallic(0.0f); // Diffuse materials are non-metallic
+            mat->SetIllum(illum);
+            
+            std::cout << "Material[" << i << "] \"" << name.C_Str() << "\": ";
+            if (illum == 0) std::cout << "Flat Color (no lighting)";
+            else if (illum == 1) std::cout << "Diffuse (Lambertian)";
+            else if (illum == 2) std::cout << "Diffuse+Specular (Blinn-Phong)";
+            else std::cout << "Diffuse (illum=" << illum << ")";
+            std::cout << std::endl;
+            
+            std::cout << "  Ka=(" << ambient.x << "," << ambient.y << "," << ambient.z << ")";
+            std::cout << ", Kd=(" << diffuse.x << "," << diffuse.y << "," << diffuse.z << ")";
+            if (illum == 2 && Ns > 0.0f) {
+                std::cout << ", Ks=(" << specular.x << "," << specular.y << "," << specular.z << ")";
+                std::cout << ", Ns=" << Ns;
+            }
+            std::cout << std::endl;
         }
         
         // Load textures
