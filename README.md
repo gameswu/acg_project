@@ -56,7 +56,8 @@ acg_project/
 │   ├── Material.h       # Material system (diffuse, specular, transmissive, PBR)
 │   ├── MathUtils.h      # Math utility functions
 │   ├── Mesh.h           # Geometry mesh
-│   ├── Renderer.h       # GPU renderer (DirectX 11)
+│   ├── MTLParser.h      # MTL file parser
+│   ├── Renderer.h       # GPU renderer (DirectX 12)
 │   ├── Sampler.h        # Sampler (importance sampling, MIS)
 │   ├── Scene.h          # Scene management
 │   └── Texture.h        # Texture system (supports Mipmap)
@@ -67,6 +68,7 @@ acg_project/
 │   ├── Material.cpp
 │   ├── MathUtils.cpp
 │   ├── Mesh.cpp
+│   ├── MTLParser.cpp
 │   ├── Renderer.cpp
 │   ├── Sampler.cpp
 │   ├── Scene.cpp
