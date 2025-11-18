@@ -284,13 +284,8 @@ void ClosestHit(inout RadiancePayload payload, in BuiltInTriangleIntersectionAtt
         
         // Use Ks (specular color) as reflectance
         float3 reflectance = mat.specular.rgb;
-        float specularMag = max(max(reflectance.r, reflectance.g), reflectance.b);
-        
-        // Fallback for undefined mirrors (ensure visible reflection)
-        if (specularMag < 0.1) {
-            reflectance = float3(0.95, 0.95, 0.95);
-        }
-        
+        // Do not force an artificial high reflectance fallback here; respect Ks provided by material.
+        // If Ks is zero, reflection will contribute nothing (correct physical behavior).
         payload.throughput *= reflectance;
         payload.nextOrigin = hitPos + geometricNormal * 0.001;
         payload.nextDirection = reflectDir;
@@ -304,11 +299,12 @@ void ClosestHit(inout RadiancePayload payload, in BuiltInTriangleIntersectionAtt
         // Get base albedo (color or texture)
         float3 albedo = mat.albedo.rgb;
         
-        // Sample texture if available
+        // Sample texture if available. If texture exists, use texture color as the
+        // base albedo (do not multiply by Kd to avoid blacking out when Kd==0).
         if (mat.HasAlbedoTexture()) {
             int texIndex = mat.GetAlbedoTextureIndex();
             float4 texColor = g_textures.SampleLevel(g_sampler, float3(texCoord, texIndex), 0);
-            albedo *= texColor.rgb;
+            albedo = texColor.rgb;
         }
         
         // For path tracing with cosine-weighted sampling:

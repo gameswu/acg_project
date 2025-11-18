@@ -12,6 +12,7 @@
 #define GLM_ENABLE_EXPERIMENTAL
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtx/string_cast.hpp>
+#include <cstring>
 
 // PIX support for GPU debugging (DEBUG only)
 #if defined(_DEBUG) && defined(USE_PIX)
@@ -281,8 +282,9 @@ namespace ACG {
             D3D12_GPU_VIRTUAL_ADDRESS materialsAddress = m_materialBuffer->GetGPUVirtualAddress();
             renderCommandList->SetComputeRootShaderResourceView(5, materialsAddress);
             
-            // Root parameter 6: Textures SRV table (not used yet, bind dummy)
+            // Root parameter 6: Textures SRV table (bind to descriptor slot 5)
             D3D12_GPU_DESCRIPTOR_HANDLE texturesHandle = m_srvUavHeap->GetGPUDescriptorHandleForHeapStart();
+            texturesHandle.ptr += 5 * m_srvUavDescriptorSize; // slot 5 reserved for textures
             renderCommandList->SetComputeRootDescriptorTable(6, texturesHandle);
 
             // Root parameter 7: Camera constants (32-bit constants)
@@ -463,8 +465,9 @@ namespace ACG {
                         D3D12_GPU_VIRTUAL_ADDRESS materialsAddress = m_materialBuffer->GetGPUVirtualAddress();
                         renderCommandList->SetComputeRootShaderResourceView(5, materialsAddress);
                         
-                        // Root parameter 6: Textures SRV table
+                        // Root parameter 6: Textures SRV table (bound to descriptor slot 5)
                         D3D12_GPU_DESCRIPTOR_HANDLE texturesHandle = m_srvUavHeap->GetGPUDescriptorHandleForHeapStart();
+                        texturesHandle.ptr += 5 * m_srvUavDescriptorSize; // slot 5 reserved for textures
                         renderCommandList->SetComputeRootDescriptorTable(6, texturesHandle);
                         
                         // Root parameter 7: Camera constants (need to update frameIndex for next batch)
@@ -1318,7 +1321,9 @@ namespace ACG {
             mat.emission = glm::vec4(0.0f, 0.0f, 0.0f, 1.0f);
             mat.specular = glm::vec4(0.0f, 0.0f, 0.0f, 1.0f);
             uint32_t type = 0; // Diffuse
-            mat.params1 = glm::vec4(*reinterpret_cast<float*>(&type), 0.0f, 0.5f, 1.5f);
+            float typeBits = 0.0f;
+            std::memcpy(&typeBits, &type, sizeof(typeBits));
+            mat.params1 = glm::vec4(typeBits, 0.0f, 0.5f, 1.5f);
             mat.params2 = glm::vec4(0.0f, 0.0f, 0.0f, 0.0f);
             mat.params3 = glm::vec4(0.0f, 0.0f, 0.0f, 0.0f);
             materialsCPU.push_back(mat);
@@ -1348,21 +1353,37 @@ namespace ACG {
                 glm::vec3 spec = m->GetSpecular();
                 mat.specular = glm::vec4(spec.x, spec.y, spec.z, 1.0f);
                 
-                // Pack scalar parameters into vec4s
+                // Pack scalar parameters into vec4s (safe bit-copy of integers into floats)
                 uint32_t materialType = static_cast<uint32_t>(m->GetType());
+                float materialTypeBits = 0.0f;
+                std::memcpy(&materialTypeBits, &materialType, sizeof(materialTypeBits));
+
                 mat.params1 = glm::vec4(
-                    *reinterpret_cast<float*>(&materialType),  // type as float bits
+                    materialTypeBits,  // type as float bits (bit-copied)
                     m->GetMetallic(),
                     m->GetRoughness(),
                     m->GetIOR()
                 );
-                
+
                 int texIdx = materialTextureIndex[m.get()];
                 int illum = m->GetIllum();
+
+                // Use dissolve (d) as alpha and neutralize albedo when texture exists
+                float albedoAlpha = m->GetDissolve();
+                if (texIdx >= 0) {
+                    mat.albedo = glm::vec4(1.0f, 1.0f, 1.0f, albedoAlpha);
+                } else {
+                    mat.albedo = glm::vec4(alb.x, alb.y, alb.z, albedoAlpha);
+                }
+                float texIdxBits = 0.0f;
+                float illumBits = 0.0f;
+                std::memcpy(&texIdxBits, &texIdx, sizeof(texIdxBits));
+                std::memcpy(&illumBits, &illum, sizeof(illumBits));
+
                 mat.params2 = glm::vec4(
                     m->GetTransmission(),
-                    *reinterpret_cast<float*>(&texIdx),  // albedoTextureIndex as float bits
-                    *reinterpret_cast<float*>(&illum),  // illum as float bits
+                    texIdxBits,  // albedoTextureIndex as float bits (bit-copied)
+                    illumBits,   // illum as float bits (bit-copied)
                     0.0f
                 );
                 
@@ -1624,7 +1645,7 @@ namespace ACG {
         
         D3D12_CPU_DESCRIPTOR_HANDLE srvHandle = m_srvUavHeap->GetCPUDescriptorHandleForHeapStart();
         UINT descriptorSize = m_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-        D3D12_CPU_DESCRIPTOR_HANDLE textureSrvHandle = { srvHandle.ptr + descriptorSize * 3 };  // Slot 3 for t3
+        D3D12_CPU_DESCRIPTOR_HANDLE textureSrvHandle = { srvHandle.ptr + descriptorSize * 5 };  // Slot 5 for t3 (avoid collision)
         
         m_device->CreateShaderResourceView(m_textureAtlas.Get(), &srvDesc, textureSrvHandle);
         
