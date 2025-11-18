@@ -107,6 +107,22 @@ We provide a GUI for users to configure rendering settings and load scenes. The 
 - **Controls:** Start or stop rendering processes.
 - **Log Details:** View log messages and debug information.
 
+<details>
+<summary>Demo</summary>
+<div align="center">
+    <img src="docs/images/demo1.png" alt="sponza" width="800"/>
+</div>
+<div align="center">
+    <img src="docs/images/demo2.png" alt="breakfast_room" width="800"/>
+</div>
+<div align="center">
+    <img src="docs/images/demo3.png" alt="cornell_box" width="800"/>
+</div>
+<div align="center">
+    <img src="docs/images/demo4.png" alt="lpshead" width="800"/>
+</div>
+</details>
+
 ## Development
 ### Dependencies
 
@@ -136,7 +152,7 @@ To build the project, follow these steps:
 
 ### Running tests
 
-The test scenes are downloaded from https://casual-effects.com/data/ by the script.
+Models downloaded from Morgan McGuire's [Computer Graphics Archive](https://casual-effects.com/data).
 ```bash
 python -m venv .venv
 .venv\Scripts\activate # On Windows

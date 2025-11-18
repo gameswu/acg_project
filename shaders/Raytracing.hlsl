@@ -302,14 +302,13 @@ void ClosestHit(inout RadiancePayload payload, in BuiltInTriangleIntersectionAtt
             // Sample texture if available (texture overrides base albedo)
             if (mat.HasAlbedoTexture()) {
                 int texIndex = mat.GetAlbedoTextureIndex();
-                // params3.zw store normalized scale of the source image within the texture array slice
                 float2 atlasScale = float2(mat.params3.z, mat.params3.w);
-                // Use fractional part of UV to support tiling/repetition and avoid
-                // sampling empty padded regions in the texture array slice.
-                float2 fracUV = frac(texCoord);
-                float2 scaledUV = fracUV * atlasScale;
-                float4 texColor = g_textures.SampleLevel(g_sampler, float3(scaledUV, texIndex), 0);
-                albedo = texColor.rgb;
+                // Only sample if scale is valid (non-zero)
+                if (atlasScale.x > 0.0 && atlasScale.y > 0.0) {
+                    float2 scaledUV = frac(texCoord) * atlasScale;
+                    float4 texColor = g_textures.SampleLevel(g_sampler, float3(scaledUV, texIndex), 0);
+                    albedo = texColor.rgb;
+                }
             }
         
         // For path tracing with cosine-weighted sampling:

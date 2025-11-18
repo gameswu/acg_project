@@ -30,6 +30,8 @@ static HWND g_hwnd = nullptr;
 // Async rendering state
 static std::atomic<bool> g_isRendering(false);
 static std::atomic<bool> g_renderComplete(false);
+static std::atomic<int> g_currentSample(0);     // Current sample being rendered
+static std::atomic<int> g_totalSamples(0);      // Total samples to render
 static std::string g_renderResultMessage;
 static std::mutex g_renderMutex;
 static std::unique_ptr<std::thread> g_renderThread;
@@ -87,8 +89,10 @@ void AddLogMessage(const std::string& msg) {
     if (g_logFile.is_open()) {
         auto now = std::chrono::system_clock::now();
         auto time_t = std::chrono::system_clock::to_time_t(now);
+        struct tm timeinfo;
+        localtime_s(&timeinfo, &time_t);
         char timeStr[100];
-        strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", std::localtime(&time_t));
+        strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", &timeinfo);
         g_logFile << "[" << timeStr << "] " << msg << std::endl;
         g_logFile.flush();
     }
@@ -208,6 +212,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         ImGui::CreateContext();
         ImGuiIO& io = ImGui::GetIO(); (void)io;
         io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+        
+        // Set ImGui ini file path to executable directory
+        static std::string iniPath = g_exeDirectory + "\\imgui.ini";
+        io.IniFilename = iniPath.c_str();
         
         ImGui::StyleColorsDark();
         
@@ -488,6 +496,8 @@ void RenderGUI(ACG::Renderer* renderer) {
                     // Set rendering flags at the start
                     g_isRendering.store(true);
                     g_renderComplete.store(false);
+                    g_totalSamples.store(samples);
+                    g_currentSample.store(0);
                     
                     // Only load scene if it hasn't been loaded yet or path changed
                     if (needsSceneLoad) {
@@ -505,7 +515,26 @@ void RenderGUI(ACG::Renderer* renderer) {
                     // Resize if needed
                     renderer->OnResize(renderWidth, renderHeight);
                     
+                    // Start progress monitoring thread
+                    std::atomic<bool> progressThreadRunning(true);
+                    auto progressThread = std::thread([renderer, samples, &progressThreadRunning]() {
+                        while (progressThreadRunning.load()) {
+                            int currentSamples = renderer->GetAccumulatedSamples();
+                            g_currentSample.store(currentSamples);
+                            if (currentSamples >= samples) {
+                                break;  // Rendering complete
+                            }
+                            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                        }
+                    });
+                    
                     renderer->RenderToFile(outputPathStr, samples, bounces);
+                    
+                    // Signal progress thread to stop and wait for it
+                    progressThreadRunning.store(false);
+                    if (progressThread.joinable()) {
+                        progressThread.join();
+                    }
                     
                     // Calculate actual render time
                     auto endTime = std::chrono::steady_clock::now();
@@ -550,6 +579,7 @@ void RenderGUI(ACG::Renderer* renderer) {
         if (ImGui::Button("Stop Render", ImVec2(150, 30))) {
             std::cout << "Stop render requested by user" << std::endl;
             renderer->StopRender();
+            g_isRendering.store(false);  // Update UI state immediately
         }
         ImGui::PopStyleColor();
     }
@@ -564,8 +594,20 @@ void RenderGUI(ACG::Renderer* renderer) {
     if (g_isRendering.load()) {
         ImGui::Separator();
         ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), "Status: Rendering offline to file");
+        
+        // Show actual progress
+        int currentSample = g_currentSample.load();
+        int totalSamples = g_totalSamples.load();
+        if (totalSamples > 0) {
+            float progress = static_cast<float>(currentSample) / static_cast<float>(totalSamples);
+            char progressText[128];
+            sprintf_s(progressText, "Progress: %d / %d samples (%.1f%%)", currentSample, totalSamples, progress * 100.0f);
+            ImGui::ProgressBar(progress, ImVec2(-1, 0), progressText);
+        } else {
+            ImGui::ProgressBar(0.0f, ImVec2(-1, 0), "Initializing...");
+        }
+        
         ImGui::Text("Please wait, the GUI remains responsive");
-        ImGui::Text("Check console for progress updates");
     }
     
     ImGui::End();
@@ -642,20 +684,21 @@ void RenderGUI(ACG::Renderer* renderer) {
     const char* statusText = g_isRendering.load() ? "Rendering" : "Idle";
     ImGui::Text("Status: %s", statusText);
     
+    // Show rendering progress
     if (g_isRendering.load()) {
-        ImGui::SameLine();
-        static float progress = 0.0f;
-        progress = fmodf(progress + 0.02f, 1.0f);
-        ImGui::ProgressBar(progress, ImVec2(-1, 0), "Processing...");
+        int currentSample = g_currentSample.load();
+        int totalSamples = g_totalSamples.load();
+        if (totalSamples > 0) {
+            float progress = static_cast<float>(currentSample) / static_cast<float>(totalSamples);
+            char progressText[128];
+            sprintf_s(progressText, "%d / %d samples (%.1f%%)", currentSample, totalSamples, progress * 100.0f);
+            ImGui::ProgressBar(progress, ImVec2(-1, 0), progressText);
+        } else {
+            ImGui::ProgressBar(0.0f, ImVec2(-1, 0), "Initializing...");
+        }
+    } else {
+        ImGui::ProgressBar(0.0f, ImVec2(-1, 0), "Idle");
     }
-    
-    int accumulated = renderer->GetAccumulatedSamples();
-    float progress = samplesPerPixel > 0 ? (float)accumulated / (float)samplesPerPixel : 0.0f;
-    char progressText[64];
-    sprintf_s(progressText, "Progress: %d / %d samples", accumulated, samplesPerPixel);
-    ImGui::ProgressBar(progress, ImVec2(-1, 0), progressText);
-    
-    ImGui::Text("Samples: %d / %d", accumulated, samplesPerPixel);
     
     // Display render time
     if (g_isRendering.load()) {

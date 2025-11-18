@@ -15,7 +15,7 @@ std::vector<MTLParser::MTLMaterial> MTLParser::Parse(const std::string& filepath
         return materials;
     }
     
-    std::cout << "MTLParser: Parsing " << filepath << std::endl;
+    std::cout << "Parsing MTL: " << filepath << std::endl;
     
     MTLMaterial* currentMaterial = nullptr;
     std::string line;
@@ -46,8 +46,6 @@ std::vector<MTLParser::MTLMaterial> MTLParser::Parse(const std::string& filepath
             materials.emplace_back();
             currentMaterial = &materials.back();
             currentMaterial->name = tokens[1];
-            
-            std::cout << "  [MTL] newmtl \"" << currentMaterial->name << "\"" << std::endl;
         }
         else if (currentMaterial) {
             // Parse material properties
@@ -212,7 +210,7 @@ std::shared_ptr<Material> MTLParser::ConvertToMaterial(
         mat->SetSpecular(mtl.Ks);
         mat->SetIllum(mtl.illum);
         
-        std::cout << "    → Emissive: Ke=(" << mtl.Ke.r << "," << mtl.Ke.g << "," << mtl.Ke.b << ")" << std::endl;
+        std::cout << "    Emissive: Ke=(" << mtl.Ke.r << "," << mtl.Ke.g << "," << mtl.Ke.b << ")" << std::endl;
     }
     else if (mtl.illum == 4 || mtl.illum == 6 || mtl.illum == 7 || mtl.illum == 9) {
         // Check if this is truly a transmissive material
@@ -256,7 +254,7 @@ std::shared_ptr<Material> MTLParser::ConvertToMaterial(
         mat->SetMetallic(1.0f);      // Full metallic for mirror
         mat->SetIllum(mtl.illum);
         
-        std::cout << "    → Mirror/Reflective: illum=" << mtl.illum 
+        std::cout << "    Mirror/Reflective: illum=" << mtl.illum 
                   << ", Ks=(" << mtl.Ks.r << "," << mtl.Ks.g << "," << mtl.Ks.b << ")" << std::endl;
     }
     // Priority 4: Standard Diffuse/Specular materials
@@ -272,7 +270,7 @@ std::shared_ptr<Material> MTLParser::ConvertToMaterial(
         mat->SetMetallic(0.0f);      // Diffuse materials are non-metallic
         mat->SetIllum(mtl.illum);
         
-        std::cout << "    → Diffuse";
+        std::cout << "    Diffuse";
         if (mtl.illum == 0) std::cout << " (Flat Color)";
         else if (mtl.illum == 1) std::cout << " (Lambertian)";
         else if (mtl.illum == 2) std::cout << " (Blinn-Phong)";
@@ -289,18 +287,18 @@ std::shared_ptr<Material> MTLParser::ConvertToMaterial(
     }
     
     // Load textures if specified
-    std::cout << "    → Checking texture: map_Kd=" << (mtl.map_Kd.empty() ? "empty" : mtl.map_Kd) 
+    std::cout << "    Checking texture: map_Kd=" << (mtl.map_Kd.empty() ? "empty" : mtl.map_Kd) 
               << ", mtlDirectory=" << (mtlDirectory.empty() ? "empty" : mtlDirectory) << std::endl;
     
     if (!mtl.map_Kd.empty() && !mtlDirectory.empty()) {
         std::string texturePath = mtlDirectory + "\\" + mtl.map_Kd;
         auto texture = std::make_shared<Texture>();
-        std::cout << "    → Loading texture: " << texturePath << std::endl;
+        std::cout << "    Loading texture: " << texturePath << std::endl;
         if (texture->LoadFromFile(texturePath)) {
             mat->SetAlbedoTexture(texture);
-            std::cout << "       ✓ Texture loaded: " << texture->GetWidth() << "x" << texture->GetHeight() << std::endl;
+            std::cout << "       Texture loaded: " << texture->GetWidth() << "x" << texture->GetHeight() << std::endl;
         } else {
-            std::cout << "       ✗ Failed to load texture" << std::endl;
+            std::cout << "       Failed to load texture" << std::endl;
         }
     }
     

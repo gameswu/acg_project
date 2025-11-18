@@ -81,7 +81,9 @@ if __name__ == "__main__":
         "https://casual-effects.com/g3d/data10/research/model/breakfast_room/breakfast_room.zip", # Texture test
         "https://casual-effects.com/g3d/data10/common/model/crytek_sponza/sponza.zip", # Large scene
         "https://casual-effects.com/g3d/data10/research/model/lpshead/lpshead.zip", # Head model
-        "https://casual-effects.com/g3d/data10/research/model/hairball/hairball.zip" # Hair model
+        "https://casual-effects.com/g3d/data10/research/model/hairball/hairball.zip", # Hair model
+        "https://casual-effects.com/g3d/data10/research/model/fireplace_room/fireplace_room.zip", # Complex scene
+        "https://casual-effects.com/g3d/data10/research/model/gallery/gallery.zip", # Gallery scene
     ]
     dest_folder = "tests/scenes"
 
@@ -90,7 +92,9 @@ if __name__ == "__main__":
         Path(dest_folder) / "breakfast_room",
         Path(dest_folder) / "sponza",
         Path(dest_folder) / "lpshead",
-        Path(dest_folder) / "hairball"
+        Path(dest_folder) / "hairball",
+        Path(dest_folder) / "fireplace_room",
+        Path(dest_folder) / "gallery"
     ]
     for url, extract_path in zip(urls, extract_paths):
         try:

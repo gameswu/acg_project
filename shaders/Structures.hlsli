@@ -41,21 +41,20 @@ struct Material {
     float4 specular;            // 32-47: Ks (RGB) + Ns (A)
     float4 params1;             // 48-63: type, metallic, roughness, Ni
     float4 params2;             // 64-79: transmission, albedoTextureIndex, illum, subsurface
-    float4 params3;             // 80-95: albedoTextureSize.xy, anisotropic, sheen
+    float4 params3;             // 80-95: textureWidth, textureHeight, textureScaleX, textureScaleY
     // Total: 96 bytes (6 * 16) - guaranteed aligned
     
     // Helper accessors for type-safe parameter access
-    uint GetType() { return asuint(params1.x); }
+    uint GetType() { return uint(round(params1.x)); }
     float GetMetallic() { return params1.y; }
     float GetRoughness() { return params1.z; }
     float GetIOR() { return params1.w; }
     float GetTransmission() { return params2.x; }
-    int GetAlbedoTextureIndex() { return asint(params2.y); }
-    int GetIllum() { return asint(params2.z); }
+    int GetAlbedoTextureIndex() { return int(round(params2.y)); }
+    int GetIllum() { return int(round(params2.z)); }
     float GetSubsurface() { return params2.w; }
-    float2 GetAlbedoTextureSize() { return params3.xy; }
-    float GetAnisotropic() { return params3.z; }
-    float GetSheen() { return params3.w; }
+    float2 GetTextureSize() { return params3.xy; }
+    float2 GetTextureScale() { return params3.zw; }
     
     // Texture sampling helpers (for future use)
     bool HasAlbedoTexture() { return GetAlbedoTextureIndex() >= 0; }

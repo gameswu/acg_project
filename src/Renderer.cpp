@@ -1353,21 +1353,17 @@ namespace ACG {
             for (const auto& m : m_scene->GetMaterials()) {
                 GPUMaterial mat = {};
                 glm::vec3 alb = m->GetAlbedo();
-                mat.albedo = glm::vec4(alb.x, alb.y, alb.z, 1.0f);
-
                 glm::vec3 emi = m->GetEmission();
                 mat.emission = glm::vec4(emi.x, emi.y, emi.z, 1.0f);
                 
                 glm::vec3 spec = m->GetSpecular();
                 mat.specular = glm::vec4(spec.x, spec.y, spec.z, 1.0f);
                 
-                // Pack scalar parameters into vec4s (safe bit-copy of integers into floats)
+                // Pack scalar parameters into vec4s
                 uint32_t materialType = static_cast<uint32_t>(m->GetType());
-                float materialTypeBits = 0.0f;
-                std::memcpy(&materialTypeBits, &materialType, sizeof(materialTypeBits));
 
                 mat.params1 = glm::vec4(
-                    materialTypeBits,  // type as float bits (bit-copied)
+                    static_cast<float>(materialType),  // Direct cast
                     m->GetMetallic(),
                     m->GetRoughness(),
                     m->GetIOR()
@@ -1383,15 +1379,11 @@ namespace ACG {
                 } else {
                     mat.albedo = glm::vec4(alb.x, alb.y, alb.z, albedoAlpha);
                 }
-                float texIdxBits = 0.0f;
-                float illumBits = 0.0f;
-                std::memcpy(&texIdxBits, &texIdx, sizeof(texIdxBits));
-                std::memcpy(&illumBits, &illum, sizeof(illumBits));
 
                 mat.params2 = glm::vec4(
                     m->GetTransmission(),
-                    texIdxBits,  // albedoTextureIndex as float bits (bit-copied)
-                    illumBits,   // illum as float bits (bit-copied)
+                    static_cast<float>(texIdx),  // Direct cast: -1, 0, 1, 2, ...
+                    static_cast<float>(illum),   // Direct cast
                     0.0f
                 );
                 
@@ -1594,6 +1586,7 @@ namespace ACG {
         // Prepare subresource data for each texture
         std::vector<D3D12_SUBRESOURCE_DATA> subresources;
         std::vector<std::vector<BYTE>> textureData;  // Keep data alive
+        textureData.reserve(textures.size());  // Prevent reallocation
         
         for (size_t i = 0; i < textures.size(); ++i) {
             const auto& tex = textures[i];
