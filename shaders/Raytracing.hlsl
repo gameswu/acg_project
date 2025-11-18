@@ -172,9 +172,16 @@ void ClosestHit(inout RadiancePayload payload, in BuiltInTriangleIntersectionAtt
     float3 n1 = g_vertices[i1].normal;
     float3 n2 = g_vertices[i2].normal;
     
+    float2 uv0 = g_vertices[i0].texCoord;
+    float2 uv1 = g_vertices[i1].texCoord;
+    float2 uv2 = g_vertices[i2].texCoord;
+    
     float3 barycentrics = float3(1.0 - attribs.barycentrics.x - attribs.barycentrics.y, 
                                   attribs.barycentrics.x, 
                                   attribs.barycentrics.y);
+    
+    // Interpolate texture coordinates
+    float2 texCoord = uv0 * barycentrics.x + uv1 * barycentrics.y + uv2 * barycentrics.z;
     
     // Calculate true geometric normal from triangle edges
     float3 edge1 = v1 - v0;
@@ -222,8 +229,10 @@ void ClosestHit(inout RadiancePayload payload, in BuiltInTriangleIntersectionAtt
     // illum 9: Glass (no ray trace)
     // illum 10: Shadow matte
     
-    // Handle refractive/transmissive materials (illum 4, 6, 7, 9)
-    if (illum == 4 || illum == 6 || illum == 7 || illum == 9 || materialType == 2) {
+    // Handle refractive/transmissive materials
+    // Use materialType (set by CPU) rather than illum for accurate classification
+    // This handles Blender's illum=4 exports correctly (many are diffuse, not glass)
+    if (materialType == 2) {
         // Glass material with reflection and refraction
         float ior = mat.GetIOR();
         float3 N = normal;
@@ -257,18 +266,19 @@ void ClosestHit(inout RadiancePayload payload, in BuiltInTriangleIntersectionAtt
             float3 reflectDir = reflect(rayDir, N);
             payload.nextOrigin = hitPos + geometricNormal * 0.001;
             payload.nextDirection = reflectDir;
-            // No throughput reduction for perfect specular
+            // Throughput weighted by probability: fresnel / fresnel = 1.0 (no change)
         } else {
             // Refraction
             float3 refractDir = eta * rayDir + (eta * cosI - sqrt(k)) * N;
-            payload.nextOrigin = hitPos - geometricNormal * 0.001; // Go inside
+            payload.nextOrigin = hitPos - geometricNormal * 0.001;
             payload.nextDirection = refractDir;
-            payload.throughput *= mat.albedo.rgb; // Color filtering through material
+            payload.throughput *= mat.albedo.rgb;
         }
         return;
     }
-    // Handle mirror/reflective materials (illum 3, 5, 8)
-    else if (illum == 3 || illum == 5 || illum == 8 || materialType == 1) {
+    // Handle mirror/reflective materials
+    // Use materialType for accurate classification
+    else if (materialType == 1) {
         // Perfect mirror reflection using Ks (specular reflectivity)
         float3 reflectDir = reflect(rayDir, normal);
         
@@ -291,11 +301,21 @@ void ClosestHit(inout RadiancePayload payload, in BuiltInTriangleIntersectionAtt
         // Lambertian diffuse BRDF
         // MTL spec: illum 0 = flat color, illum 1 = diffuse, illum 2 = diffuse+specular
         
+        // Get base albedo (color or texture)
+        float3 albedo = mat.albedo.rgb;
+        
+        // Sample texture if available
+        if (mat.HasAlbedoTexture()) {
+            int texIndex = mat.GetAlbedoTextureIndex();
+            float4 texColor = g_textures.SampleLevel(g_sampler, float3(texCoord, texIndex), 0);
+            albedo *= texColor.rgb;
+        }
+        
         // For path tracing with cosine-weighted sampling:
         // BRDF = albedo / PI
         // PDF = cosTheta / PI
         // Combined factor: (albedo / PI) * cosTheta / (cosTheta / PI) = albedo
-        payload.throughput *= mat.albedo.rgb;
+        payload.throughput *= albedo;
         
         // Russian roulette path termination
         float maxThroughput = max(max(payload.throughput.r, payload.throughput.g), payload.throughput.b);

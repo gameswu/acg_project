@@ -1308,6 +1308,9 @@ namespace ACG {
 
         // Create GPU-side material buffer
         std::vector<GPUMaterial> materialsCPU;
+        std::vector<std::shared_ptr<Texture>> textures;  // Collect textures
+        std::unordered_map<Material*, int> materialTextureIndex;  // Map material to texture index
+        
         if (m_scene->GetMaterials().empty()) {
             // Add a default material if none are loaded
             GPUMaterial mat = {};
@@ -1320,6 +1323,20 @@ namespace ACG {
             mat.params3 = glm::vec4(0.0f, 0.0f, 0.0f, 0.0f);
             materialsCPU.push_back(mat);
         } else {
+            // First pass: collect textures
+            for (const auto& m : m_scene->GetMaterials()) {
+                auto albedoTex = m->GetAlbedoTexture();
+                if (albedoTex && albedoTex->GetWidth() > 0) {
+                    materialTextureIndex[m.get()] = textures.size();
+                    textures.push_back(albedoTex);
+                } else {
+                    materialTextureIndex[m.get()] = -1;
+                }
+            }
+            
+            std::cout << "Collected " << textures.size() << " textures from materials" << std::endl;
+            
+            // Second pass: create material data
             for (const auto& m : m_scene->GetMaterials()) {
                 GPUMaterial mat = {};
                 glm::vec3 alb = m->GetAlbedo();
@@ -1340,7 +1357,7 @@ namespace ACG {
                     m->GetIOR()
                 );
                 
-                int texIdx = -1;
+                int texIdx = materialTextureIndex[m.get()];
                 int illum = m->GetIllum();
                 mat.params2 = glm::vec4(
                     m->GetTransmission(),
@@ -1349,7 +1366,14 @@ namespace ACG {
                     0.0f
                 );
                 
-                mat.params3 = glm::vec4(0.0f, 0.0f, 0.0f, 0.0f);  // albedoTextureSize + padding
+                // Set texture size if texture exists
+                if (texIdx >= 0 && texIdx < textures.size()) {
+                    float texWidth = static_cast<float>(textures[texIdx]->GetWidth());
+                    float texHeight = static_cast<float>(textures[texIdx]->GetHeight());
+                    mat.params3 = glm::vec4(texWidth, texHeight, 0.0f, 0.0f);
+                } else {
+                    mat.params3 = glm::vec4(0.0f, 0.0f, 0.0f, 0.0f);
+                }
                 
                 materialsCPU.push_back(mat);
             }
@@ -1363,6 +1387,12 @@ namespace ACG {
             std::cout << "  Material buffer created: GPU address = " << m_materialBuffer->GetGPUVirtualAddress() << std::endl;
         } else {
             std::cout << "  ERROR: Material buffer size is 0!" << std::endl;
+        }
+
+        // Upload textures to GPU
+        if (!textures.empty()) {
+            std::cout << "Uploading " << textures.size() << " textures to GPU..." << std::endl;
+            UploadTexturesToGPU(cmdList, textures);
         }
 
         // Create output texture (UAV)
@@ -1469,6 +1499,137 @@ namespace ACG {
         }
 
         std::cout << "Shader resources uploaded: vertices=" << vertices.size() << " indices=" << indices.size() << " materials=" << materialsCPU.size() << std::endl;
+    }
+
+    void Renderer::UploadTexturesToGPU(ID3D12GraphicsCommandList4* cmdList, const std::vector<std::shared_ptr<Texture>>& textures) {
+        if (textures.empty()) {
+            std::cout << "  No textures to upload" << std::endl;
+            return;
+        }
+
+        std::cout << "  Uploading " << textures.size() << " textures to GPU..." << std::endl;
+        
+        // Find max texture dimensions
+        UINT maxWidth = 0;
+        UINT maxHeight = 0;
+        for (const auto& tex : textures) {
+            maxWidth = std::max(maxWidth, static_cast<UINT>(tex->GetWidth()));
+            maxHeight = std::max(maxHeight, static_cast<UINT>(tex->GetHeight()));
+            std::cout << "    [" << (&tex - &textures[0]) << "] " << tex->GetWidth() << "x" << tex->GetHeight() 
+                      << " (" << tex->GetChannels() << " channels)" << std::endl;
+        }
+        
+        // Create Texture2DArray
+        D3D12_RESOURCE_DESC texArrayDesc = {};
+        texArrayDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        texArrayDesc.Width = maxWidth;
+        texArrayDesc.Height = maxHeight;
+        texArrayDesc.DepthOrArraySize = static_cast<UINT16>(textures.size());
+        texArrayDesc.MipLevels = 1;
+        texArrayDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        texArrayDesc.SampleDesc.Count = 1;
+        texArrayDesc.SampleDesc.Quality = 0;
+        texArrayDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        texArrayDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+        
+        CD3DX12_HEAP_PROPERTIES defaultHeapProps(D3D12_HEAP_TYPE_DEFAULT);
+        ThrowIfFailed(m_device->CreateCommittedResource(
+            &defaultHeapProps,
+            D3D12_HEAP_FLAG_NONE,
+            &texArrayDesc,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            nullptr,
+            IID_PPV_ARGS(&m_textureAtlas)
+        ));
+        m_textureAtlas->SetName(L"Texture Array");
+        
+        // Upload each texture
+        const UINT64 uploadBufferSize = GetRequiredIntermediateSize(m_textureAtlas.Get(), 0, textures.size());
+        
+        CD3DX12_HEAP_PROPERTIES uploadHeapProps(D3D12_HEAP_TYPE_UPLOAD);
+        auto uploadBufferDesc = CD3DX12_RESOURCE_DESC::Buffer(uploadBufferSize);
+        
+        ThrowIfFailed(m_device->CreateCommittedResource(
+            &uploadHeapProps,
+            D3D12_HEAP_FLAG_NONE,
+            &uploadBufferDesc,
+            D3D12_RESOURCE_STATE_GENERIC_READ,
+            nullptr,
+            IID_PPV_ARGS(&m_textureUpload)
+        ));
+        
+        // Prepare subresource data for each texture
+        std::vector<D3D12_SUBRESOURCE_DATA> subresources;
+        std::vector<std::vector<BYTE>> textureData;  // Keep data alive
+        
+        for (size_t i = 0; i < textures.size(); ++i) {
+            const auto& tex = textures[i];
+            
+            // Convert texture data to RGBA if needed
+            std::vector<BYTE> rgba(maxWidth * maxHeight * 4, 0);
+            const unsigned char* srcData = tex->GetRawData();
+            int srcChannels = tex->GetChannels();
+            int srcWidth = tex->GetWidth();
+            int srcHeight = tex->GetHeight();
+            
+            for (int y = 0; y < srcHeight; ++y) {
+                for (int x = 0; x < srcWidth; ++x) {
+                    int srcIdx = (y * srcWidth + x) * srcChannels;
+                    int dstIdx = (y * maxWidth + x) * 4;
+                    
+                    if (srcChannels >= 3) {
+                        rgba[dstIdx + 0] = srcData[srcIdx + 0];  // R
+                        rgba[dstIdx + 1] = srcData[srcIdx + 1];  // G
+                        rgba[dstIdx + 2] = srcData[srcIdx + 2];  // B
+                        rgba[dstIdx + 3] = (srcChannels == 4) ? srcData[srcIdx + 3] : 255;  // A
+                    } else if (srcChannels == 1) {
+                        rgba[dstIdx + 0] = srcData[srcIdx];  // R
+                        rgba[dstIdx + 1] = srcData[srcIdx];  // G
+                        rgba[dstIdx + 2] = srcData[srcIdx];  // B
+                        rgba[dstIdx + 3] = 255;  // A
+                    }
+                }
+            }
+            
+            textureData.push_back(std::move(rgba));
+            
+            D3D12_SUBRESOURCE_DATA subresource = {};
+            subresource.pData = textureData.back().data();
+            subresource.RowPitch = maxWidth * 4;
+            subresource.SlicePitch = subresource.RowPitch * maxHeight;
+            subresources.push_back(subresource);
+        }
+        
+        // Upload to GPU
+        UpdateSubresources(cmdList, m_textureAtlas.Get(), m_textureUpload.Get(), 
+                          0, 0, static_cast<UINT>(subresources.size()), subresources.data());
+        
+        // Transition to shader resource
+        auto barrier = CD3DX12_RESOURCE_BARRIER::Transition(
+            m_textureAtlas.Get(),
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+        );
+        cmdList->ResourceBarrier(1, &barrier);
+        
+        // Create SRV in descriptor heap (slot t3 = index 3)
+        D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+        srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+        srvDesc.Texture2DArray.MostDetailedMip = 0;
+        srvDesc.Texture2DArray.MipLevels = 1;
+        srvDesc.Texture2DArray.FirstArraySlice = 0;
+        srvDesc.Texture2DArray.ArraySize = static_cast<UINT>(textures.size());
+        
+        D3D12_CPU_DESCRIPTOR_HANDLE srvHandle = m_srvUavHeap->GetCPUDescriptorHandleForHeapStart();
+        UINT descriptorSize = m_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        D3D12_CPU_DESCRIPTOR_HANDLE textureSrvHandle = { srvHandle.ptr + descriptorSize * 3 };  // Slot 3 for t3
+        
+        m_device->CreateShaderResourceView(m_textureAtlas.Get(), &srvDesc, textureSrvHandle);
+        
+        std::cout << "  ✓ Texture array uploaded: " << textures.size() << " textures, " 
+                  << maxWidth << "x" << maxHeight << " per slice" << std::endl;
     }
 
     void Renderer::CreateShaderBindingTable() {

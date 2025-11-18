@@ -77,6 +77,7 @@ namespace ACG {
         void CreateAccelerationStructures(ID3D12GraphicsCommandList4* cmdList);
         void CreateShaderResources(ID3D12GraphicsCommandList4* cmdList);
         void CreateShaderBindingTable();
+        void UploadTexturesToGPU(ID3D12GraphicsCommandList4* cmdList, const std::vector<std::shared_ptr<Texture>>& textures);
         
         void CheckRaytracingSupport();
         Microsoft::WRL::ComPtr<IDxcBlob> CompileShader(const std::wstring& filename);
@@ -129,6 +130,7 @@ namespace ACG {
         Microsoft::WRL::ComPtr<ID3D12Resource> m_indexUpload;
         Microsoft::WRL::ComPtr<ID3D12Resource> m_triangleMaterialUpload;
         Microsoft::WRL::ComPtr<ID3D12Resource> m_materialUpload;
+        Microsoft::WRL::ComPtr<ID3D12Resource> m_textureUpload;  // Upload heap for textures
 
         // DXR Shader Resources
         Microsoft::WRL::ComPtr<ID3D12Resource> m_outputTexture;

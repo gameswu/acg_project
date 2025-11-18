@@ -7,6 +7,12 @@
 #include "Material.h"
 #include "Light.h"
 
+// Forward declarations for Assimp types (geometry loading only)
+struct aiScene;
+struct aiNode;
+struct aiMesh;
+struct aiMaterial;
+
 namespace ACG {
 
 /**
@@ -40,6 +46,11 @@ public:
     glm::vec3 GetBBoxMax() const { return m_bboxMax; }
 
 private:
+    // Internal helper functions for mesh processing
+    void ProcessNode(aiNode* node, const aiScene* scene);
+    void ProcessMesh(aiMesh* mesh, const aiScene* scene);
+    void CalculateBoundingBox();
+    
     std::vector<std::shared_ptr<Mesh>> m_meshes;
     std::vector<std::shared_ptr<Material>> m_materials;
     std::vector<std::shared_ptr<Light>> m_lights;
