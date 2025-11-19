@@ -38,10 +38,11 @@ namespace ACG {
         void OnDestroy();
         void OnResize(UINT width, UINT height);
 
-        void LoadScene(const std::string& path);
-        void LoadSceneAsync(const std::string& path); // Async version using independent command resources
+        void LoadScene(const std::string& path, bool useCustomMTLParser = true);
+        void LoadSceneAsync(const std::string& path, bool useCustomMTLParser = true); // Async version using independent command resources
         void RenderToFile(const std::string& outputPath, int samplesPerPixel, int maxBounces);
         void SetEnvironmentMap(const std::string& path);  // Load HDR/EXR environment map
+        void ClearEnvironmentMap();  // Clear/unload environment map
         
         // GUI控制方法
         void SetSamplesPerPixel(int spp) { m_samplesPerPixel = spp; }
@@ -86,7 +87,7 @@ namespace ACG {
         void CreateShaderResources(ID3D12GraphicsCommandList4* cmdList);
         void CreateShaderBindingTable();
         void UploadTexturesToGPU(ID3D12GraphicsCommandList4* cmdList, const std::vector<std::shared_ptr<Texture>>& textures);
-        void UploadEnvironmentMap(ID3D12GraphicsCommandList4* cmdList, const std::shared_ptr<Texture>& envMap);
+        Microsoft::WRL::ComPtr<ID3D12Resource> UploadEnvironmentMap(ID3D12GraphicsCommandList4* cmdList, const std::shared_ptr<Texture>& envMap);
         
         void CheckRaytracingSupport();
         Microsoft::WRL::ComPtr<IDxcBlob> CompileShader(const std::wstring& filename);

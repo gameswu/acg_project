@@ -84,10 +84,10 @@ namespace ACG {
         }
     }
 
-    void Renderer::LoadScene(const std::string& path) {
+    void Renderer::LoadScene(const std::string& path, bool useCustomMTLParser) {
         try {
             m_scene = std::make_unique<Scene>();
-            m_scene->LoadFromFile(path);
+            m_scene->LoadFromFile(path, useCustomMTLParser);
             
             // Prepare command list for resource creation
             WaitForGpu(); // Ensure GPU is idle
@@ -118,13 +118,13 @@ namespace ACG {
         }
     }
 
-    void Renderer::LoadSceneAsync(const std::string& path) {
+    void Renderer::LoadSceneAsync(const std::string& path, bool useCustomMTLParser) {
         try {
             std::cout << "[Async] Loading scene from file..." << std::endl;
             std::cout.flush();
             
             m_scene = std::make_unique<Scene>();
-            m_scene->LoadFromFile(path);
+            m_scene->LoadFromFile(path, useCustomMTLParser);
             
             std::cout << "[Async] Creating shader resources..." << std::endl;
             std::cout.flush();
@@ -1811,10 +1811,10 @@ void ACG::Renderer::SetSunIntensity(float intensity) {
                   << maxWidth << "x" << maxHeight << " per slice" << std::endl;
     }
 
-    void Renderer::UploadEnvironmentMap(ID3D12GraphicsCommandList4* cmdList, const std::shared_ptr<Texture>& envMap) {
+    Microsoft::WRL::ComPtr<ID3D12Resource> Renderer::UploadEnvironmentMap(ID3D12GraphicsCommandList4* cmdList, const std::shared_ptr<Texture>& envMap) {
         if (!envMap || !envMap->IsHDR()) {
             std::cout << "  No valid HDR environment map to upload" << std::endl;
-            return;
+            return nullptr;
         }
 
         std::cout << "  Uploading HDR environment map: " << envMap->GetWidth() << "x" << envMap->GetHeight() << std::endl;
@@ -1916,6 +1916,9 @@ void ACG::Renderer::SetSunIntensity(float intensity) {
         m_device->CreateShaderResourceView(m_environmentMap.Get(), &srvDesc, envMapSrvHandle);
         
         std::cout << "  ✓ Environment map uploaded: " << width << "x" << height << std::endl;
+        
+        // Return upload buffer to keep it alive until GPU finishes using it
+        return envMapUpload;
     }
 
     void Renderer::CreateShaderBindingTable() {
@@ -2162,28 +2165,55 @@ void ACG::Renderer::SetSunIntensity(float intensity) {
         envMap->SetType(TextureType::Environment);
         if (!envMap->LoadFromFile(path)) {
             std::cerr << "Failed to load environment map: " << path << std::endl;
-            return;
+            throw std::runtime_error("Failed to load environment map file");
         }
         
         if (!envMap->IsHDR()) {
             std::cerr << "Environment map is not HDR format: " << path << std::endl;
-            return;
+            throw std::runtime_error("Environment map is not HDR format");
         }
         
-        // Prepare command list for upload
-        WaitForGpu();
-        ThrowIfFailed(m_commandAllocators[m_frameIndex]->Reset());
-        ThrowIfFailed(m_commandList->Reset(m_commandAllocators[m_frameIndex].Get(), nullptr));
+        // Create independent command allocator for environment map loading
+        Microsoft::WRL::ComPtr<ID3D12CommandAllocator> envMapAllocator;
+        ThrowIfFailed(m_device->CreateCommandAllocator(
+            D3D12_COMMAND_LIST_TYPE_DIRECT,
+            IID_PPV_ARGS(&envMapAllocator)),
+            "Failed to create environment map command allocator");
         
-        // Upload to GPU
-        UploadEnvironmentMap(m_commandList.Get(), envMap);
+        // Create independent command list
+        Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList4> envMapCmdList;
+        ThrowIfFailed(m_device->CreateCommandList(
+            0,
+            D3D12_COMMAND_LIST_TYPE_DIRECT,
+            envMapAllocator.Get(),
+            nullptr,
+            IID_PPV_ARGS(&envMapCmdList)),
+            "Failed to create environment map command list");
+        
+        // Upload to GPU using independent command list
+        // Keep upload buffer alive until GPU finishes
+        auto envMapUploadBuffer = UploadEnvironmentMap(envMapCmdList.Get(), envMap);
         
         // Execute and wait
-        ThrowIfFailed(m_commandList->Close());
-        ID3D12CommandList* cmdLists[] = { m_commandList.Get() };
+        ThrowIfFailed(envMapCmdList->Close(), "Failed to close environment map command list");
+        ID3D12CommandList* cmdLists[] = { envMapCmdList.Get() };
         m_commandQueue->ExecuteCommandLists(1, cmdLists);
         WaitForGpu();
         
+        // Now it's safe to let envMapUploadBuffer be destroyed
+        
         std::cout << "Environment map loaded successfully" << std::endl;
+    }
+
+    void Renderer::ClearEnvironmentMap() {
+        std::cout << "Clearing environment map" << std::endl;
+        
+        // Wait for GPU to finish using the resource
+        WaitForGpu();
+        
+        // Release the environment map resource
+        m_environmentMap.Reset();
+        
+        std::cout << "Environment map cleared" << std::endl;
     }
 }

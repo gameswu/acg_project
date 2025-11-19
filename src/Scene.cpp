@@ -4,6 +4,7 @@
 #include <limits>
 #include <filesystem>
 #include <unordered_map>
+#include <algorithm>
 
 #include "assimp/Importer.hpp"
 #include "assimp/scene.h"
@@ -33,8 +34,21 @@ void Scene::AddLight(std::shared_ptr<Light> light) {
     m_lights.push_back(light);
 }
 
-bool Scene::LoadFromFile(const std::string& filename) {
+bool Scene::LoadFromFile(const std::string& filename, bool useCustomMTLParser) {
     std::cout << "Loading scene from: " << filename << std::endl;
+    
+    // Check file extension
+    std::string extension = filename.substr(filename.find_last_of('.'));
+    std::transform(extension.begin(), extension.end(), extension.begin(), ::tolower);
+    bool isObjFile = (extension == ".obj");
+    
+    // For non-OBJ files, always use Assimp
+    if (!isObjFile) {
+        useCustomMTLParser = false;
+        std::cout << "Non-OBJ file detected, using Assimp for all loading" << std::endl;
+    }
+    
+    std::cout << "MTL Parser: " << (useCustomMTLParser ? "Custom MTL Parser" : "Assimp") << std::endl;
     
     // Extract directory from filename for texture loading and scene name
     std::string directory;
@@ -73,27 +87,29 @@ bool Scene::LoadFromFile(const std::string& filename) {
     m_meshes.clear();
     m_materials.clear();
     
-    // ========== CUSTOM MTL PARSER - ONLY MATERIAL LOADING METHOD ==========
-    // Parse MTL file directly for 100% accurate material properties
-    // This completely bypasses Assimp's buggy material parsing
-    std::string mtlFilename = filename.substr(0, filename.find_last_of('.')) + ".mtl";
-    
     std::unordered_map<std::string, std::shared_ptr<Material>> materialMap;
     std::vector<std::string> materialOrder; // Preserve material order
     
-    if (std::filesystem::exists(mtlFilename)) {
-        std::cout << "\n========== Custom MTL Parser (v1.0) ==========" << std::endl;
-        std::cout << "MTL File: " << mtlFilename << std::endl;
-        std::cout << "MTL Specification: Wavefront v4.2 (October 1995)" << std::endl;
+    // ========== MATERIAL LOADING ==========
+    if (useCustomMTLParser) {
+        // ========== CUSTOM MTL PARSER - ONLY MATERIAL LOADING METHOD ==========
+        // Parse MTL file directly for 100% accurate material properties
+        // This completely bypasses Assimp's buggy material parsing
+        std::string mtlFilename = filename.substr(0, filename.find_last_of('.')) + ".mtl";
         
-        MTLParser parser;
-        auto parsedMaterials = parser.Parse(mtlFilename);
-        
-        // Extract MTL directory for texture loading
-        std::filesystem::path mtlPath(mtlFilename);
-        std::string mtlDirectory = mtlPath.parent_path().string();
-        
-        std::cout << "\nParsed " << parsedMaterials.size() << " materials from MTL file:\n" << std::endl;
+        if (std::filesystem::exists(mtlFilename)) {
+            std::cout << "\n========== Custom MTL Parser (v1.0) ==========" << std::endl;
+            std::cout << "MTL File: " << mtlFilename << std::endl;
+            std::cout << "MTL Specification: Wavefront v4.2 (October 1995)" << std::endl;
+            
+            MTLParser parser;
+            auto parsedMaterials = parser.Parse(mtlFilename);
+            
+            // Extract MTL directory for texture loading
+            std::filesystem::path mtlPath(mtlFilename);
+            std::string mtlDirectory = mtlPath.parent_path().string();
+            
+            std::cout << "\nParsed " << parsedMaterials.size() << " materials from MTL file:\n" << std::endl;
         
         for (const auto& mtl : parsedMaterials) {
             auto mat = MTLParser::ConvertToMaterial(mtl, mtlDirectory);
@@ -133,32 +149,70 @@ bool Scene::LoadFromFile(const std::string& filename) {
         }
         
         std::cout << "\n============================================\n" << std::endl;
+        } else {
+            std::cerr << "ERROR: MTL file not found: " << mtlFilename << std::endl;
+            std::cerr << "Custom MTL parser is REQUIRED for material loading." << std::endl;
+            return false;
+        }
     } else {
-        std::cerr << "ERROR: MTL file not found: " << mtlFilename << std::endl;
-        std::cerr << "Custom MTL parser is REQUIRED for material loading." << std::endl;
-        return false;
+        // ========== USE ASSIMP FOR MATERIAL LOADING ==========
+        std::cout << "\n========== Using Assimp Material Parser ==========" << std::endl;
+        std::cout << "Loading materials via Assimp library" << std::endl;
+        
+        for (unsigned int i = 0; i < ascene->mNumMaterials; ++i) {
+            aiMaterial* aiMat = ascene->mMaterials[i];
+            
+            aiString name;
+            aiMat->Get(AI_MATKEY_NAME, name);
+            std::string materialName = name.C_Str();
+            
+            // Load diffuse color
+            aiColor3D diffuse(0.8f, 0.8f, 0.8f);
+            aiMat->Get(AI_MATKEY_COLOR_DIFFUSE, diffuse);
+            glm::vec3 diffuseColor(diffuse.r, diffuse.g, diffuse.b);
+            
+            // Create diffuse material with the color
+            auto mat = std::make_shared<DiffuseMaterial>(diffuseColor);
+            
+            materialMap[materialName] = mat;
+            materialOrder.push_back(materialName);
+            
+            std::cout << "Material: \"" << materialName << "\" loaded via Assimp (Diffuse)" << std::endl;
+        }
+        
+        std::cout << "============================================\n" << std::endl;
     }
     
-    // ========== MAP ASSIMP MATERIALS TO CUSTOM PARSED MATERIALS ==========
-    // Assimp scene contains material references, but we ignore Assimp's parsed values
-    // We only use Assimp material names to match with our custom-parsed materials
-    for (unsigned int i = 0; i < ascene->mNumMaterials; ++i) {
-        aiMaterial* aiMat = ascene->mMaterials[i];
-        
-        aiString name;
-        aiMat->Get(AI_MATKEY_NAME, name);
-        std::string materialName = name.C_Str();
-        
-        auto it = materialMap.find(materialName);
-        if (it != materialMap.end()) {
-            m_materials.push_back(it->second);
-            std::cout << "Material[" << i << "] \"" << materialName << "\": Loaded from custom MTL parser" << std::endl;
-        } else {
-            // Material not found in MTL file - create default diffuse
-            std::cerr << "WARNING: Material \"" << materialName << "\" not found in MTL file" << std::endl;
-            std::cerr << "         Using default gray diffuse material" << std::endl;
-            auto defaultMat = std::make_shared<DiffuseMaterial>(glm::vec3(0.5f));
-            m_materials.push_back(defaultMat);
+    // ========== MAP MATERIALS TO SCENE ==========
+    // Map materials in the order they appear in the scene
+    if (useCustomMTLParser) {
+        // For custom MTL parser: map Assimp material names to our parsed materials
+        for (unsigned int i = 0; i < ascene->mNumMaterials; ++i) {
+            aiMaterial* aiMat = ascene->mMaterials[i];
+            
+            aiString name;
+            aiMat->Get(AI_MATKEY_NAME, name);
+            std::string materialName = name.C_Str();
+            
+            auto it = materialMap.find(materialName);
+            if (it != materialMap.end()) {
+                m_materials.push_back(it->second);
+                std::cout << "Material[" << i << "] \"" << materialName << "\": Loaded from custom MTL parser" << std::endl;
+            } else {
+                // Material not found in MTL file - create default diffuse
+                std::cerr << "WARNING: Material \"" << materialName << "\" not found in MTL file" << std::endl;
+                std::cerr << "         Using default gray diffuse material" << std::endl;
+                auto defaultMat = std::make_shared<DiffuseMaterial>(glm::vec3(0.5f));
+                m_materials.push_back(defaultMat);
+            }
+        }
+    } else {
+        // For Assimp: materials are already in materialMap, just add them in order
+        for (const auto& matName : materialOrder) {
+            auto it = materialMap.find(matName);
+            if (it != materialMap.end()) {
+                m_materials.push_back(it->second);
+            }
         }
     }
     

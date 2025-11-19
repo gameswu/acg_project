@@ -11,36 +11,36 @@ We are planning to implement a GPU-based renderer that meets the following cours
 <details>
 <summary>Click to expand the requirements</summary>
 
-- Base: Implement a path tracing algorithm that correctly handles diffuse and specular materials. (basic)
-- Scene creation: Build a custom scene with aesthetic considerations, using geometry that you create from scratch or find online (ensure the source is credited). (basic, tidiness and attractiveness 1pt)
-- Acceleration structure: Implement an acceleration structure such as BVH (Bounding Volume Hierarchy). This is not required for hardware-based renderers, as the acceleration structure is built-in in that case. (basic, Surface Area Heuristic or another advanced algorithm 2pts)
+- Base: Implement a path tracing algorithm that correctly handles diffuse and specular materials. (basic) :white_check_mark:
+- Scene creation: Build a custom scene with aesthetic considerations, using geometry that you create from scratch or find online (ensure the source is credited). (basic, tidiness and attractiveness 1pt) :construction:
+- Acceleration structure: Implement an acceleration structure such as BVH (Bounding Volume Hierarchy). This is not required for hardware-based renderers, as the acceleration structure is built-in in that case. (basic, Surface Area Heuristic or another advanced algorithm 2pts) :construction:
 - Material: Create a (non-trivial) custom material. Options include:
-    - Transmissive material (basic)
-    - Principled BSDF (2pts)
-    - Multi-layer material (2pts)
-    - Rendering of fur, hair, skin, etc. (2pts)
+    - Transmissive material (basic) :white_check_mark:
+    - Principled BSDF (2pts) :x:
+    - Multi-layer material (2pts) :x:
+    - Rendering of fur, hair, skin, etc. (2pts) :x:
 - Texture: Create your own (non-trivial) texture with proper texture mapping. Options include:
-    - Color texture (basic)
-    - Normal map, height map, attribute map, or any functional texture mapping (1pt for each, up to 2pts)
-    - Implement an adaptive mipmap algorithm (2pts)
-- Importance Sampling: Use more advanced sampling algorithms for path tracing. (Importance sampling with Russian Roulette, multiple importance sampling 2pts)
+    - Color texture (basic) :white_check_mark:
+    - Normal map, height map, attribute map, or any functional texture mapping (1pt for each, up to 2pts) :construction:
+    - Implement an adaptive mipmap algorithm (2pts) :x:
+- Importance Sampling: Use more advanced sampling algorithms for path tracing. (Importance sampling with Russian Roulette, multiple importance sampling 2pts) :construction:
 - Volumetric Rendering: Options include:
-    - Subsurface scattering (2pts)
-    - Homogeneous volume rendering (1pt)
-    - Inhomogeneous volume rendering (1pt)
-    - Channel-independent subsurface scattering (1pt)
-    - Volumetric emission (1pt)
-    - Volumetric alpha shadow (2pts)
+    - Subsurface scattering (2pts) :x:
+    - Homogeneous volume rendering (1pt) :x:
+    - Inhomogeneous volume rendering (1pt) :x:
+    - Channel-independent subsurface scattering (1pt) :x:
+    - Volumetric emission (1pt) :x:
+    - Volumetric alpha shadow (2pts) :x:
 - Special Visual Effects: Options include:
-    - Motion blur, depth of field (basic)
-    - Alpha shadow (basic)
-    - Cartoon style rendering (2pts)
-    - Chromatic dispersion (2pts)
+    - Motion blur, depth of field (basic) :x:
+    - Alpha shadow (basic) :x:
+    - Cartoon style rendering (2pts) :x:
+    - Chromatic dispersion (2pts) :x:
 - Lighting: Options include:
-    - Point light and area light (basic)
-    - Environment lighting with HDR, such as skybox (2pts)
-- Anti-aliasing: Implement an anti-aliasing algorithm (basic)
-- Simulation-based content creation: Up to 2pts
+    - Point light and area light (basic) :construction:
+    - Environment lighting with HDR, such as skybox (2pts) :white_check_mark:
+- Anti-aliasing: Implement an anti-aliasing algorithm (basic) :x:
+- Simulation-based content creation: Up to 2pts :construction:
 </details>
 
 Details of each requirement can be found in the [project description document](/docs/ACG_2025_Project_Announcement.pdf).
@@ -52,6 +52,7 @@ acg_project/
 │   ├── Camera.h         # Camera system
 │   ├── Denoiser.h       # Denoising using OIDN
 │   ├── DX12Helper.h     # DirectX 12 helper functions
+│   ├── GUI.h            # GUI system using ImGui
 │   ├── Light.h          # Lighting system (point light, area light, environment light)
 │   ├── LogRedirector.h  # Redirect console output to GUI log panel
 │   ├── Material.h       # Material system (diffuse, specular, transmissive, PBR)
@@ -66,6 +67,7 @@ acg_project/
 ├── src/                 # Source files directory
 │   ├── Camera.cpp
 │   ├── Denoiser.cpp
+│   ├── GUI.cpp
 │   ├── Light.cpp
 │   ├── Material.cpp
 │   ├── MathUtils.cpp
@@ -168,6 +170,11 @@ python download.py
 python unzip.py
 ```
 
+Simple test scenes made by us.
+
+| Test Scene | Targeted Feature |
+| materialtest | Material rendering |
+
 Models downloaded from Morgan McGuire's [Computer Graphics Archive](https://casual-effects.com/data).
 
 | Test Scene | Targeted Feature |
@@ -187,6 +194,8 @@ Models downloaded from [Sketchfab](https://sketchfab.com/).
 | Test Scene | Targeted Feature |
 |------------|------------------|
 | cloud | Volumetric rendering |
+| hair_cards_fbx | Hair rendering |
+| project_-_cirno_fumo_3d_scan | FUMO |
 
 The skybox downloaded from [HDRI Haven](https://hdrihaven.com/).
 

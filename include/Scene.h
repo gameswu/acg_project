@@ -29,7 +29,7 @@ public:
     void AddLight(std::shared_ptr<Light> light);
     
     // 加载场景
-    bool LoadFromFile(const std::string& filename);
+    bool LoadFromFile(const std::string& filename, bool useCustomMTLParser = true);
     
     // 获取场景数据
     const std::vector<std::shared_ptr<Mesh>>& GetMeshes() const { return m_meshes; }
