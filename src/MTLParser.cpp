@@ -86,6 +86,7 @@ std::vector<MTLParser::MTLMaterial> MTLParser::Parse(const std::string& filepath
                 } else {
                     currentMaterial->d = std::stof(tokens[1]);
                 }
+                currentMaterial->hasD = true;
             }
             else if (keyword == "Ni" && tokens.size() >= 2) {
                 currentMaterial->Ni = std::stof(tokens[1]);
@@ -214,20 +215,45 @@ std::shared_ptr<Material> MTLParser::ConvertToMaterial(
     }
     else if (mtl.illum == 4 || mtl.illum == 6 || mtl.illum == 7 || mtl.illum == 9) {
         // Check if this is truly a transmissive material
-        // Blender exports illum=4 for all raytraced materials, but with Tf=1.0 and Ni=1.0 for opaque ones
-        // True glass: Tf < 1.0 (absorbs some light) OR Ni > 1.05 (has refraction)
+        // Blender and other exporters sometimes emit illum=6/7/4 but leave Tf==1.0 and Ni==1.0
+        // which semantically makes the material opaque. For realistic glass we need a
+        // refractive index > 1.05 or a non-white transmission filter. Use conservative
+        // heuristics: if illum indicates refraction (6 or 7) and the material has a
+        // significant specular term, assume the author intended glass — default to IOR=1.5
+        // when Ni is left at 1.0.
         float tfAvg = (mtl.Tf.r + mtl.Tf.g + mtl.Tf.b) / 3.0f;
-        bool isTransmissive = (tfAvg < 0.99f) || (mtl.Ni > 1.05f);
+        float effectiveNi = mtl.Ni;
+        if ((mtl.illum == 6 || mtl.illum == 7) && effectiveNi <= 1.01f) {
+            float specularIntensity = (mtl.Ks.r + mtl.Ks.g + mtl.Ks.b) / 3.0f;
+            if (specularIntensity > 0.01f) {
+                std::cout << "    Warning: illum=" << mtl.illum << " indicates refraction but Ni==" << mtl.Ni
+                          << ". Assuming IOR=1.5 for glass fallback." << std::endl;
+                effectiveNi = 1.5f;
+            }
+        }
+        bool isTransmissive = (tfAvg < 0.99f) || (effectiveNi > 1.05f);
         
         if (isTransmissive) {
             glm::vec3 transmissionColor = mtl.Tf;
-            
-            mat = std::make_shared<TransmissiveMaterial>(transmissionColor, mtl.Ni);
+
+            mat = std::make_shared<TransmissiveMaterial>(transmissionColor, effectiveNi);
             mat->SetAlbedo(transmissionColor);
             mat->SetTransmissionFilter(mtl.Tf);
             mat->SetSpecular(mtl.Ks);
-            mat->SetIOR(mtl.Ni);
-            mat->SetTransmission(1.0f - mtl.d);
+            mat->SetIOR(effectiveNi);
+            // Transmission amount: prefer explicit 'd' (dissolve). If 'd' was not set,
+            // derive a reasonable transmission from the transmission filter (Tf).
+            float transAmount = 1.0f;
+            if (mtl.hasD) {
+                transAmount = 1.0f - mtl.d;
+            } else {
+                float tfAvg = (mtl.Tf.r + mtl.Tf.g + mtl.Tf.b) / 3.0f;
+                // If Tf is white (1.0) and no 'd', assume full transmission; otherwise use Tf as tint
+                transAmount = tfAvg;
+            }
+            if (transAmount < 0.0f) transAmount = 0.0f;
+            if (transAmount > 1.0f) transAmount = 1.0f;
+            mat->SetTransmission(transAmount);
             mat->SetRoughness(mtl.Ns > 0.0f ? std::sqrt(2.0f / (mtl.Ns + 2.0f)) : 0.05f);
             mat->SetIllum(mtl.illum);
         } else {

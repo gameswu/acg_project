@@ -10,6 +10,9 @@ struct RadiancePayload
     float3 nextDirection; // Next ray direction (for iterative tracing)
     uint rngState;        // RNG state
     bool terminated;      // Path terminated flag
+    // Medium tracking (IOR stack) for nested refractive media
+    float iorStack[4];    // Small stack for nested IORs (stack[0] = 1.0 = air)
+    uint iorStackTop;     // Current top index
 };
 
 // Global root signature
@@ -110,6 +113,9 @@ void RayGen()
     payload.nextDirection = float3(0, 0, 0);
     payload.rngState = rngState;
     payload.terminated = false;
+    // Initialize medium stack (start in air)
+    payload.iorStack[0] = 1.0f;
+    payload.iorStackTop = 0;
     
     // Iterative path tracing (multiple bounces)
     for (uint bounce = 0; bounce < maxBounces && !payload.terminated; bounce++) {
@@ -265,19 +271,60 @@ void ClosestHit(inout RadiancePayload payload, in BuiltInTriangleIntersectionAtt
         
         // Russian roulette between reflection and refraction
         float rand = Random(payload.rngState);
-        
+
+        // Robust transmission fallback: CPU may leave transmission == 0 when 'd' is default.
+        // Use material's stored transmission if available, otherwise derive a safe fallback
+        // from the albedo (Tf) so glass is not black.
+        float trans = mat.GetTransmission();
+        if (trans <= 0.001f) {
+            // Derive a conservative fallback from albedo (albedo for transmissive materials
+            // is set to Tf on CPU). Use a small minimum to avoid complete energy loss.
+            float avgAlbedo = (mat.albedo.r + mat.albedo.g + mat.albedo.b) * (1.0 / 3.0);
+            trans = max(avgAlbedo, 0.01f);
+        }
+
+        // Compute small offset to avoid self-intersections
+        float eps = 0.001f;
+        float3 offset = geometricNormal * eps;
+
         if (rand < fresnel || k < 0.0) {
             // Total internal reflection or Fresnel reflection
             float3 reflectDir = reflect(rayDir, N);
-            payload.nextOrigin = hitPos + geometricNormal * 0.001;
+            // Offset origin away from surface in ray direction hemisphere
+            payload.nextOrigin = dot(rayDir, geometricNormal) > 0.0 ? hitPos + offset : hitPos - offset;
             payload.nextDirection = reflectDir;
-            // Throughput weighted by probability: fresnel / fresnel = 1.0 (no change)
+            // throughput unchanged except by reflectance (handled elsewhere)
         } else {
             // Refraction
-            float3 refractDir = eta * rayDir + (eta * cosI - sqrt(k)) * N;
-            payload.nextOrigin = hitPos - geometricNormal * 0.001;
-            payload.nextDirection = refractDir;
-            payload.throughput *= mat.albedo.rgb;
+            // Determine current and target IOR from payload stack
+            float iorCurrent = payload.iorStack[payload.iorStackTop];
+            bool entering = dot(rayDir, normal) < 0.0; // entering if ray goes against normal
+            float iorTarget = entering ? mat.GetIOR() : (payload.iorStackTop > 0 ? payload.iorStack[payload.iorStackTop - 1] : 1.0f);
+
+            float etaLocal = iorCurrent / iorTarget;
+            float kLocal = 1.0 - etaLocal * etaLocal * (1.0 - cosI * cosI);
+            // If total internal reflection detected here, fallback to reflection
+            if (kLocal < 0.0) {
+                float3 reflectDir = reflect(rayDir, N);
+                payload.nextOrigin = dot(rayDir, geometricNormal) > 0.0 ? hitPos + offset : hitPos - offset;
+                payload.nextDirection = reflectDir;
+            } else {
+                float3 refractDir = etaLocal * rayDir + (etaLocal * cosI - sqrt(kLocal)) * N;
+                payload.nextDirection = refractDir;
+                payload.nextOrigin = dot(rayDir, geometricNormal) > 0.0 ? hitPos + offset : hitPos - offset;
+
+                // Update IOR stack: push on entering, pop on exiting
+                if (entering) {
+                    uint newTop = min(payload.iorStackTop + 1, 3);
+                    payload.iorStackTop = newTop;
+                    payload.iorStack[payload.iorStackTop] = mat.GetIOR();
+                } else {
+                    if (payload.iorStackTop > 0) payload.iorStackTop--;
+                }
+
+                // Apply color filtering (albedo/Tf) and transmission amount
+                payload.throughput *= mat.albedo.rgb * trans;
+            }
         }
         return;
     }
