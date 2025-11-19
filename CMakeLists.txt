@@ -14,6 +14,12 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_SOURCE_DIR}/bin)
 # 添加头文件目录
 include_directories(include)
 
+# Intel Open Image Denoise (OIDN) support
+set(OIDN_ROOT ${CMAKE_SOURCE_DIR}/lib/oidn)
+include_directories(${OIDN_ROOT}/include)
+link_directories(${OIDN_ROOT}/lib)
+message(STATUS "OIDN enabled: ${OIDN_ROOT}")
+
 # PIX for Windows support (DEBUG only)
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     include_directories(${CMAKE_SOURCE_DIR}/lib/WinPixEventRuntime/Include)
@@ -32,7 +38,7 @@ file(GLOB_RECURSE HEADER_FILES
     "include/*.h"
 )
 
-# 生成可执行文件 (WIN32标志隐藏控制台窗口)
+# 生成可执行文件
 add_executable(${PROJECT_NAME} WIN32 ${SRC_FILES} ${HEADER_FILES})
 
 # 查找 vcpkg 安装的依赖包
@@ -62,6 +68,11 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     dxguid.lib     # DirectX GUIDs
 )
 
+# 链接 Intel OIDN 库
+target_link_libraries(${PROJECT_NAME} PRIVATE
+    OpenImageDenoise.lib
+)
+
 # 链接 PIX 调试库 (DEBUG only)
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     target_link_libraries(${PROJECT_NAME} PRIVATE
@@ -79,6 +90,22 @@ if(CMAKE_BUILD_TYPE STREQUAL "Debug")
         COMMENT "Copying WinPixEventRuntime.dll (Debug)"
     )
 endif()
+
+# 复制 OIDN DLL 到输出目录
+set(OIDN_DLLS
+    OpenImageDenoise.dll
+    OpenImageDenoise_core.dll
+    OpenImageDenoise_device_cpu.dll
+    tbb12.dll
+)
+foreach(OIDN_DLL ${OIDN_DLLS})
+    add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        ${OIDN_ROOT}/bin/${OIDN_DLL}
+        ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${OIDN_DLL}
+        COMMENT "Copying ${OIDN_DLL}"
+    )
+endforeach()
 
 # 复制 shader 文件到 bin 目录
 file(GLOB SHADER_FILES "${CMAKE_SOURCE_DIR}/shaders/*.hlsl" "${CMAKE_SOURCE_DIR}/shaders/*.hlsli")

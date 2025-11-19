@@ -3,6 +3,7 @@
 #include "DX12Helper.h"
 #include "Scene.h"
 #include "Camera.h"
+#include "Denoiser.h"
 #include <d3d12.h>
 #include <dxgi1_6.h>
 #include <wrl.h>
@@ -178,5 +179,8 @@ namespace ACG {
         int m_accumulatedSamples = 0;
         float m_environmentLightIntensity = 0.5f;
         std::atomic<bool> m_isRendering;
+        
+        // OIDN降噪器
+        std::unique_ptr<Denoiser> m_denoiser;
     };
 }

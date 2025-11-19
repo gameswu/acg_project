@@ -57,7 +57,13 @@ namespace ACG {
         m_offlineFenceValue(0),
         m_offlineFenceEvent(nullptr),
         m_stopRenderRequested(false)
-    {}
+    {
+        // 初始化OIDN降噪器
+        m_denoiser = std::make_unique<Denoiser>();
+        if (!m_denoiser->Initialize()) {
+            std::cerr << "Warning: Failed to initialize denoiser: " << m_denoiser->GetError() << std::endl;
+        }
+    }
 
     Renderer::~Renderer() {
         OnDestroy();
@@ -636,6 +642,47 @@ namespace ACG {
 
             const float* pixels = static_cast<const float*>(mappedData); // Now reading float data
 
+            // 准备降噪数据
+            std::vector<float> inputImage(m_width * m_height * 3);
+            std::vector<float> denoisedImage(m_width * m_height * 3);
+            float invSamples = 1.0f / static_cast<float>(samplesPerPixel);
+
+            // 从GPU数据复制到输入图像（RGBA -> RGB，并平均采样）
+            std::cout << "Preparing image for denoising..." << std::endl;
+            for (UINT y = 0; y < m_height; ++y) {
+                const float* row = reinterpret_cast<const float*>(
+                    reinterpret_cast<const uint8_t*>(pixels) + y * footprint.Footprint.RowPitch
+                );
+                for (UINT x = 0; x < m_width; ++x) {
+                    const float* pixel = row + x * 4; // RGBA
+                    size_t idx = (y * m_width + x) * 3;
+                    inputImage[idx + 0] = pixel[0] * invSamples; // R
+                    inputImage[idx + 1] = pixel[1] * invSamples; // G
+                    inputImage[idx + 2] = pixel[2] * invSamples; // B
+                }
+            }
+
+            // 执行降噪
+            bool denoised = false;
+            if (m_denoiser && m_denoiser->IsInitialized()) {
+                std::cout << "Denoising image..." << std::endl;
+                denoised = m_denoiser->Denoise(
+                    inputImage.data(),
+                    denoisedImage.data(),
+                    m_width,
+                    m_height
+                );
+                if (!denoised) {
+                    std::cerr << "Denoising failed: " << m_denoiser->GetError() << std::endl;
+                    std::cout << "Saving original (non-denoised) image" << std::endl;
+                }
+            } else {
+                std::cout << "Denoiser not available, saving original image" << std::endl;
+            }
+
+            // 使用降噪后的图像（如果降噪成功）或原始图像
+            const float* finalImage = denoised ? denoisedImage.data() : inputImage.data();
+
             // Write PPM file
             std::cout << "Writing PPM file..." << std::endl;
             std::ofstream file(outputPath, std::ios::binary);
@@ -646,21 +693,13 @@ namespace ACG {
 
             file << "P6\n" << m_width << " " << m_height << "\n255\n";
 
-            // Divide by sample count and convert to 8-bit
-            float invSamples = 1.0f / static_cast<float>(samplesPerPixel);
-            
+            // 将float图像转换为8位并写入
             for (UINT y = 0; y < m_height; ++y) {
-                const float* row = reinterpret_cast<const float*>(
-                    reinterpret_cast<const uint8_t*>(pixels) + y * footprint.Footprint.RowPitch
-                );
                 for (UINT x = 0; x < m_width; ++x) {
-                    // RGBA float format: 4 floats per pixel
-                    const float* pixel = row + x * 4;
-                    
-                    // Average and tone map
-                    float r = pixel[0] * invSamples;
-                    float g = pixel[1] * invSamples;
-                    float b = pixel[2] * invSamples;
+                    size_t idx = (y * m_width + x) * 3;
+                    float r = finalImage[idx + 0];
+                    float g = finalImage[idx + 1];
+                    float b = finalImage[idx + 2];
                     
                     // Clamp and convert to 8-bit
                     uint8_t rgb[3];

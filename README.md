@@ -50,6 +50,7 @@ Details of each requirement can be found in the [project description document](/
 acg_project/
 ├── include/             # Header directory
 │   ├── Camera.h         # Camera system
+│   ├── Denoiser.h       # Denoising using OIDN
 │   ├── DX12Helper.h     # DirectX 12 helper functions
 │   ├── Light.h          # Lighting system (point light, area light, environment light)
 │   ├── LogRedirector.h  # Redirect console output to GUI log panel
@@ -64,6 +65,7 @@ acg_project/
 │
 ├── src/                 # Source files directory
 │   ├── Camera.cpp
+│   ├── Denoiser.cpp
 │   ├── Light.cpp
 │   ├── Material.cpp
 │   ├── MathUtils.cpp
@@ -81,7 +83,9 @@ acg_project/
 │   └── Structures.hlsli # HLSL shader structures
 │
 ├── lib/                 # Third-party libraries
+│   ├── oidn/            # Open Image Denoise library
 │   └── WinPixEventRuntime/ # PIX for Windows library
+│
 ├── docs/                # Documentation directory
 ├── tests/               # Test scenes and scripts
 ├── CMakeLists.txt       # CMake build configuration
@@ -131,6 +135,7 @@ This project requires the following dependencies:
 - A C++17 compatible compiler
 - vcpkg for managing third-party libraries
 - Windows SDK for DirectX libraries
+- [OIDN](https://www.openimagedenoise.org/index.html) (We have offered a pre-compiled binary in the `lib` folder)
 
 For debugging and performance analysis, we use [PIX for Windows](https://devblogs.microsoft.com/pix/).
 
@@ -167,3 +172,5 @@ python tests/download.py
 | sponza | Large scene |
 | lpshead | Head model |
 | hairball | Hair model |
+| fireplace_room | Complex scene |
+| gallery | Gallery scene |
