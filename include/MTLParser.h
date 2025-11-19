@@ -60,6 +60,7 @@ public:
         bool hasKa = false;
         bool hasKs = false;
         bool hasNi = false;
+        bool hasD = false;
         bool hasSharpness = false;
     };
     

@@ -894,8 +894,17 @@ namespace ACG {
 
             // 3. Shader Config
             auto shaderConfig = raytracingPipeline.CreateSubobject<CD3DX12_RAYTRACING_SHADER_CONFIG_SUBOBJECT>();
-            // RadiancePayload: 4x float3 (radiance, throughput, nextOrigin, nextDirection) + 2x uint (rngState, terminated) = 56 bytes
-            UINT payloadSize = 4 * 3 * sizeof(float) + 2 * sizeof(UINT);
+            // RadiancePayload layout in HLSL:
+            //   float3 radiance;      // 12
+            //   float3 throughput;    // 12
+            //   float3 nextOrigin;    // 12
+            //   float3 nextDirection; // 12
+            //   uint   rngState;      // 4
+            //   bool   terminated;    // 4 (HLSL bool is 4 bytes)
+            //   float  iorStack[4];   // 16
+            //   uint   iorStackTop;   // 4
+            // Total = 76 bytes
+            UINT payloadSize = (4 * 3 * sizeof(float)) + (2 * sizeof(UINT)) + (4 * sizeof(float)) + sizeof(UINT);
             UINT attributeSize = 2 * sizeof(float); // BuiltInTriangleIntersectionAttributes: float2 barycentrics
             shaderConfig->Config(payloadSize, attributeSize);
 
