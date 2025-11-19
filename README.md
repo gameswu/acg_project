@@ -157,13 +157,18 @@ To build the project, follow these steps:
 
 ### Running tests
 
-Models downloaded from Morgan McGuire's [Computer Graphics Archive](https://casual-effects.com/data).
+We offer several test scenes located in the `tests` directory. You can load these scenes through the GUI by specifying the model path in the Render Settings section. Using the python script to unzip all test scenes:
+
 ```bash
 python -m venv .venv
 .venv\Scripts\activate # On Windows
 pip install -r requirements.txt
-python tests/download.py
+cd tests
+python download.py
+python unzip.py
 ```
+
+Models downloaded from Morgan McGuire's [Computer Graphics Archive](https://casual-effects.com/data).
 
 | Test Scene | Targeted Feature |
 |------------|------------------|
@@ -176,3 +181,10 @@ python tests/download.py
 | bedroom | Bedroom scene |
 | San_Miguel | Architectural scene |
 | bistro | Final scene |
+
+Models downloaded from [Sketchfab](https://sketchfab.com/).
+
+| Test Scene | Targeted Feature |
+|------------|------------------|
+| cloud | Volumetric rendering |
+| clouds-model-to-blender | Volumetric rendering |
