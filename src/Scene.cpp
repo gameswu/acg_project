@@ -173,11 +173,37 @@ bool Scene::LoadFromFile(const std::string& filename, bool useCustomMTLParser) {
             
             // Create diffuse material with the color
             auto mat = std::make_shared<DiffuseMaterial>(diffuseColor);
+
+            // Attempt to load diffuse texture if present
+            if (aiMat->GetTextureCount(aiTextureType_DIFFUSE) > 0) {
+                aiString texPath;
+                if (aiMat->GetTexture(aiTextureType_DIFFUSE, 0, &texPath) == AI_SUCCESS) {
+                    std::filesystem::path fullPath = directory.empty()
+                        ? std::filesystem::path(texPath.C_Str())
+                        : std::filesystem::path(directory) / texPath.C_Str();
+
+                    if (std::filesystem::exists(fullPath)) {
+                        auto texture = TextureManager::Instance().Load(fullPath.string());
+                        if (texture) {
+                            mat->SetAlbedoTexture(texture);
+                            std::cout << "  Loaded diffuse texture: " << fullPath << std::endl;
+                        } else {
+                            std::cout << "  Failed to load diffuse texture: " << fullPath << std::endl;
+                        }
+                    } else {
+                        std::cout << "  Diffuse texture not found: " << fullPath << std::endl;
+                    }
+                }
+            }
             
             materialMap[materialName] = mat;
             materialOrder.push_back(materialName);
             
-            std::cout << "Material: \"" << materialName << "\" loaded via Assimp (Diffuse)" << std::endl;
+            std::cout << "Material: \"" << materialName << "\" loaded via Assimp (Diffuse";
+            if (mat->GetAlbedoTexture()) {
+                std::cout << "+Texture";
+            }
+            std::cout << ")" << std::endl;
         }
         
         std::cout << "============================================\n" << std::endl;
