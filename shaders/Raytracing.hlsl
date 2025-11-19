@@ -33,6 +33,9 @@ cbuffer SceneConstantBuffer : register(b0)
     uint maxBounces;
     float environmentLightIntensity;
     float _padding;
+    // Sun (directional) parameters
+    float4 sunDirIntensity; // xyz = direction (toward light), w = intensity
+    float4 sunColorEnabled; // rgb = color, a = enabled (0 or 1)
 }
 
 // Raytracing output
@@ -148,6 +151,25 @@ void Miss(inout RadiancePayload payload)
 {
     // Environment light contribution (controlled by GUI)
     payload.radiance += payload.throughput * environmentLightIntensity;
+
+    // Add directional sun contribution for rays that reach infinity.
+    // We evaluate sun radiance along the ray direction; if the ray direction
+    // aligns with the sun direction, add sun contribution. Using intensity>0
+    // as the enable check (sunDirIntensity.w).
+    if (sunDirIntensity.w > 0.0) {
+        float3 rayDir = normalize(WorldRayDirection());
+        float3 sunDir = normalize(sunDirIntensity.xyz);
+        float sunIntensity = sunDirIntensity.w;
+        float3 sunColor = sunColorEnabled.rgb;
+
+        // Alignment between ray direction and sun direction (1 when exactly aligned)
+        float align = max(0.0, dot(rayDir, sunDir));
+        if (align > 0.0) {
+            // Add sun radiance seen along this direction
+            payload.radiance += payload.throughput * sunColor * sunIntensity * align;
+        }
+    }
+
     payload.terminated = true;
 }
 
@@ -221,6 +243,10 @@ void ClosestHit(inout RadiancePayload payload, in BuiltInTriangleIntersectionAtt
         payload.terminated = true;
         return;
     }
+
+    // Sun contribution for surface shading should be handled via explicit visibility
+    // tests or by evaluating environment on miss rays. Per requirement, we DO NOT add
+    // sun contribution here. Sun is applied when a ray reaches infinity (in the Miss shader).
     
     // ========== MTL ILLUMINATION MODEL CLASSIFICATION ==========
     // Get illum model (authoritative material type identifier)

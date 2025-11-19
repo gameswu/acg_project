@@ -122,6 +122,29 @@ EnvironmentLight::EnvironmentLight()
 {
 }
 
+// DirectionalLight implementation
+
+DirectionalLight::DirectionalLight()
+    : Light(LightType::Directional)
+    , m_direction(0.0f, 1.0f, 0.0f)
+{
+}
+
+glm::vec3 DirectionalLight::Sample(const glm::vec3& hitPoint, glm::vec3& lightDir, float& distance, float& pdf) const {
+    // Directional light is at infinity. lightDir points from surface toward the light.
+    lightDir = glm::normalize(m_direction);
+    distance = std::numeric_limits<float>::infinity();
+    pdf = 1.0f; // Delta distribution (handled specially by integrator)
+
+    // Return constant radiance (no attenuation)
+    return m_color * m_intensity;
+}
+
+float DirectionalLight::PDF(const glm::vec3& hitPoint, const glm::vec3& lightDir) const {
+    // Delta-directional light -> PDF is zero except at exact direction; return large value or 0.
+    return 0.0f;
+}
+
 bool EnvironmentLight::LoadHDR(const std::string& filename) {
     std::cout << "Loading HDR environment: " << filename << std::endl;
     

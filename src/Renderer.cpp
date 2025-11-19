@@ -322,8 +322,10 @@ namespace ACG {
             cameraConstants.maxBounces = static_cast<uint32_t>(m_maxBounces);
             cameraConstants.environmentLightIntensity = m_environmentLightIntensity;
             cameraConstants.padding = 0.0f;
+            cameraConstants.sunDirIntensity = glm::vec4(m_sunDirection, m_sunIntensity);
+            cameraConstants.sunColorEnabled = glm::vec4(m_sunColor, m_sunEnabled ? 1.0f : 0.0f);
             
-            // Set root constants (144 bytes = 36 DWORDs)
+            // Set root constants (CameraConstants size in DWORDs)
             renderCommandList->SetComputeRoot32BitConstants(7, sizeof(CameraConstants) / 4, &cameraConstants, 0);
 
             // Dispatch rays with accumulation
@@ -391,6 +393,8 @@ namespace ACG {
                 cameraConstants.maxBounces = static_cast<uint32_t>(maxBounces);
                 cameraConstants.environmentLightIntensity = m_environmentLightIntensity;
                 cameraConstants.padding = 0.0f;
+                cameraConstants.sunDirIntensity = glm::vec4(m_sunDirection, m_sunIntensity);
+                cameraConstants.sunColorEnabled = glm::vec4(m_sunColor, m_sunEnabled ? 1.0f : 0.0f);
                 renderCommandList->SetComputeRoot32BitConstants(7, sizeof(CameraConstants) / 4, &cameraConstants, 0);
                 
                 // PIX: Mark individual sample
@@ -485,6 +489,8 @@ namespace ACG {
                         nextCameraConstants.maxBounces = static_cast<uint32_t>(maxBounces);
                         nextCameraConstants.environmentLightIntensity = m_environmentLightIntensity;
                         nextCameraConstants.padding = 0.0f;
+                        nextCameraConstants.sunDirIntensity = glm::vec4(m_sunDirection, m_sunIntensity);
+                        nextCameraConstants.sunColorEnabled = glm::vec4(m_sunColor, m_sunEnabled ? 1.0f : 0.0f);
                         
                         renderCommandList->SetComputeRoot32BitConstants(7, sizeof(CameraConstants) / 4, &nextCameraConstants, 0);
                         
@@ -1068,6 +1074,23 @@ namespace ACG {
         std::cout << "Root signature created" << std::endl;
         rootParameters[7].InitAsConstants(sizeof(CameraConstants) / 4, 0);
     }
+
+// Sun setter implementations (moved from header for logging)
+void ACG::Renderer::SetSunEnabled(bool enabled) {
+    m_sunEnabled = enabled;
+}
+
+void ACG::Renderer::SetSunDirection(const glm::vec3& dir) {
+    m_sunDirection = glm::normalize(dir);
+}
+
+void ACG::Renderer::SetSunColor(const glm::vec3& color) {
+    m_sunColor = color;
+}
+
+void ACG::Renderer::SetSunIntensity(float intensity) {
+    m_sunIntensity = intensity;
+}
 
     void Renderer::CreateAccelerationStructures(ID3D12GraphicsCommandList4* cmdList) {
         if (!m_dxrSupported) {
