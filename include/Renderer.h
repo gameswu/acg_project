@@ -46,6 +46,10 @@ namespace ACG {
         void SetSamplesPerPixel(int spp) { m_samplesPerPixel = spp; }
         void SetMaxBounces(int bounces) { m_maxBounces = bounces; }
         void SetEnvironmentLightIntensity(float intensity) { m_environmentLightIntensity = intensity; }
+        void SetSunEnabled(bool enabled);
+        void SetSunDirection(const glm::vec3& dir);
+        void SetSunColor(const glm::vec3& color);
+        void SetSunIntensity(float intensity);
         void ResetAccumulation() { m_accumulatedSamples = 0; }
         int GetAccumulatedSamples() const { return m_accumulatedSamples; }
         int GetSamplesPerPixel() const { return m_samplesPerPixel; }
@@ -66,6 +70,9 @@ namespace ACG {
             uint32_t maxBounces;
             float environmentLightIntensity;
             float padding;
+            // Sun parameters packed as vec4 for safe alignment
+            glm::vec4 sunDirIntensity; // xyz = direction (toward light), w = intensity
+            glm::vec4 sunColorEnabled; // rgb = color, a = enabled (0 or 1)
         };
 
         void InitPipeline(HWND hwnd);
@@ -178,6 +185,11 @@ namespace ACG {
         int m_maxBounces = 5;
         int m_accumulatedSamples = 0;
         float m_environmentLightIntensity = 0.5f;
+        // Sun parameters (CPU-side)
+        bool m_sunEnabled = false;
+        glm::vec3 m_sunDirection = glm::vec3(0.0f, 1.0f, 0.0f);
+        glm::vec3 m_sunColor = glm::vec3(1.0f, 1.0f, 1.0f);
+        float m_sunIntensity = 1.0f;
         std::atomic<bool> m_isRendering;
         
         // OIDN降噪器

@@ -407,6 +407,41 @@ void RenderGUI(ACG::Renderer* renderer) {
     if (ImGui::SliderFloat("Environment Light", &envLightIntensity, 0.0f, 10.0f)) {
         renderer->SetEnvironmentLightIntensity(envLightIntensity);
     }
+
+    // Sun (directional) controls
+    static bool sunEnabled = false;
+    if (ImGui::Checkbox("Enable Sun Light", &sunEnabled)) {
+        renderer->SetSunEnabled(sunEnabled);
+        renderer->ResetAccumulation();
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("(Directional sun)");
+
+    static float sunAzimuth = 45.0f;   // degrees, 0..360
+    static float sunElevation = 45.0f; // degrees, -90..90
+    bool sunDirChanged = false;
+    if (ImGui::SliderFloat("Sun Azimuth (deg)", &sunAzimuth, 0.0f, 360.0f)) sunDirChanged = true;
+    if (ImGui::SliderFloat("Sun Elevation (deg)", &sunElevation, -89.9f, 89.9f)) sunDirChanged = true;
+    if (sunDirChanged) {
+        // Convert spherical angles to direction vector (Y-up)
+        float az = glm::radians(sunAzimuth);
+        float el = glm::radians(sunElevation);
+        glm::vec3 dir = glm::vec3(cos(el) * cos(az), sin(el), cos(el) * sin(az));
+        renderer->SetSunDirection(dir);
+        renderer->ResetAccumulation();
+    }
+
+    static float sunIntensity = 1.0f;
+    if (ImGui::SliderFloat("Sun Intensity", &sunIntensity, 0.0f, 20.0f)) {
+        renderer->SetSunIntensity(sunIntensity);
+        renderer->ResetAccumulation();
+    }
+
+    static float sunColor[3] = {1.0f, 1.0f, 1.0f};
+    if (ImGui::ColorEdit3("Sun Color", sunColor)) {
+        renderer->SetSunColor(glm::vec3(sunColor[0], sunColor[1], sunColor[2]));
+        renderer->ResetAccumulation();
+    }
     
     ImGui::Separator();
     ImGui::Text("Scene");

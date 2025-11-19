@@ -106,4 +106,24 @@ private:
     void BuildCDF();
 };
 
+/**
+ * @brief Directional (sun) light - distant directional source
+ *
+ * Industry practice: treat as a delta-direction light (no attenuation with distance).
+ * The renderer / shaders can sample it as a constant direction and intensity.
+ */
+class DirectionalLight : public Light {
+public:
+    DirectionalLight();
+
+    void SetDirection(const glm::vec3& dir) { m_direction = glm::normalize(dir); }
+    glm::vec3 GetDirection() const { return m_direction; }
+
+    virtual glm::vec3 Sample(const glm::vec3& hitPoint, glm::vec3& lightDir, float& distance, float& pdf) const override;
+    virtual float PDF(const glm::vec3& hitPoint, const glm::vec3& lightDir) const override;
+
+private:
+    glm::vec3 m_direction; // direction from surface point towards the light (normalized)
+};
+
 } // namespace ACG
