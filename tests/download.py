@@ -81,9 +81,15 @@ if __name__ == "__main__":
         "https://casual-effects.com/g3d/data10/research/model/breakfast_room/breakfast_room.zip", # Texture test
         "https://casual-effects.com/g3d/data10/common/model/crytek_sponza/sponza.zip", # Large scene
         "https://casual-effects.com/g3d/data10/research/model/lpshead/lpshead.zip", # Head model
-        "https://casual-effects.com/g3d/data10/research/model/hairball/hairball.zip", # Hair model
         "https://casual-effects.com/g3d/data10/research/model/fireplace_room/fireplace_room.zip", # Complex scene
         "https://casual-effects.com/g3d/data10/research/model/gallery/gallery.zip", # Gallery scene
+        "https://casual-effects.com/g3d/data10/research/model/bedroom/bedroom.zip", # Bedroom scene
+        "https://casual-effects.com/g3d/data10/research/model/San_Miguel/San_Miguel.zip", # San Miguel scene
+        "https://casual-effects.com/g3d/data10/research/model/bistro/Exterior.zip", # Final scene
+        "https://casual-effects.com/g3d/data10/research/model/bistro/PropTextures",
+        "https://casual-effects.com/g3d/data10/research/model/bistro/Interior.zip",
+        "https://casual-effects.com/g3d/data10/research/model/bistro/BuildingTextures",
+        "https://casual-effects.com/g3d/data10/research/model/bistro/OtherTextures"
     ]
     dest_folder = "tests/scenes"
 
@@ -92,9 +98,15 @@ if __name__ == "__main__":
         Path(dest_folder) / "breakfast_room",
         Path(dest_folder) / "sponza",
         Path(dest_folder) / "lpshead",
-        Path(dest_folder) / "hairball",
         Path(dest_folder) / "fireplace_room",
-        Path(dest_folder) / "gallery"
+        Path(dest_folder) / "gallery",
+        Path(dest_folder) / "bedroom",
+        Path(dest_folder) / "San_Miguel",
+        Path(dest_folder) / "bistro" / "Exterior",
+        Path(dest_folder) / "bistro" / "PropTextures",
+        Path(dest_folder) / "bistro" / "Interior",
+        Path(dest_folder) / "bistro" / "BuildingTextures",
+        Path(dest_folder) / "bistro" / "OtherTextures"
     ]
     for url, extract_path in zip(urls, extract_paths):
         try:
