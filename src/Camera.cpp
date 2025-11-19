@@ -127,10 +127,23 @@ void Camera::Move(const glm::vec3& offset) {
 }
 
 void Camera::UpdateVectors() {
-    // Standard right-hand coordinate system for Cornell Box
-    // Ensure Up is (0,1,0) to match scene Y-up convention
-    glm::vec3 worldUp(0.0f, 1.0f, 0.0f);
-    m_right = glm::normalize(glm::cross(m_direction, worldUp));
+    // Preserve user-specified up vector when possible to allow roll control
+    glm::vec3 desiredUp = glm::length(m_up) > 0.0f ? glm::normalize(m_up) : glm::vec3(0.0f, 1.0f, 0.0f);
+
+    // If desired up is nearly parallel to direction, choose an alternate basis to avoid degeneracy
+    if (glm::abs(glm::dot(desiredUp, m_direction)) > 0.999f) {
+        desiredUp = std::abs(m_direction.y) < 0.99f ? glm::vec3(0.0f, 1.0f, 0.0f) : glm::vec3(1.0f, 0.0f, 0.0f);
+    }
+
+    glm::vec3 right = glm::cross(m_direction, desiredUp);
+    float rightLen = glm::length(right);
+    if (rightLen < 1e-6f) {
+        // Fallback if direction and desired up were still nearly parallel
+        desiredUp = glm::vec3(0.0f, 1.0f, 0.0f);
+        right = glm::cross(m_direction, desiredUp);
+        rightLen = glm::length(right);
+    }
+    m_right = glm::normalize(right);
     m_up = glm::normalize(glm::cross(m_right, m_direction));
 }
 

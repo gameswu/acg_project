@@ -30,6 +30,12 @@ struct GUIState {
     float sunAzimuth = 45.0f;
     float sunElevation = 45.0f;
     float sunColor[3] = {1.0f, 1.0f, 1.0f};
+    // Camera orbit controls (azimuth/elevation/distance)
+    float cameraAzimuth = 45.0f;    // degrees
+    float cameraElevation = 0.0f;   // degrees
+    float cameraDistance = 3.0f;    // distance from target
+    bool cameraAnglesInitialized = false;
+    float cameraUpAngle = 0.0f; // roll angle in degrees (rotation around camera forward)
     
     // Internal state
     std::string renderStatus = "";
@@ -58,7 +64,7 @@ std::string SaveFileDialog(HWND hwnd, const char* filter, const char* title);
 // Individual window rendering functions
 void RenderSettingsWindow(ACG::Renderer* renderer, GUIState& state, HWND hwnd);
 void RenderControlsWindow(ACG::Renderer* renderer, GUIState& state);
-void RenderCameraWindow(ACG::Renderer* renderer);
+void RenderCameraWindow(ACG::Renderer* renderer, GUIState& state);
 void RenderStatisticsWindow(ACG::Renderer* renderer, GUIState& state);
 void RenderLogWindow(const std::vector<std::string>& logMessages);
 

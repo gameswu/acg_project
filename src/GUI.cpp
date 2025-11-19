@@ -1,4 +1,5 @@
 #include "GUI.h"
+#define GLM_ENABLE_EXPERIMENTAL
 #include "Renderer.h"
 #include "Camera.h"
 #include "Scene.h"
@@ -8,8 +9,11 @@
 #include <atomic>
 #include <mutex>
 #include <iostream>
+#include <cmath>
 #include <chrono>
 #include <glm/glm.hpp>
+#include <glm/gtc/constants.hpp>
+#include <glm/gtx/rotate_vector.hpp>
 
 namespace GUI {
 
@@ -396,11 +400,81 @@ void RenderControlsWindow(ACG::Renderer* renderer, GUIState& state) {
     ImGui::End();
 }
 
-void RenderCameraWindow(ACG::Renderer* renderer) {
+void RenderCameraWindow(ACG::Renderer* renderer, GUIState& state) {
     ImGui::Begin("Camera Settings");
         
     ACG::Camera* camera = renderer->GetCamera();
     if (camera) {
+        // Initialize camera orbit angles from current camera once
+        if (!state.cameraAnglesInitialized) {
+            glm::vec3 pos = camera->GetPosition();
+            glm::vec3 target = camera->GetTarget();
+            glm::vec3 dir = glm::normalize(target - pos);
+            // Azimuth: atan2(z, x), Elevation: asin(y)
+            state.cameraAzimuth = std::atan2(dir.z, dir.x) * 180.0f / glm::pi<float>();
+            state.cameraElevation = std::asin(glm::clamp(dir.y, -1.0f, 1.0f)) * 180.0f / glm::pi<float>();
+            state.cameraDistance = glm::length(target - pos);
+            // Initialize roll (up angle) relative to local up
+            glm::vec3 worldUp(0.0f, 1.0f, 0.0f);
+            glm::vec3 camUp = camera->GetUp();
+            glm::vec3 right = glm::normalize(glm::cross(dir, worldUp));
+            glm::vec3 localUp = glm::normalize(glm::cross(right, dir));
+            float a = glm::dot(localUp, camUp);
+            float b = glm::dot(right, camUp);
+            state.cameraUpAngle = std::atan2(b, a) * 180.0f / glm::pi<float>();
+            state.cameraAnglesInitialized = true;
+        }
+
+        ImGui::Text("Angle Controls (rotate camera orientation)");
+        bool orbitChanged = false;
+        if (ImGui::SliderFloat("Azimuth (deg)", &state.cameraAzimuth, 0.0f, 360.0f)) orbitChanged = true;
+        if (ImGui::SliderFloat("Elevation (deg)", &state.cameraElevation, -89.9f, 89.9f)) orbitChanged = true;
+        ImGui::TextDisabled("(Rotate camera about its own position: change orientation only)");
+        if (orbitChanged) {
+            // Convert spherical angles to world-space direction (Y-up)
+            float az = state.cameraAzimuth * glm::pi<float>() / 180.0f;
+            float el = state.cameraElevation * glm::pi<float>() / 180.0f;
+            glm::vec3 dir = glm::vec3(std::cos(el) * std::cos(az), std::sin(el), std::cos(el) * std::sin(az));
+            glm::vec3 pos = camera->GetPosition();
+            glm::vec3 target = pos + dir * state.cameraDistance; // target positioned in front of camera (internal fixed distance)
+            camera->SetTarget(target);
+            // Recompute up from roll angle using worldUp projection, rotate and orthonormalize
+            glm::vec3 worldUp(0.0f, 1.0f, 0.0f);
+            // Project worldUp onto plane perpendicular to dir to get a stable base up
+            glm::vec3 baseUp = worldUp - glm::dot(worldUp, dir) * dir;
+            if (glm::dot(baseUp, baseUp) < 1e-6f) {
+                // dir is nearly parallel to worldUp; pick an arbitrary perpendicular
+                baseUp = glm::vec3(1.0f, 0.0f, 0.0f);
+            }
+            baseUp = glm::normalize(baseUp);
+            float rollRad = state.cameraUpAngle * glm::pi<float>() / 180.0f;
+            glm::vec3 rolledUpCandidate = glm::rotate(baseUp, rollRad, dir);
+            // Orthonormalize: right, up
+            glm::vec3 right = glm::normalize(glm::cross(dir, rolledUpCandidate));
+            glm::vec3 up = glm::normalize(glm::cross(right, dir));
+            camera->SetUp(up);
+            renderer->ResetAccumulation();
+        }
+
+        // Up angle control (roll)
+        ImGui::Separator();
+        ImGui::Text("Up Vector Angle (Roll)");
+        if (ImGui::SliderFloat("Up Angle (deg)", &state.cameraUpAngle, -180.0f, 180.0f)) {
+            // Apply roll to current direction using same robust method as above
+            glm::vec3 pos = camera->GetPosition();
+            glm::vec3 dir = glm::normalize(camera->GetTarget() - pos);
+            glm::vec3 worldUp(0.0f, 1.0f, 0.0f);
+            glm::vec3 baseUp = worldUp - glm::dot(worldUp, dir) * dir;
+            if (glm::dot(baseUp, baseUp) < 1e-6f) baseUp = glm::vec3(1.0f, 0.0f, 0.0f);
+            baseUp = glm::normalize(baseUp);
+            float rollRad = state.cameraUpAngle * glm::pi<float>() / 180.0f;
+            glm::vec3 rolledUpCandidate = glm::rotate(baseUp, rollRad, dir);
+            glm::vec3 right = glm::normalize(glm::cross(dir, rolledUpCandidate));
+            glm::vec3 up = glm::normalize(glm::cross(right, dir));
+            camera->SetUp(up);
+            renderer->ResetAccumulation();
+        }
+
         ImGui::Text("Camera Position");
         glm::vec3 pos = camera->GetPosition();
         if (ImGui::InputFloat("X##Pos", &pos.x, 0.1f, 1.0f, "%.2f")) {
@@ -415,37 +489,7 @@ void RenderCameraWindow(ACG::Renderer* renderer) {
         ImGui::SameLine();
         ImGui::Text("Position");
         
-        ImGui::Separator();
-        ImGui::Text("Camera Target");
-        glm::vec3 target = camera->GetTarget();
-        if (ImGui::InputFloat("X##Target", &target.x, 0.1f, 1.0f, "%.2f")) {
-            camera->SetTarget(target);
-        }
-        if (ImGui::InputFloat("Y##Target", &target.y, 0.1f, 1.0f, "%.2f")) {
-            camera->SetTarget(target);
-        }
-        if (ImGui::InputFloat("Z##Target", &target.z, 0.1f, 1.0f, "%.2f")) {
-            camera->SetTarget(target);
-        }
-        ImGui::SameLine();
-        ImGui::Text("Target");
         
-        ImGui::Separator();
-        ImGui::Text("Camera Up Vector");
-        glm::vec3 up = camera->GetUp();
-        if (ImGui::InputFloat("X##Up", &up.x, 0.01f, 0.1f, "%.3f")) {
-            camera->SetUp(up);
-        }
-        if (ImGui::InputFloat("Y##Up", &up.y, 0.01f, 0.1f, "%.3f")) {
-            camera->SetUp(up);
-        }
-        if (ImGui::InputFloat("Z##Up", &up.z, 0.01f, 0.1f, "%.3f")) {
-            camera->SetUp(up);
-        }
-        ImGui::SameLine();
-        ImGui::Text("Up");
-        
-        ImGui::Separator();
         ImGui::Text("Field of View");
         float fov = camera->GetFOV();
         if (ImGui::InputFloat("FOV (deg)", &fov, 1.0f, 10.0f, "%.1f")) {
@@ -558,7 +602,7 @@ void RenderGUI(ACG::Renderer* renderer, GUIState& state, HWND hwnd) {
     
     RenderSettingsWindow(renderer, state, hwnd);
     RenderControlsWindow(renderer, state);
-    RenderCameraWindow(renderer);
+    RenderCameraWindow(renderer, state);
     RenderStatisticsWindow(renderer, state);
     
     if (state.pLogMessages) {
