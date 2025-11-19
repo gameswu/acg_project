@@ -41,12 +41,12 @@ namespace ACG {
         void LoadScene(const std::string& path);
         void LoadSceneAsync(const std::string& path); // Async version using independent command resources
         void RenderToFile(const std::string& outputPath, int samplesPerPixel, int maxBounces);
+        void SetEnvironmentMap(const std::string& path);  // Load HDR/EXR environment map
         
         // GUI控制方法
         void SetSamplesPerPixel(int spp) { m_samplesPerPixel = spp; }
         void SetMaxBounces(int bounces) { m_maxBounces = bounces; }
         void SetEnvironmentLightIntensity(float intensity) { m_environmentLightIntensity = intensity; }
-        void SetSunEnabled(bool enabled);
         void SetSunDirection(const glm::vec3& dir);
         void SetSunColor(const glm::vec3& color);
         void SetSunIntensity(float intensity);
@@ -86,6 +86,7 @@ namespace ACG {
         void CreateShaderResources(ID3D12GraphicsCommandList4* cmdList);
         void CreateShaderBindingTable();
         void UploadTexturesToGPU(ID3D12GraphicsCommandList4* cmdList, const std::vector<std::shared_ptr<Texture>>& textures);
+        void UploadEnvironmentMap(ID3D12GraphicsCommandList4* cmdList, const std::shared_ptr<Texture>& envMap);
         
         void CheckRaytracingSupport();
         Microsoft::WRL::ComPtr<IDxcBlob> CompileShader(const std::wstring& filename);
@@ -150,6 +151,7 @@ namespace ACG {
         Microsoft::WRL::ComPtr<ID3D12Resource> m_materialBuffer;
         Microsoft::WRL::ComPtr<ID3D12Resource> m_triangleMaterialBuffer; // Material index per triangle
         Microsoft::WRL::ComPtr<ID3D12Resource> m_textureAtlas;
+        Microsoft::WRL::ComPtr<ID3D12Resource> m_environmentMap;  // HDR environment map
 
         // Descriptor indices in the shader-visible heap
         UINT m_srvUavDescriptorSize;
@@ -185,11 +187,10 @@ namespace ACG {
         int m_maxBounces = 5;
         int m_accumulatedSamples = 0;
         float m_environmentLightIntensity = 0.5f;
-        // Sun parameters (CPU-side)
-        bool m_sunEnabled = false;
+        // Sun parameters (CPU-side, controlled via intensity)
         glm::vec3 m_sunDirection = glm::vec3(0.0f, 1.0f, 0.0f);
         glm::vec3 m_sunColor = glm::vec3(1.0f, 1.0f, 1.0f);
-        float m_sunIntensity = 1.0f;
+        float m_sunIntensity = 0.0f;  // 0 = disabled
         std::atomic<bool> m_isRendering;
         
         // OIDN降噪器

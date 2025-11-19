@@ -187,4 +187,9 @@ Models downloaded from [Sketchfab](https://sketchfab.com/).
 | Test Scene | Targeted Feature |
 |------------|------------------|
 | cloud | Volumetric rendering |
-| clouds-model-to-blender | Volumetric rendering |
+
+The skybox downloaded from [HDRI Haven](https://hdrihaven.com/).
+
+## License
+
+[MIT License](LICENSE)

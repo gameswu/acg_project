@@ -77,6 +77,7 @@ bool g_ImGuiInitialized = false;
 
 // Scene loading tracking
 std::string g_lastLoadedScene;
+std::string g_lastLoadedEnvMap;
 
 // 日志系统
 std::vector<std::string> g_logMessages;
@@ -347,6 +348,7 @@ void RenderGUI(ACG::Renderer* renderer) {
     static int maxBounces = 5;
     static char modelPath[512] = "";
     static char outputPath[512] = "";
+    static char envMapPath[512] = "";
     static std::string renderStatus = "";
     static bool showRenderStatus = false;
     static std::chrono::steady_clock::time_point renderStartTime;
@@ -403,44 +405,64 @@ void RenderGUI(ACG::Renderer* renderer) {
     
     ImGui::Separator();
     ImGui::Text("Lighting");
-    static float envLightIntensity = 0.50f;
-    if (ImGui::SliderFloat("Environment Light", &envLightIntensity, 0.0f, 10.0f)) {
-        renderer->SetEnvironmentLightIntensity(envLightIntensity);
+    
+    // Environment Light Section
+    if (ImGui::TreeNode("Environment Light")) {
+        ImGui::TextDisabled("(HDR/EXR skybox for indirect lighting)");
+        
+        ImGui::InputText("Environment Map", envMapPath, sizeof(envMapPath));
+        ImGui::SameLine();
+        if (ImGui::Button("Browse##EnvMap")) {
+            std::string path = OpenFileDialog(g_hwnd, 
+                "HDR/EXR Images\0*.hdr;*.exr\0All Files\0*.*\0\0",
+                "Select Environment Map");
+            if (!path.empty()) {
+                strncpy_s(envMapPath, path.c_str(), sizeof(envMapPath) - 1);
+            }
+        }
+        ImGui::TextDisabled("(Will be loaded automatically on Start Render)");
+        
+        static float envLightIntensity = 0.50f;
+        if (ImGui::SliderFloat("Intensity##EnvLight", &envLightIntensity, 0.0f, 10.0f)) {
+            renderer->SetEnvironmentLightIntensity(envLightIntensity);
+        }
+        ImGui::TextDisabled("(Multiplier for environment map brightness)");
+        
+        ImGui::TreePop();
     }
-
-    // Sun (directional) controls
-    static bool sunEnabled = false;
-    if (ImGui::Checkbox("Enable Sun Light", &sunEnabled)) {
-        renderer->SetSunEnabled(sunEnabled);
-        renderer->ResetAccumulation();
-    }
-    ImGui::SameLine();
-    ImGui::TextDisabled("(Directional sun)");
-
-    static float sunAzimuth = 45.0f;   // degrees, 0..360
-    static float sunElevation = 45.0f; // degrees, -90..90
-    bool sunDirChanged = false;
-    if (ImGui::SliderFloat("Sun Azimuth (deg)", &sunAzimuth, 0.0f, 360.0f)) sunDirChanged = true;
-    if (ImGui::SliderFloat("Sun Elevation (deg)", &sunElevation, -89.9f, 89.9f)) sunDirChanged = true;
-    if (sunDirChanged) {
-        // Convert spherical angles to direction vector (Y-up)
-        float az = glm::radians(sunAzimuth);
-        float el = glm::radians(sunElevation);
-        glm::vec3 dir = glm::vec3(cos(el) * cos(az), sin(el), cos(el) * sin(az));
-        renderer->SetSunDirection(dir);
-        renderer->ResetAccumulation();
-    }
-
-    static float sunIntensity = 1.0f;
-    if (ImGui::SliderFloat("Sun Intensity", &sunIntensity, 0.0f, 20.0f)) {
-        renderer->SetSunIntensity(sunIntensity);
-        renderer->ResetAccumulation();
-    }
-
-    static float sunColor[3] = {1.0f, 1.0f, 1.0f};
-    if (ImGui::ColorEdit3("Sun Color", sunColor)) {
-        renderer->SetSunColor(glm::vec3(sunColor[0], sunColor[1], sunColor[2]));
-        renderer->ResetAccumulation();
+    
+    // Directional Sun Light Section
+    if (ImGui::TreeNode("Directional Sun Light")) {
+        ImGui::TextDisabled("(Distant directional light source)");
+        
+        static float sunIntensity = 0.0f;  // Default disabled
+        if (ImGui::SliderFloat("Intensity##SunLight", &sunIntensity, 0.0f, 20.0f)) {
+            renderer->SetSunIntensity(sunIntensity);
+            renderer->ResetAccumulation();
+        }
+        ImGui::TextDisabled("(Set to 0 to disable sun light)");
+        
+        static float sunAzimuth = 45.0f;   // degrees, 0..360
+        static float sunElevation = 45.0f; // degrees, -90..90
+        bool sunDirChanged = false;
+        if (ImGui::SliderFloat("Azimuth (deg)", &sunAzimuth, 0.0f, 360.0f)) sunDirChanged = true;
+        if (ImGui::SliderFloat("Elevation (deg)", &sunElevation, -89.9f, 89.9f)) sunDirChanged = true;
+        if (sunDirChanged) {
+            // Convert spherical angles to direction vector (Y-up)
+            float az = glm::radians(sunAzimuth);
+            float el = glm::radians(sunElevation);
+            glm::vec3 dir = glm::vec3(cos(el) * cos(az), sin(el), cos(el) * sin(az));
+            renderer->SetSunDirection(dir);
+            renderer->ResetAccumulation();
+        }
+        
+        static float sunColor[3] = {1.0f, 1.0f, 1.0f};
+        if (ImGui::ColorEdit3("Color##SunLight", sunColor)) {
+            renderer->SetSunColor(glm::vec3(sunColor[0], sunColor[1], sunColor[2]));
+            renderer->ResetAccumulation();
+        }
+        
+        ImGui::TreePop();
     }
     
     ImGui::Separator();
@@ -501,6 +523,7 @@ void RenderGUI(ACG::Renderer* renderer) {
             // Copy parameters
             std::string modelPathStr = modelPath;
             std::string outputPathStr = outputPath;
+            std::string envMapPathStr = envMapPath;
             int samples = samplesPerPixel;
             int bounces = maxBounces;
             int renderWidth = width;
@@ -522,11 +545,12 @@ void RenderGUI(ACG::Renderer* renderer) {
             
             // Check if scene needs to be loaded
             bool needsSceneLoad = (g_lastLoadedScene != modelPathStr);
+            bool needsEnvMapLoad = (!envMapPathStr.empty() && g_lastLoadedEnvMap != envMapPathStr);
             
             // Record start time
             renderStartTime = std::chrono::steady_clock::now();
             
-            g_renderThread = std::make_unique<std::thread>([renderer, modelPathStr, outputPathStr, samples, bounces, renderWidth, renderHeight, needsSceneLoad]() {
+            g_renderThread = std::make_unique<std::thread>([renderer, modelPathStr, outputPathStr, envMapPathStr, samples, bounces, renderWidth, renderHeight, needsSceneLoad, needsEnvMapLoad]() {
                 try {
                     // Set rendering flags at the start
                     g_isRendering.store(true);
@@ -542,6 +566,21 @@ void RenderGUI(ACG::Renderer* renderer) {
                     } else {
                         std::cout << "[Async] Using already loaded scene" << std::endl;
                         std::cout.flush();
+                    }
+                    
+                    // Load environment map if specified and changed
+                    if (needsEnvMapLoad) {
+                        std::cout << "[Async] Loading environment map: " << envMapPathStr << std::endl;
+                        std::cout.flush();
+                        try {
+                            renderer->SetEnvironmentMap(envMapPathStr);
+                            g_lastLoadedEnvMap = envMapPathStr;
+                            std::cout << "[Async] Environment map loaded successfully" << std::endl;
+                        } catch (const std::exception& e) {
+                            std::cerr << "[Async] Failed to load environment map: " << e.what() << std::endl;
+                        }
+                    } else if (!envMapPathStr.empty()) {
+                        std::cout << "[Async] Using already loaded environment map" << std::endl;
                     }
                     
                     std::cout << "[Async] Starting render..." << std::endl;

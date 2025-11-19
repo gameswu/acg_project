@@ -10,6 +10,9 @@
     "stb",
     "assimp",
     "nlohmann-json",
-    "d3dx12"
+    "d3dx12",
+    "openexr",
+    "tinyexr",
+    "miniz"
   ]
 }

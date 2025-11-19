@@ -47,6 +47,9 @@ find_package(imgui CONFIG REQUIRED)
 find_package(Stb REQUIRED)
 find_package(assimp CONFIG REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
+find_package(OpenEXR CONFIG REQUIRED)
+find_package(tinyexr CONFIG REQUIRED)
+find_package(miniz CONFIG REQUIRED)
 
 # 将依赖库链接到您的可执行文件
 target_link_libraries(${PROJECT_NAME} PRIVATE 
@@ -54,6 +57,9 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     imgui::imgui
     assimp::assimp
     nlohmann_json::nlohmann_json
+    OpenEXR::OpenEXR
+    unofficial::tinyexr::tinyexr
+    miniz::miniz
 )
 
 # stb 是仅头文件库，只需要包含目录

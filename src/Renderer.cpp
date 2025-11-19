@@ -292,8 +292,13 @@ namespace ACG {
             D3D12_GPU_DESCRIPTOR_HANDLE texturesHandle = m_srvUavHeap->GetGPUDescriptorHandleForHeapStart();
             texturesHandle.ptr += 5 * m_srvUavDescriptorSize; // slot 5 reserved for textures
             renderCommandList->SetComputeRootDescriptorTable(6, texturesHandle);
+            
+            // Root parameter 7: Environment map SRV table (bind to descriptor slot 6)
+            D3D12_GPU_DESCRIPTOR_HANDLE envMapHandle = m_srvUavHeap->GetGPUDescriptorHandleForHeapStart();
+            envMapHandle.ptr += 6 * m_srvUavDescriptorSize; // slot 6 for environment map
+            renderCommandList->SetComputeRootDescriptorTable(7, envMapHandle);
 
-            // Root parameter 7: Camera constants (32-bit constants)
+            // Root parameter 8: Camera constants (32-bit constants)
             // Compute camera matrices
             glm::vec3 pos = m_camera.GetPosition();
             glm::vec3 dir = m_camera.GetDirection();
@@ -323,10 +328,10 @@ namespace ACG {
             cameraConstants.environmentLightIntensity = m_environmentLightIntensity;
             cameraConstants.padding = 0.0f;
             cameraConstants.sunDirIntensity = glm::vec4(m_sunDirection, m_sunIntensity);
-            cameraConstants.sunColorEnabled = glm::vec4(m_sunColor, m_sunEnabled ? 1.0f : 0.0f);
+            cameraConstants.sunColorEnabled = glm::vec4(m_sunColor, 1.0f);  // Always 1.0, controlled by intensityolled by intensity
             
             // Set root constants (CameraConstants size in DWORDs)
-            renderCommandList->SetComputeRoot32BitConstants(7, sizeof(CameraConstants) / 4, &cameraConstants, 0);
+            renderCommandList->SetComputeRoot32BitConstants(8, sizeof(CameraConstants) / 4, &cameraConstants, 0);
 
             // Dispatch rays with accumulation
             D3D12_DISPATCH_RAYS_DESC dispatchDesc = {};
@@ -394,8 +399,8 @@ namespace ACG {
                 cameraConstants.environmentLightIntensity = m_environmentLightIntensity;
                 cameraConstants.padding = 0.0f;
                 cameraConstants.sunDirIntensity = glm::vec4(m_sunDirection, m_sunIntensity);
-                cameraConstants.sunColorEnabled = glm::vec4(m_sunColor, m_sunEnabled ? 1.0f : 0.0f);
-                renderCommandList->SetComputeRoot32BitConstants(7, sizeof(CameraConstants) / 4, &cameraConstants, 0);
+                cameraConstants.sunColorEnabled = glm::vec4(m_sunColor, 1.0f);  // Always 1.0, controlled by intensity
+                renderCommandList->SetComputeRoot32BitConstants(8, sizeof(CameraConstants) / 4, &cameraConstants, 0);
                 
                 // PIX: Mark individual sample
                 PIXBeginEvent(renderCommandList.Get(), PIX_COLOR_INDEX(2), "Sample %d", sampleIdx + 1);
@@ -480,7 +485,12 @@ namespace ACG {
                         texturesHandle.ptr += 5 * m_srvUavDescriptorSize; // slot 5 reserved for textures
                         renderCommandList->SetComputeRootDescriptorTable(6, texturesHandle);
                         
-                        // Root parameter 7: Camera constants (need to update frameIndex for next batch)
+                        // Root parameter 7: Environment map SRV table (bind to descriptor slot 6)
+                        D3D12_GPU_DESCRIPTOR_HANDLE envMapHandle = m_srvUavHeap->GetGPUDescriptorHandleForHeapStart();
+                        envMapHandle.ptr += 6 * m_srvUavDescriptorSize; // slot 6 for environment map
+                        renderCommandList->SetComputeRootDescriptorTable(7, envMapHandle);
+                        
+                        // Root parameter 8: Camera constants (need to update frameIndex for next batch)
                         // Note: Next batch starts at sampleIdx + 1
                         CameraConstants nextCameraConstants;
                         nextCameraConstants.viewInverse = cameraToWorld;
@@ -490,9 +500,9 @@ namespace ACG {
                         nextCameraConstants.environmentLightIntensity = m_environmentLightIntensity;
                         nextCameraConstants.padding = 0.0f;
                         nextCameraConstants.sunDirIntensity = glm::vec4(m_sunDirection, m_sunIntensity);
-                        nextCameraConstants.sunColorEnabled = glm::vec4(m_sunColor, m_sunEnabled ? 1.0f : 0.0f);
+                        nextCameraConstants.sunColorEnabled = glm::vec4(m_sunColor, 1.0f);  // Always 1.0, controlled by intensity
                         
-                        renderCommandList->SetComputeRoot32BitConstants(7, sizeof(CameraConstants) / 4, &nextCameraConstants, 0);
+                        renderCommandList->SetComputeRoot32BitConstants(8, sizeof(CameraConstants) / 4, &nextCameraConstants, 0);
                         
                         PIXBeginEvent(renderCommandList.Get(), PIX_COLOR_INDEX(1), "Path Tracing Loop");
                     }
@@ -835,7 +845,7 @@ namespace ACG {
 
         // Create SRV/UAV heap for DXR (raytracing resources)
         D3D12_DESCRIPTOR_HEAP_DESC srvUavHeapDesc = {};
-        srvUavHeapDesc.NumDescriptors = 11; // UAV(output) + SRV(TLAS, vertices, indices, triangleMaterials, materials, textures)
+        srvUavHeapDesc.NumDescriptors = 12; // UAV(output) + SRV(TLAS, vertices, indices, triangleMaterials, materials, textures, environment map)
         srvUavHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
         srvUavHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         ThrowIfFailed(m_device->CreateDescriptorHeap(&srvUavHeapDesc, IID_PPV_ARGS(&m_srvUavHeap)));
@@ -1036,7 +1046,7 @@ namespace ACG {
 
     void Renderer::CreateRaytracingRootSignature() {
         // Create a root signature with global resources
-        CD3DX12_DESCRIPTOR_RANGE1 ranges[7];
+        CD3DX12_DESCRIPTOR_RANGE1 ranges[8];
         ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0); // u0: output texture
         ranges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0); // t0: acceleration structure
         ranges[2].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1, 0); // t1 space0: vertices
@@ -1044,11 +1054,12 @@ namespace ACG {
         ranges[4].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1, 2); // t1 space2: triangle material indices
         ranges[5].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 2); // t2: materials
         ranges[6].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 3); // t3: textures
+        ranges[7].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 4); // t4: environment map
 
         // Static sampler for texture sampling
         CD3DX12_STATIC_SAMPLER_DESC samplerDesc(0, D3D12_FILTER_MIN_MAG_MIP_LINEAR);
 
-        CD3DX12_ROOT_PARAMETER1 rootParameters[8];
+        CD3DX12_ROOT_PARAMETER1 rootParameters[9];
         rootParameters[0].InitAsDescriptorTable(1, &ranges[0]); // Output UAV
         rootParameters[1].InitAsShaderResourceView(0); // Acceleration structure (SRV)
         rootParameters[2].InitAsDescriptorTable(1, &ranges[2]); // Vertices (t1, space0)
@@ -1056,8 +1067,9 @@ namespace ACG {
         rootParameters[4].InitAsDescriptorTable(1, &ranges[4]); // Triangle material indices (t1, space2)
         rootParameters[5].InitAsShaderResourceView(2); // Materials (t2) - ROOT DESCRIPTOR
         rootParameters[6].InitAsDescriptorTable(1, &ranges[6]); // Textures (t3)
+        rootParameters[7].InitAsDescriptorTable(1, &ranges[7]); // Environment map (t4)
         // Scene constants (b0): view and projection matrices
-        rootParameters[7].InitAsConstants(sizeof(CameraConstants) / 4, 0);
+        rootParameters[8].InitAsConstants(sizeof(CameraConstants) / 4, 0);
 
         CD3DX12_VERSIONED_ROOT_SIGNATURE_DESC rootSignatureDesc;
         rootSignatureDesc.Init_1_1(_countof(rootParameters), rootParameters, 1, &samplerDesc,
@@ -1072,14 +1084,9 @@ namespace ACG {
             "Failed to create root signature");
             
         std::cout << "Root signature created" << std::endl;
-        rootParameters[7].InitAsConstants(sizeof(CameraConstants) / 4, 0);
     }
 
 // Sun setter implementations (moved from header for logging)
-void ACG::Renderer::SetSunEnabled(bool enabled) {
-    m_sunEnabled = enabled;
-}
-
 void ACG::Renderer::SetSunDirection(const glm::vec3& dir) {
     m_sunDirection = glm::normalize(dir);
 }
@@ -1582,6 +1589,81 @@ void ACG::Renderer::SetSunIntensity(float intensity) {
         // Transition output texture to UAV state
         cmdList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(m_outputTexture.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
 
+        // Create default environment map if none exists (black 1x1 texture)
+        if (!m_environmentMap) {
+            std::cout << "Creating default environment map (black 1x1)..." << std::endl;
+            
+            D3D12_RESOURCE_DESC envTexDesc = {};
+            envTexDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            envTexDesc.Width = 1;
+            envTexDesc.Height = 1;
+            envTexDesc.DepthOrArraySize = 1;
+            envTexDesc.MipLevels = 1;
+            envTexDesc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+            envTexDesc.SampleDesc.Count = 1;
+            envTexDesc.SampleDesc.Quality = 0;
+            envTexDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+            envTexDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+            
+            CD3DX12_HEAP_PROPERTIES envDefaultHeapProps(D3D12_HEAP_TYPE_DEFAULT);
+            ThrowIfFailed(m_device->CreateCommittedResource(
+                &envDefaultHeapProps,
+                D3D12_HEAP_FLAG_NONE,
+                &envTexDesc,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                nullptr,
+                IID_PPV_ARGS(&m_environmentMap)
+            ));
+            m_environmentMap->SetName(L"Default Environment Map");
+            
+            // Create upload buffer
+            const UINT64 envUploadBufferSize = GetRequiredIntermediateSize(m_environmentMap.Get(), 0, 1);
+            CD3DX12_HEAP_PROPERTIES envUploadHeapProps(D3D12_HEAP_TYPE_UPLOAD);
+            auto envUploadBufferDesc = CD3DX12_RESOURCE_DESC::Buffer(envUploadBufferSize);
+            
+            Microsoft::WRL::ComPtr<ID3D12Resource> envMapUpload;
+            ThrowIfFailed(m_device->CreateCommittedResource(
+                &envUploadHeapProps,
+                D3D12_HEAP_FLAG_NONE,
+                &envUploadBufferDesc,
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+                nullptr,
+                IID_PPV_ARGS(&envMapUpload)
+            ));
+            
+            // Black pixel data
+            float blackPixel[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+            D3D12_SUBRESOURCE_DATA envSubresource = {};
+            envSubresource.pData = blackPixel;
+            envSubresource.RowPitch = 4 * sizeof(float);
+            envSubresource.SlicePitch = envSubresource.RowPitch;
+            
+            // Upload to GPU
+            UpdateSubresources(cmdList, m_environmentMap.Get(), envMapUpload.Get(), 0, 0, 1, &envSubresource);
+            
+            // Transition to shader resource
+            auto envBarrier = CD3DX12_RESOURCE_BARRIER::Transition(
+                m_environmentMap.Get(),
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+            );
+            cmdList->ResourceBarrier(1, &envBarrier);
+            
+            std::cout << "  Default environment map created" << std::endl;
+        }
+        
+        // Create SRV for environment map (slot 6)
+        D3D12_SHADER_RESOURCE_VIEW_DESC envSrvDesc = {};
+        envSrvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        envSrvDesc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        envSrvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        envSrvDesc.Texture2D.MostDetailedMip = 0;
+        envSrvDesc.Texture2D.MipLevels = 1;
+        
+        D3D12_CPU_DESCRIPTOR_HANDLE envMapSrvHandle = { srvHandle.ptr + m_srvUavDescriptorSize * 6 };
+        m_device->CreateShaderResourceView(m_environmentMap.Get(), &envSrvDesc, envMapSrvHandle);
+        std::cout << "  Environment map SRV created at slot 6" << std::endl;
+
         // Note: Do NOT close or execute here - caller will handle command list execution
         // Upload buffers are kept alive inside CreateDefaultBuffer until command list is executed
         
@@ -1727,6 +1809,113 @@ void ACG::Renderer::SetSunIntensity(float intensity) {
         
         std::cout << "  ✓ Texture array uploaded: " << textures.size() << " textures, " 
                   << maxWidth << "x" << maxHeight << " per slice" << std::endl;
+    }
+
+    void Renderer::UploadEnvironmentMap(ID3D12GraphicsCommandList4* cmdList, const std::shared_ptr<Texture>& envMap) {
+        if (!envMap || !envMap->IsHDR()) {
+            std::cout << "  No valid HDR environment map to upload" << std::endl;
+            return;
+        }
+
+        std::cout << "  Uploading HDR environment map: " << envMap->GetWidth() << "x" << envMap->GetHeight() << std::endl;
+        
+        // Create texture resource for environment map
+        D3D12_RESOURCE_DESC texDesc = {};
+        texDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        texDesc.Width = envMap->GetWidth();
+        texDesc.Height = envMap->GetHeight();
+        texDesc.DepthOrArraySize = 1;
+        texDesc.MipLevels = 1;
+        texDesc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;  // HDR format
+        texDesc.SampleDesc.Count = 1;
+        texDesc.SampleDesc.Quality = 0;
+        texDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        texDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+        
+        CD3DX12_HEAP_PROPERTIES defaultHeapProps(D3D12_HEAP_TYPE_DEFAULT);
+        ThrowIfFailed(m_device->CreateCommittedResource(
+            &defaultHeapProps,
+            D3D12_HEAP_FLAG_NONE,
+            &texDesc,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            nullptr,
+            IID_PPV_ARGS(&m_environmentMap)
+        ));
+        m_environmentMap->SetName(L"Environment Map");
+        
+        // Create upload buffer
+        const UINT64 uploadBufferSize = GetRequiredIntermediateSize(m_environmentMap.Get(), 0, 1);
+        
+        CD3DX12_HEAP_PROPERTIES uploadHeapProps(D3D12_HEAP_TYPE_UPLOAD);
+        auto uploadBufferDesc = CD3DX12_RESOURCE_DESC::Buffer(uploadBufferSize);
+        
+        Microsoft::WRL::ComPtr<ID3D12Resource> envMapUpload;
+        ThrowIfFailed(m_device->CreateCommittedResource(
+            &uploadHeapProps,
+            D3D12_HEAP_FLAG_NONE,
+            &uploadBufferDesc,
+            D3D12_RESOURCE_STATE_GENERIC_READ,
+            nullptr,
+            IID_PPV_ARGS(&envMapUpload)
+        ));
+        
+        // Prepare subresource data (convert to RGBA if needed)
+        const float* hdrData = envMap->GetHDRData();
+        int channels = envMap->GetChannels();
+        int width = envMap->GetWidth();
+        int height = envMap->GetHeight();
+        
+        std::vector<float> rgba(width * height * 4);
+        for (int y = 0; y < height; ++y) {
+            for (int x = 0; x < width; ++x) {
+                int srcIdx = (y * width + x) * channels;
+                int dstIdx = (y * width + x) * 4;
+                
+                if (channels >= 3) {
+                    rgba[dstIdx + 0] = hdrData[srcIdx + 0];
+                    rgba[dstIdx + 1] = hdrData[srcIdx + 1];
+                    rgba[dstIdx + 2] = hdrData[srcIdx + 2];
+                    rgba[dstIdx + 3] = (channels == 4) ? hdrData[srcIdx + 3] : 1.0f;
+                } else if (channels == 1) {
+                    rgba[dstIdx + 0] = hdrData[srcIdx];
+                    rgba[dstIdx + 1] = hdrData[srcIdx];
+                    rgba[dstIdx + 2] = hdrData[srcIdx];
+                    rgba[dstIdx + 3] = 1.0f;
+                }
+            }
+        }
+        
+        D3D12_SUBRESOURCE_DATA subresource = {};
+        subresource.pData = rgba.data();
+        subresource.RowPitch = width * 4 * sizeof(float);
+        subresource.SlicePitch = subresource.RowPitch * height;
+        
+        // Upload to GPU
+        UpdateSubresources(cmdList, m_environmentMap.Get(), envMapUpload.Get(), 0, 0, 1, &subresource);
+        
+        // Transition to shader resource
+        auto barrier = CD3DX12_RESOURCE_BARRIER::Transition(
+            m_environmentMap.Get(),
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+        );
+        cmdList->ResourceBarrier(1, &barrier);
+        
+        // Create SRV in descriptor heap (slot 6 for environment map)
+        D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+        srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srvDesc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srvDesc.Texture2D.MostDetailedMip = 0;
+        srvDesc.Texture2D.MipLevels = 1;
+        
+        D3D12_CPU_DESCRIPTOR_HANDLE srvHandle = m_srvUavHeap->GetCPUDescriptorHandleForHeapStart();
+        UINT descriptorSize = m_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        D3D12_CPU_DESCRIPTOR_HANDLE envMapSrvHandle = { srvHandle.ptr + descriptorSize * 6 };  // Slot 6 for environment map
+        
+        m_device->CreateShaderResourceView(m_environmentMap.Get(), &srvDesc, envMapSrvHandle);
+        
+        std::cout << "  ✓ Environment map uploaded: " << width << "x" << height << std::endl;
     }
 
     void Renderer::CreateShaderBindingTable() {
@@ -1963,5 +2152,38 @@ void ACG::Renderer::SetSunIntensity(float intensity) {
             ThrowIfFailed(m_fence->SetEventOnCompletion(currentFenceValue, m_fenceEvent), "Failed to set fence event in MoveToNextFrame");
             WaitForSingleObject(m_fenceEvent, INFINITE);
         }
+    }
+
+    void Renderer::SetEnvironmentMap(const std::string& path) {
+        std::cout << "Loading environment map from: " << path << std::endl;
+        
+        // Load HDR/EXR texture
+        auto envMap = std::make_shared<Texture>();
+        envMap->SetType(TextureType::Environment);
+        if (!envMap->LoadFromFile(path)) {
+            std::cerr << "Failed to load environment map: " << path << std::endl;
+            return;
+        }
+        
+        if (!envMap->IsHDR()) {
+            std::cerr << "Environment map is not HDR format: " << path << std::endl;
+            return;
+        }
+        
+        // Prepare command list for upload
+        WaitForGpu();
+        ThrowIfFailed(m_commandAllocators[m_frameIndex]->Reset());
+        ThrowIfFailed(m_commandList->Reset(m_commandAllocators[m_frameIndex].Get(), nullptr));
+        
+        // Upload to GPU
+        UploadEnvironmentMap(m_commandList.Get(), envMap);
+        
+        // Execute and wait
+        ThrowIfFailed(m_commandList->Close());
+        ID3D12CommandList* cmdLists[] = { m_commandList.Get() };
+        m_commandQueue->ExecuteCommandLists(1, cmdLists);
+        WaitForGpu();
+        
+        std::cout << "Environment map loaded successfully" << std::endl;
     }
 }

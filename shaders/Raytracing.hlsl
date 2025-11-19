@@ -50,7 +50,27 @@ Buffer<uint> g_indices : register(t1, space1); // Typed buffer for indices
 Buffer<uint> g_triangleMaterialIndices : register(t1, space2); // Typed buffer for material indices
 StructuredBuffer<Material> g_materials : register(t2);  // Structured buffer for materials
 Texture2DArray<float4> g_textures : register(t3);
+Texture2D<float4> g_environmentMap : register(t4);  // HDR environment map
 SamplerState g_sampler : register(s0);
+
+// Convert ray direction to equirectangular UV coordinates
+float2 DirectionToEquirectangularUV(float3 dir)
+{
+    // Normalize direction
+    dir = normalize(dir);
+    
+    // Convert to spherical coordinates
+    // theta = azimuthal angle (0 to 2π)
+    // phi = polar angle (0 to π)
+    float phi = acos(dir.y);  // y is up
+    float theta = atan2(dir.z, dir.x);  // atan2(z, x) for azimuth
+    
+    // Map to [0,1] UV space
+    float u = theta / (2.0 * 3.14159265359) + 0.5;
+    float v = phi / 3.14159265359;
+    
+    return float2(u, v);
+}
 
 // Helper function to create orthonormal basis from normal
 void CreateOrthonormalBasis(float3 normal, out float3 tangent, out float3 bitangent)
@@ -149,15 +169,20 @@ void RayGen()
 [shader("miss")]
 void Miss(inout RadiancePayload payload)
 {
-    // Environment light contribution (controlled by GUI)
-    payload.radiance += payload.throughput * environmentLightIntensity;
+    float3 rayDir = normalize(WorldRayDirection());
+    
+    // Sample environment map using equirectangular mapping
+    float2 envUV = DirectionToEquirectangularUV(rayDir);
+    float4 envColor = g_environmentMap.SampleLevel(g_sampler, envUV, 0);
+    
+    // Apply environment light intensity and add to radiance
+    payload.radiance += payload.throughput * envColor.rgb * environmentLightIntensity;
 
     // Add directional sun contribution for rays that reach infinity.
     // We evaluate sun radiance along the ray direction; if the ray direction
     // aligns with the sun direction, add sun contribution. Using intensity>0
     // as the enable check (sunDirIntensity.w).
     if (sunDirIntensity.w > 0.0) {
-        float3 rayDir = normalize(WorldRayDirection());
         float3 sunDir = normalize(sunDirIntensity.xyz);
         float sunIntensity = sunDirIntensity.w;
         float3 sunColor = sunColorEnabled.rgb;

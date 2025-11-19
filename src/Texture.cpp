@@ -2,9 +2,14 @@
 #include <iostream>
 #include <cmath>
 #include <algorithm>
+#include <cstring>
 
 #define STB_IMAGE_IMPLEMENTATION
 #include <stb_image.h>
+
+#include <miniz.h>  // Include miniz before tinyexr
+#define TINYEXR_IMPLEMENTATION
+#include <tinyexr.h>
 
 namespace ACG {
 
@@ -12,6 +17,7 @@ Texture::Texture()
     : m_width(0)
     , m_height(0)
     , m_channels(0)
+    , m_format(TextureFormat::UInt8)
     , m_type(TextureType::Color)
     , m_filter(TextureFilter::Bilinear)
     , m_wrap(TextureWrap::Repeat)
@@ -24,6 +30,17 @@ Texture::~Texture() {
 bool Texture::LoadFromFile(const std::string& filename) {
     std::cout << "Loading texture: " << filename << std::endl;
     
+    // Check file extension for HDR/EXR
+    std::string ext = filename.substr(filename.find_last_of('.') + 1);
+    std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+    
+    if (ext == "hdr") {
+        return LoadHDR(filename);
+    } else if (ext == "exr") {
+        return LoadEXR(filename);
+    }
+    
+    // Standard LDR texture loading
     int width, height, channels;
     unsigned char* data = stbi_load(filename.c_str(), &width, &height, &channels, 0);
     if (!data) {
@@ -39,10 +56,49 @@ bool Texture::LoadFromFile(const std::string& filename) {
     return true;
 }
 
+bool Texture::LoadHDR(const std::string& filename) {
+    int width, height, channels;
+    float* data = stbi_loadf(filename.c_str(), &width, &height, &channels, 0);
+    if (!data) {
+        std::cerr << "Failed to load HDR texture: " << filename << std::endl;
+        std::cerr << "stbi_failure_reason: " << stbi_failure_reason() << std::endl;
+        return false;
+    }
+    
+    CreateHDR(width, height, channels, data);
+    stbi_image_free(data);
+    
+    std::cout << "Loaded HDR texture: " << width << "x" << height << " (" << channels << " channels)" << std::endl;
+    return true;
+}
+
+bool Texture::LoadEXR(const std::string& filename) {
+    float* data;
+    int width, height;
+    const char* err = nullptr;
+    
+    int ret = ::LoadEXR(&data, &width, &height, filename.c_str(), &err);  // Use global namespace
+    if (ret != TINYEXR_SUCCESS) {
+        if (err) {
+            std::cerr << "Failed to load EXR texture: " << err << std::endl;
+            FreeEXRErrorMessage(err);
+        }
+        return false;
+    }
+    
+    // EXR always loads as RGBA (4 channels)
+    CreateHDR(width, height, 4, data);
+    free(data);
+    
+    std::cout << "Loaded EXR texture: " << width << "x" << height << " (4 channels)" << std::endl;
+    return true;
+}
+
 void Texture::Create(int width, int height, int channels, const unsigned char* data) {
     m_width = width;
     m_height = height;
     m_channels = channels;
+    m_format = TextureFormat::UInt8;
     
     // Store base mip level
     MipLevel level0;
@@ -55,6 +111,25 @@ void Texture::Create(int width, int height, int channels, const unsigned char* d
     
     m_mipLevels.clear();
     m_mipLevels.push_back(level0);
+}
+
+void Texture::CreateHDR(int width, int height, int channels, const float* data) {
+    m_width = width;
+    m_height = height;
+    m_channels = channels;
+    m_format = TextureFormat::Float32;
+    
+    // Store base mip level
+    HDRMipLevel level0;
+    level0.width = width;
+    level0.height = height;
+    level0.data.resize(width * height * channels);
+    if (data) {
+        std::copy(data, data + width * height * channels, level0.data.begin());
+    }
+    
+    m_hdrMipLevels.clear();
+    m_hdrMipLevels.push_back(level0);
 }
 
 glm::vec4 Texture::Sample(float u, float v, float mipLevel) const {

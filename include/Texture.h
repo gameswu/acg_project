@@ -15,7 +15,13 @@ enum class TextureType {
     Metallic,       // Metallic map
     Height,         // Height/displacement map
     AO,             // Ambient occlusion
-    Emissive        // Emission map
+    Emissive,       // Emission map
+    Environment     // HDR environment map
+};
+
+enum class TextureFormat {
+    UInt8,          // 8-bit per channel (LDR)
+    Float32         // 32-bit float per channel (HDR)
 };
 
 enum class TextureFilter {
@@ -48,8 +54,13 @@ public:
     // Load texture from file
     bool LoadFromFile(const std::string& filename);
     
+    // Load HDR/EXR environment map
+    bool LoadHDR(const std::string& filename);
+    bool LoadEXR(const std::string& filename);
+    
     // Create texture from data
     void Create(int width, int height, int channels, const unsigned char* data);
+    void CreateHDR(int width, int height, int channels, const float* data);
     
     // Sample texture
     glm::vec4 Sample(float u, float v, float mipLevel = 0.0f) const;
@@ -66,6 +77,9 @@ public:
     int GetChannels() const { return m_channels; }
     int GetMipLevels() const { return static_cast<int>(m_mipLevels.size()); }
     const unsigned char* GetRawData() const { return m_mipLevels.empty() ? nullptr : m_mipLevels[0].data.data(); }
+    const float* GetHDRData() const { return m_hdrMipLevels.empty() ? nullptr : m_hdrMipLevels[0].data.data(); }
+    bool IsHDR() const { return m_format == TextureFormat::Float32; }
+    TextureFormat GetFormat() const { return m_format; }
     
     // Settings
     void SetFilter(TextureFilter filter) { m_filter = filter; }
@@ -79,11 +93,19 @@ private:
         std::vector<unsigned char> data;
     };
     
+    struct HDRMipLevel {
+        int width;
+        int height;
+        std::vector<float> data;
+    };
+    
     int m_width;
     int m_height;
     int m_channels;
+    TextureFormat m_format;
     
     std::vector<MipLevel> m_mipLevels;
+    std::vector<HDRMipLevel> m_hdrMipLevels;
     
     TextureType m_type;
     TextureFilter m_filter;
