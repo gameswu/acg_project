@@ -116,7 +116,9 @@ float4 SampleVirtualTexture(int texIndex, float2 uv, float2 textureSize)
     uint pageY = physicalPageIndex / CACHE_TILES_PER_ROW;
     
     // Calculate final UV in physical cache texture
-    float2 cacheUV = (float2(pageX, pageY) + inTileUV) / float(CACHE_TILES_PER_ROW);
+    // Convert page coordinates to pixel coordinates, add in-tile offset, then normalize
+    float2 cachePixelCoords = float2(pageX, pageY) * TILE_SIZE + inTileUV * TILE_SIZE;
+    float2 cacheUV = cachePixelCoords / (CACHE_TILES_PER_ROW * TILE_SIZE);
     
     // Sample from physical cache
     return g_virtualTextureCache.SampleLevel(g_sampler, cacheUV, 0);
@@ -455,10 +457,6 @@ void ClosestHit(inout RadiancePayload payload, in BuiltInTriangleIntersectionAtt
                     float2 wrappedUV = frac(texCoord);
                     float4 texColor = SampleVirtualTexture(texIndex, wrappedUV, textureSize);
                     albedo = texColor.rgb;
-                    
-                    // Debug: if sampled color is nearly black, maybe show red to indicate VT path
-                    // Uncomment for debugging:
-                    // if (length(albedo) < 0.1) albedo = float3(1.0, 0.0, 0.0);
                 } else {
                     // Fallback: standard texture array (for downsampled textures)
                     float2 atlasScale = float2(mat.params3.z, mat.params3.w);

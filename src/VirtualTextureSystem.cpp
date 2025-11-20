@@ -127,7 +127,7 @@ bool VirtualTextureSystem::Initialize(ID3D12Device* device, const VirtualTexture
         &cacheHeapProps,
         D3D12_HEAP_FLAG_NONE,
         &cacheDesc,
-        D3D12_RESOURCE_STATE_COMMON,
+        D3D12_RESOURCE_STATE_COPY_DEST,  // Start in COPY_DEST to match first barrier
         nullptr,
         IID_PPV_ARGS(&m_physicalCacheTexture)
     );
@@ -283,6 +283,10 @@ bool VirtualTextureSystem::UploadAllTiles(ID3D12GraphicsCommandList* cmdList, ID
     cacheBarrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     batchCmdList->ResourceBarrier(1, &cacheBarrier);
     
+    // NOTE: We don't clear the physical cache to avoid state tracking issues with CommandList reset.
+    // Uninitialized cache positions will contain undefined data, but all tiles we upload will have valid data.
+    // The indirection texture marks which tiles are resident (not 0xFFFFFFFF), so shader won't sample uninitialized areas.
+    
     for (size_t texIdx = 0; texIdx < m_virtualTextureMetadata.size(); ++texIdx) {
         auto& metadata = m_virtualTextureMetadata[texIdx];
         auto& sourceTexture = metadata.sourceTexture;
@@ -362,6 +366,18 @@ bool VirtualTextureSystem::UploadAllTiles(ID3D12GraphicsCommandList* cmdList, ID
                         tileData[dstIdx + 3] = 255;
                     }
                 }
+            }
+            
+            // DEBUG: Check tile data for first tile
+            if (texIdx == 0 && tile.tileX == 0 && tile.tileY == 0) {
+                uint32_t nonBlackPixels = 0;
+                for (size_t i = 0; i < tileData.size(); i += 4) {
+                    if (tileData[i] > 10 || tileData[i+1] > 10 || tileData[i+2] > 10) {
+                        nonBlackPixels++;
+                    }
+                }
+                std::cout << "    DEBUG: Texture 0 Tile[0,0] has " << nonBlackPixels << "/" << (tileData.size()/4) 
+                          << " non-black pixels, first pixel=(" << (int)tileData[0] << "," << (int)tileData[1] << "," << (int)tileData[2] << ")" << std::endl;
             }
             
             // Upload tile data using UpdateSubresources
@@ -481,32 +497,37 @@ bool VirtualTextureSystem::UploadAllTiles(ID3D12GraphicsCommandList* cmdList, ID
         
     }
     
-    // Execute remaining tiles if any
-    if (m_uploadBuffers.size() > 0) {
-        std::cout << "  Executing final batch..." << std::endl;
-        
-        // Transition physical cache back to PIXEL_SHADER_RESOURCE
-        D3D12_RESOURCE_BARRIER cacheBarrierFinal = {};
-        cacheBarrierFinal.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        cacheBarrierFinal.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
-        cacheBarrierFinal.Transition.pResource = m_physicalCacheTexture.Get();
-        cacheBarrierFinal.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-        cacheBarrierFinal.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-        cacheBarrierFinal.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        batchCmdList->ResourceBarrier(1, &cacheBarrierFinal);
-        
-        batchCmdList->Close();
-        ID3D12CommandList* cmdLists[] = { batchCmdList.Get() };
-        commandQueue->ExecuteCommandLists(1, cmdLists);
-        
-        commandQueue->Signal(fence.Get(), ++fenceValue);
-        if (fence->GetCompletedValue() < fenceValue) {
-            fence->SetEventOnCompletion(fenceValue, fenceEvent);
-            WaitForSingleObject(fenceEvent, INFINITE);
-        }
-        
-        m_uploadBuffers.clear();
+    // Always transition physical cache back to PIXEL_SHADER_RESOURCE at the end
+    std::cout << "  Finalizing physical cache state..." << std::endl;
+    
+    // Check if command list is already closed (from last batch)
+    // If uploadBuffers is empty, we need to reset and create a new command list for the final barrier
+    if (m_uploadBuffers.empty()) {
+        batchAllocator->Reset();
+        batchCmdList->Reset(batchAllocator.Get(), nullptr);
     }
+    
+    // Transition physical cache to NON_PIXEL_SHADER_RESOURCE for DXR compute pipeline
+    D3D12_RESOURCE_BARRIER cacheBarrierFinal = {};
+    cacheBarrierFinal.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    cacheBarrierFinal.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+    cacheBarrierFinal.Transition.pResource = m_physicalCacheTexture.Get();
+    cacheBarrierFinal.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    cacheBarrierFinal.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    cacheBarrierFinal.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    batchCmdList->ResourceBarrier(1, &cacheBarrierFinal);
+    
+    batchCmdList->Close();
+    ID3D12CommandList* cmdLists[] = { batchCmdList.Get() };
+    commandQueue->ExecuteCommandLists(1, cmdLists);
+    
+    commandQueue->Signal(fence.Get(), ++fenceValue);
+    if (fence->GetCompletedValue() < fenceValue) {
+        fence->SetEventOnCompletion(fenceValue, fenceEvent);
+        WaitForSingleObject(fenceEvent, INFINITE);
+    }
+    
+    m_uploadBuffers.clear();
     
     CloseHandle(fenceEvent);
     
@@ -593,6 +614,21 @@ bool VirtualTextureSystem::CreateIndirectionTexture(ID3D12GraphicsCommandList* c
                 indirectionData[idx] = tile.physicalPageIndex;
             }
         }
+        
+        // DEBUG: Print first texture's indirection data
+        if (texIdx == 0) {
+            std::cout << "[Virtual Texture] Indirection data for texture 0:" << std::endl;
+            for (uint32_t y = 0; y < std::min(3u, metadata.numTilesY); ++y) {
+                for (uint32_t x = 0; x < std::min(3u, metadata.numTilesX); ++x) {
+                    size_t idx = layerOffset + y * alignedRowPitchInUints + x;
+                    std::cout << "  Tile[" << x << "," << y << "] = page " << indirectionData[idx];
+                    if (indirectionData[idx] == UINT32_MAX) {
+                        std::cout << " (NOT RESIDENT)";
+                    }
+                    std::cout << std::endl;
+                }
+            }
+        }
     }
     
     // Create upload buffer
@@ -642,11 +678,11 @@ bool VirtualTextureSystem::CreateIndirectionTexture(ID3D12GraphicsCommandList* c
                 uploadCmdList->CopyTextureRegion(&dstLocation, 0, 0, 0, &srcLocation, nullptr);
             }
             
-            // Transition to shader resource
+            // Transition to NON_PIXEL_SHADER_RESOURCE for DXR compute pipeline
             auto barrier = CD3DX12_RESOURCE_BARRIER::Transition(
                 m_indirectionTexture.Get(),
                 D3D12_RESOURCE_STATE_COPY_DEST,
-                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
             );
             uploadCmdList->ResourceBarrier(1, &barrier);
             
@@ -822,8 +858,12 @@ void VirtualTextureSystem::EvictTile(ID3D12CommandQueue* commandQueue,
 void VirtualTextureSystem::CreateShaderResourceView(ID3D12Device* device,
                                                     D3D12_CPU_DESCRIPTOR_HANDLE srvHandle,
                                                     D3D12_CPU_DESCRIPTOR_HANDLE indirectionSrvHandle) {
+    std::cout << "[VT] CreateShaderResourceView called" << std::endl;
+    
     // Create SRV for physical cache texture
     if (m_physicalCacheTexture) {
+        std::cout << "[VT]   Creating physical cache SRV at descriptor " << srvHandle.ptr << std::endl;
+        
         D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
         srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         srvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -832,10 +872,16 @@ void VirtualTextureSystem::CreateShaderResourceView(ID3D12Device* device,
         srvDesc.Texture2D.MipLevels = 1;
         
         device->CreateShaderResourceView(m_physicalCacheTexture.Get(), &srvDesc, srvHandle);
+        std::cout << "[VT]   ✓ Physical cache SRV created" << std::endl;
+    } else {
+        std::cerr << "[VT]   ✗ ERROR: Physical cache texture is NULL!" << std::endl;
     }
     
     // Create SRV for indirection texture
     if (m_indirectionTexture) {
+        std::cout << "[VT]   Creating indirection SRV at descriptor " << indirectionSrvHandle.ptr 
+                  << " (264 slices)" << std::endl;
+        
         D3D12_SHADER_RESOURCE_VIEW_DESC indirectionSrvDesc = {};
         indirectionSrvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         indirectionSrvDesc.Format = DXGI_FORMAT_R32_UINT;
@@ -846,7 +892,12 @@ void VirtualTextureSystem::CreateShaderResourceView(ID3D12Device* device,
         indirectionSrvDesc.Texture2DArray.ArraySize = static_cast<UINT>(m_virtualTextureMetadata.size());
         
         device->CreateShaderResourceView(m_indirectionTexture.Get(), &indirectionSrvDesc, indirectionSrvHandle);
+        std::cout << "[VT]   ✓ Indirection SRV created" << std::endl;
+    } else {
+        std::cerr << "[VT]   ✗ ERROR: Indirection texture is NULL!" << std::endl;
     }
+    
+    std::cout << "[VT] ✓ All VT SRVs created successfully" << std::endl;
 }
 
 VirtualTextureSystem::Statistics VirtualTextureSystem::GetStatistics() const {

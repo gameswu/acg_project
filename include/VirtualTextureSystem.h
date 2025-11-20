@@ -31,7 +31,7 @@ struct VirtualTextureTile {
 struct VirtualTextureConfig {
     uint32_t tileSize = 256;              // Size of each tile (256x256 is standard)
     uint32_t maxPhysicalPages = 4096;     // Maximum physical memory pages (256MB at 256x256 RGBA)
-    uint32_t maxVirtualTextures = 512;    // Maximum number of virtual textures
+    uint32_t maxVirtualTextures = 1024;   // Maximum number of virtual textures
     uint32_t feedbackBufferSize = 1024;   // Size of feedback buffer for streaming
     bool enableTiledResources = true;     // Use DX12 tiled resources
     bool enableSparseBinding = true;      // Use sparse binding for better memory efficiency

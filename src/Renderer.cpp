@@ -332,10 +332,8 @@ namespace ACG {
                 D3D12_GPU_DESCRIPTOR_HANDLE vtCacheHandle = m_srvUavHeap->GetGPUDescriptorHandleForHeapStart();
                 vtCacheHandle.ptr += 7 * m_srvUavDescriptorSize; // slot 7 for virtual texture cache
                 renderCommandList->SetComputeRootDescriptorTable(8, vtCacheHandle);
-            }
-            
-            // Root parameter 9: Indirection Texture SRV table (bind to descriptor slot 8, t6)
-            if (m_useVirtualTextures) {
+                
+                // Also bind indirection texture immediately
                 D3D12_GPU_DESCRIPTOR_HANDLE indirectionHandle = m_srvUavHeap->GetGPUDescriptorHandleForHeapStart();
                 indirectionHandle.ptr += 8 * m_srvUavDescriptorSize; // slot 8 for indirection texture
                 renderCommandList->SetComputeRootDescriptorTable(9, indirectionHandle);
@@ -1581,7 +1579,7 @@ void ACG::Renderer::SetSunIntensity(float intensity) {
                 VirtualTextureConfig vtConfig;
                 vtConfig.tileSize = 256;
                 vtConfig.maxPhysicalPages = 4096;  // 256MB physical memory
-                vtConfig.maxVirtualTextures = 512;
+                vtConfig.maxVirtualTextures = 1024;
                 
                 if (m_virtualTextureSystem.Initialize(m_device.Get(), vtConfig)) {
                     std::cout << "  ✓ Virtual Texture System initialized successfully" << std::endl;
@@ -1602,11 +1600,13 @@ void ACG::Renderer::SetSunIntensity(float intensity) {
                         if (m_virtualTextureSystem.UploadAllTiles(cmdList, m_commandQueue.Get())) {
                             // Create indirection texture
                             if (m_virtualTextureSystem.CreateIndirectionTexture(cmdList, m_commandQueue.Get())) {
+                                // Set flag BEFORE creating SRVs so the function doesn't early-return
+                                useVirtualTextures = true;
+                                m_useVirtualTextures = true;
+                                
                                 // Create SRVs for Virtual Textures
                                 CreateVirtualTextureSRVs();
                                 
-                                useVirtualTextures = true;
-                                m_useVirtualTextures = true;
                                 std::cout << "  ✓ Virtual Texture System ready" << std::endl;
                             } else {
                                 std::cerr << "  ✗ Failed to create indirection texture" << std::endl;
