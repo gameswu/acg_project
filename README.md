@@ -1,7 +1,9 @@
 # ACG Project
 <div align="center">
 <img src="docs/images/logo.png" alt="ACG Logo" width="200"/>
+</div>
 
+<div align="center">
 <img src="https://img.shields.io/github/license/gameswu/acg_project.svg" alt="License"/>
 <img src="https://img.shields.io/badge/Course-ACG-blue" alt="Custom Badge"/>
 <img src="https://img.shields.io/badge/Semester-Fall%202025-blue" alt="Custom Badge"/>

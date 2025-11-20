@@ -91,7 +91,6 @@ void RenderSettingsWindow(ACG::Renderer* renderer, GUIState& state, HWND hwnd) {
     if (ImGui::InputInt("Samples Per Pixel", &state.samplesPerPixel)) {
         if (state.samplesPerPixel < 1) state.samplesPerPixel = 1;
     }
-    ImGui::TextDisabled("(Total number of samples to accumulate per pixel)");
     
     if (ImGui::InputInt("Max Bounces", &state.maxBounces)) {
         if (state.maxBounces < 1) state.maxBounces = 1;
@@ -103,8 +102,6 @@ void RenderSettingsWindow(ACG::Renderer* renderer, GUIState& state, HWND hwnd) {
     
     // Environment Light Section
     if (ImGui::TreeNode("Environment Light")) {
-        ImGui::TextDisabled("(HDR/EXR skybox for indirect lighting)");
-        
         ImGui::InputText("Environment Map", state.envMapPath, sizeof(state.envMapPath));
         ImGui::SameLine();
         if (ImGui::Button("Browse##EnvMap")) {
@@ -115,25 +112,20 @@ void RenderSettingsWindow(ACG::Renderer* renderer, GUIState& state, HWND hwnd) {
                 strncpy_s(state.envMapPath, path.c_str(), sizeof(state.envMapPath) - 1);
             }
         }
-        ImGui::TextDisabled("(Will be loaded automatically on Start Render)");
         
         if (ImGui::SliderFloat("Intensity##EnvLight", &state.envLightIntensity, 0.0f, 10.0f)) {
             renderer->SetEnvironmentLightIntensity(state.envLightIntensity);
         }
-        ImGui::TextDisabled("(Multiplier for environment map brightness)");
         
         ImGui::TreePop();
     }
     
     // Directional Sun Light Section
     if (ImGui::TreeNode("Directional Sun Light")) {
-        ImGui::TextDisabled("(Distant directional light source)");
-        
         if (ImGui::SliderFloat("Intensity##SunLight", &state.sunIntensity, 0.0f, 20.0f)) {
             renderer->SetSunIntensity(state.sunIntensity);
             renderer->ResetAccumulation();
         }
-        ImGui::TextDisabled("(Set to 0 to disable sun light)");
         
         bool sunDirChanged = false;
         if (ImGui::SliderFloat("Azimuth (deg)", &state.sunAzimuth, 0.0f, 360.0f)) sunDirChanged = true;
@@ -468,47 +460,25 @@ void RenderCameraWindow(ACG::Renderer* renderer, GUIState& state) {
             state.cameraAnglesInitialized = true;
         }
 
-        ImGui::Text("Angle Controls (rotate camera orientation)");
+        ImGui::Text("Angle Controls");
         bool orbitChanged = false;
         if (ImGui::SliderFloat("Azimuth (deg)", &state.cameraAzimuth, 0.0f, 360.0f)) orbitChanged = true;
         if (ImGui::SliderFloat("Elevation (deg)", &state.cameraElevation, -89.9f, 89.9f)) orbitChanged = true;
-        ImGui::TextDisabled("(Rotate camera about its own position: change orientation only)");
+        if (ImGui::SliderFloat("Roll (deg)", &state.cameraUpAngle, -180.0f, 180.0f)) orbitChanged = true;
         if (orbitChanged) {
             // Convert spherical angles to world-space direction (Y-up)
             float az = state.cameraAzimuth * glm::pi<float>() / 180.0f;
             float el = state.cameraElevation * glm::pi<float>() / 180.0f;
             glm::vec3 dir = glm::vec3(std::cos(el) * std::cos(az), std::sin(el), std::cos(el) * std::sin(az));
             glm::vec3 pos = camera->GetPosition();
-            glm::vec3 target = pos + dir * state.cameraDistance; // target positioned in front of camera (internal fixed distance)
+            glm::vec3 target = pos + dir * state.cameraDistance;
             camera->SetTarget(target);
-            // Recompute up from roll angle using worldUp projection, rotate and orthonormalize
+            // Recompute up from roll angle
             glm::vec3 worldUp(0.0f, 1.0f, 0.0f);
-            // Project worldUp onto plane perpendicular to dir to get a stable base up
             glm::vec3 baseUp = worldUp - glm::dot(worldUp, dir) * dir;
             if (glm::dot(baseUp, baseUp) < 1e-6f) {
-                // dir is nearly parallel to worldUp; pick an arbitrary perpendicular
                 baseUp = glm::vec3(1.0f, 0.0f, 0.0f);
             }
-            baseUp = glm::normalize(baseUp);
-            float rollRad = state.cameraUpAngle * glm::pi<float>() / 180.0f;
-            glm::vec3 rolledUpCandidate = glm::rotate(baseUp, rollRad, dir);
-            // Orthonormalize: right, up
-            glm::vec3 right = glm::normalize(glm::cross(dir, rolledUpCandidate));
-            glm::vec3 up = glm::normalize(glm::cross(right, dir));
-            camera->SetUp(up);
-            renderer->ResetAccumulation();
-        }
-
-        // Up angle control (roll)
-        ImGui::Separator();
-        ImGui::Text("Up Vector Angle (Roll)");
-        if (ImGui::SliderFloat("Up Angle (deg)", &state.cameraUpAngle, -180.0f, 180.0f)) {
-            // Apply roll to current direction using same robust method as above
-            glm::vec3 pos = camera->GetPosition();
-            glm::vec3 dir = glm::normalize(camera->GetTarget() - pos);
-            glm::vec3 worldUp(0.0f, 1.0f, 0.0f);
-            glm::vec3 baseUp = worldUp - glm::dot(worldUp, dir) * dir;
-            if (glm::dot(baseUp, baseUp) < 1e-6f) baseUp = glm::vec3(1.0f, 0.0f, 0.0f);
             baseUp = glm::normalize(baseUp);
             float rollRad = state.cameraUpAngle * glm::pi<float>() / 180.0f;
             glm::vec3 rolledUpCandidate = glm::rotate(baseUp, rollRad, dir);
@@ -597,14 +567,16 @@ void RenderStatisticsWindow(ACG::Renderer* renderer, GUIState& state) {
     ImGui::End();
 }
 
-void RenderLogWindow(const std::vector<std::string>& logMessages) {
+void RenderLogWindow(std::vector<std::string>& logMessages) {
     ImGui::Begin("Log Details");
     
     static bool autoScroll = true;
-    // Note: We can't clear the external log vector easily without a pointer to it
-    // But we can just show it
     
     ImGui::Checkbox("Auto-scroll", &autoScroll);
+    ImGui::SameLine();
+    if (ImGui::Button("Clear")) {
+        logMessages.clear();
+    }
     
     ImGui::Separator();
     ImGui::BeginChild("LogScrolling", ImVec2(0, 0), false, ImGuiWindowFlags_HorizontalScrollbar);
