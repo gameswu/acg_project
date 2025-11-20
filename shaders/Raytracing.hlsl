@@ -49,8 +49,10 @@ StructuredBuffer<Vertex> g_vertices : register(t1);
 Buffer<uint> g_indices : register(t1, space1); // Typed buffer for indices
 Buffer<uint> g_triangleMaterialIndices : register(t1, space2); // Typed buffer for material indices
 StructuredBuffer<Material> g_materials : register(t2);  // Structured buffer for materials
-Texture2DArray<float4> g_textures : register(t3);
+Texture2DArray<float4> g_textures : register(t3);  // Standard texture array (fallback)
 Texture2D<float4> g_environmentMap : register(t4);  // HDR environment map
+Texture2D<float4> g_virtualTextureCache : register(t5);  // Virtual Texture physical page cache
+Texture2DArray<uint> g_indirectionTexture : register(t6);  // Virtual Texture indirection lookup
 SamplerState g_sampler : register(s0);
 
 // Convert ray direction to equirectangular UV coordinates
@@ -79,6 +81,45 @@ void CreateOrthonormalBasis(float3 normal, out float3 tangent, out float3 bitang
     float3 helper = abs(normal.x) > 0.99 ? float3(0, 1, 0) : float3(1, 0, 0);
     tangent = normalize(cross(normal, helper));
     bitangent = normalize(cross(normal, tangent)); // Ensure normalization
+}
+
+// Virtual Texture sampling helper
+// Returns texture color using indirection-based lookup for virtual textures
+float4 SampleVirtualTexture(int texIndex, float2 uv, float2 textureSize)
+{
+    // Virtual Texture system: 256x256 tile size
+    const float TILE_SIZE = 256.0;
+    
+    // Calculate which virtual tile this UV falls into
+    float2 pixelCoords = uv * textureSize;
+    float2 tileCoords = pixelCoords / TILE_SIZE;
+    uint2 tileXY = uint2(floor(tileCoords));
+    
+    // Lookup physical page index from indirection texture
+    uint physicalPageIndex = g_indirectionTexture.Load(int4(tileXY.x, tileXY.y, texIndex, 0));
+    
+    // Check if tile is resident (0xFFFFFFFF = not loaded)
+    if (physicalPageIndex == 0xFFFFFFFF)
+    {
+        // Tile not resident, return magenta for debugging
+        return float4(1.0, 0.0, 1.0, 1.0);
+    }
+    
+    // Calculate in-tile UV coordinates
+    float2 inTileUV = frac(tileCoords);
+    
+    // Physical page cache layout: tiles arranged in a grid
+    // Each page is 256x256, cache is arranged as sqrt(numPages) x sqrt(numPages)
+    // For 2304 pages: 48 x 48 grid (12288x12288 texture = 576MB)
+    const uint CACHE_TILES_PER_ROW = 48;  // sqrt(2304) = 48
+    uint pageX = physicalPageIndex % CACHE_TILES_PER_ROW;
+    uint pageY = physicalPageIndex / CACHE_TILES_PER_ROW;
+    
+    // Calculate final UV in physical cache texture
+    float2 cacheUV = (float2(pageX, pageY) + inTileUV) / float(CACHE_TILES_PER_ROW);
+    
+    // Sample from physical cache
+    return g_virtualTextureCache.SampleLevel(g_sampler, cacheUV, 0);
 }
 
 [shader("raygeneration")]
@@ -405,12 +446,28 @@ void ClosestHit(inout RadiancePayload payload, in BuiltInTriangleIntersectionAtt
             // Sample texture if available (texture overrides base albedo)
             if (mat.HasAlbedoTexture()) {
                 int texIndex = mat.GetAlbedoTextureIndex();
-                float2 atlasScale = float2(mat.params3.z, mat.params3.w);
-                // Only sample if scale is valid (non-zero)
-                if (atlasScale.x > 0.0 && atlasScale.y > 0.0) {
-                    float2 scaledUV = frac(texCoord) * atlasScale;
-                    float4 texColor = g_textures.SampleLevel(g_sampler, float3(scaledUV, texIndex), 0);
+                
+                // Check if using Virtual Texture System
+                // If material has texture size info (params3.xy), use Virtual Texture
+                float2 textureSize = float2(mat.params3.x, mat.params3.y);
+                if (textureSize.x > 0.0 && textureSize.y > 0.0) {
+                    // Virtual Texture path: use indirection-based sampling
+                    float2 wrappedUV = frac(texCoord);
+                    float4 texColor = SampleVirtualTexture(texIndex, wrappedUV, textureSize);
                     albedo = texColor.rgb;
+                    
+                    // Debug: if sampled color is nearly black, maybe show red to indicate VT path
+                    // Uncomment for debugging:
+                    // if (length(albedo) < 0.1) albedo = float3(1.0, 0.0, 0.0);
+                } else {
+                    // Fallback: standard texture array (for downsampled textures)
+                    float2 atlasScale = float2(mat.params3.z, mat.params3.w);
+                    // Only sample if scale is valid (non-zero)
+                    if (atlasScale.x > 0.0 && atlasScale.y > 0.0) {
+                        float2 scaledUV = frac(texCoord) * atlasScale;
+                        float4 texColor = g_textures.SampleLevel(g_sampler, float3(scaledUV, texIndex), 0);
+                        albedo = texColor.rgb;
+                    }
                 }
             }
         

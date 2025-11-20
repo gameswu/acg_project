@@ -5,6 +5,8 @@
 #include <filesystem>
 #include <unordered_map>
 #include <algorithm>
+#include <set>
+#include <functional>
 
 #include "assimp/Importer.hpp"
 #include "assimp/scene.h"
@@ -35,6 +37,17 @@ void Scene::AddLight(std::shared_ptr<Light> light) {
 }
 
 bool Scene::LoadFromFile(const std::string& filename, bool useCustomMTLParser) {
+    // Default configuration for backward compatibility
+    SceneLoadConfig config;
+    config.useCustomMTLParser = useCustomMTLParser;
+    config.enableBatchLoading = true;
+    config.maxMeshesPerBatch = 500;  // Process 500 meshes at a time
+    config.maxTexturesPerBatch = 64; // Load 64 textures at a time
+    config.maxMemoryMB = 4096;       // 4GB memory limit
+    return LoadFromFileEx(filename, config);
+}
+
+bool Scene::LoadFromFileEx(const std::string& filename, const SceneLoadConfig& config) {
     std::cout << "Loading scene from: " << filename << std::endl;
     
     // Check file extension
@@ -43,12 +56,19 @@ bool Scene::LoadFromFile(const std::string& filename, bool useCustomMTLParser) {
     bool isObjFile = (extension == ".obj");
     
     // For non-OBJ files, always use Assimp
+    bool useCustomMTLParser = config.useCustomMTLParser;
     if (!isObjFile) {
         useCustomMTLParser = false;
         std::cout << "Non-OBJ file detected, using Assimp for all loading" << std::endl;
     }
     
     std::cout << "MTL Parser: " << (useCustomMTLParser ? "Custom MTL Parser" : "Assimp") << std::endl;
+    std::cout << "Batch Loading: " << (config.enableBatchLoading ? "Enabled" : "Disabled") << std::endl;
+    if (config.enableBatchLoading) {
+        std::cout << "  Max Meshes/Batch: " << config.maxMeshesPerBatch << std::endl;
+        std::cout << "  Max Textures/Batch: " << config.maxTexturesPerBatch << std::endl;
+        std::cout << "  Memory Limit: " << config.maxMemoryMB << " MB" << std::endl;
+    }
     
     // Extract directory from filename for texture loading and scene name
     std::string directory;
@@ -250,14 +270,41 @@ bool Scene::LoadFromFile(const std::string& filename, bool useCustomMTLParser) {
     }
     
     // ========== LOAD GEOMETRY ==========
-    // Process meshes (geometry only, materials already loaded)
-    ProcessNode(ascene->mRootNode, ascene);
+    // Count total meshes for progress reporting
+    std::function<int(aiNode*)> countMeshes = [&](aiNode* node) -> int {
+        int count = node->mNumMeshes;
+        for (unsigned int i = 0; i < node->mNumChildren; ++i) {
+            count += countMeshes(node->mChildren[i]);
+        }
+        return count;
+    };
+    int totalMeshCount = countMeshes(ascene->mRootNode);
+    
+    std::cout << "\n========== Geometry Loading ==========" << std::endl;
+    std::cout << "Total meshes to process: " << totalMeshCount << std::endl;
+    
+    // Use batch loading if enabled and scene is large
+    if (config.enableBatchLoading && totalMeshCount > config.maxMeshesPerBatch) {
+        std::cout << "Scene is large (" << totalMeshCount << " meshes), using BATCH LOADING" << std::endl;
+        if (!LoadGeometryBatched(ascene, config)) {
+            std::cerr << "Batch loading failed!" << std::endl;
+            return false;
+        }
+    } else {
+        std::cout << "Loading all geometry at once..." << std::endl;
+        // Process meshes (geometry only, materials already loaded)
+        ProcessNode(ascene->mRootNode, ascene);
+    }
     
     CalculateBoundingBox();
+    EstimateMemoryUsage();
     
     std::cout << "\n========== Scene Loading Complete ==========" << std::endl;
     std::cout << "Meshes: " << m_meshes.size() << std::endl;
     std::cout << "Materials: " << m_materials.size() << std::endl;
+    std::cout << "Triangles: " << m_loadStats.totalTriangles << std::endl;
+    std::cout << "Vertices: " << m_loadStats.totalVertices << std::endl;
+    std::cout << "Estimated Memory: " << m_loadStats.estimatedMemoryMB << " MB" << std::endl;
     std::cout << "Bounding box: min=(" << m_bboxMin.x << ", " << m_bboxMin.y << ", " << m_bboxMin.z << ")" 
               << " max=(" << m_bboxMax.x << ", " << m_bboxMax.y << ", " << m_bboxMax.z << ")" << std::endl;
     
@@ -340,6 +387,136 @@ void Scene::CalculateBoundingBox() {
 
 void Scene::ComputeBoundingBox() {
     CalculateBoundingBox();
+}
+
+bool Scene::LoadGeometryBatched(const aiScene* scene, const SceneLoadConfig& config) {
+    // Collect all mesh nodes in a flat list for batch processing
+    std::vector<std::pair<aiNode*, unsigned int>> meshNodePairs; // (node, meshIndex)
+    
+    std::function<void(aiNode*)> collectMeshes = [&](aiNode* node) {
+        for (unsigned int i = 0; i < node->mNumMeshes; ++i) {
+            meshNodePairs.push_back({node, i});
+        }
+        for (unsigned int i = 0; i < node->mNumChildren; ++i) {
+            collectMeshes(node->mChildren[i]);
+        }
+    };
+    
+    collectMeshes(scene->mRootNode);
+    
+    int totalMeshes = static_cast<int>(meshNodePairs.size());
+    int batchSize = (config.maxMeshesPerBatch > 0) ? config.maxMeshesPerBatch : totalMeshes;
+    int numBatches = (totalMeshes + batchSize - 1) / batchSize;
+    
+    std::cout << "Processing " << totalMeshes << " meshes in " << numBatches << " batches" << std::endl;
+    std::cout << "Batch size: " << batchSize << " meshes" << std::endl;
+    
+    for (int batch = 0; batch < numBatches; ++batch) {
+        int startIdx = batch * batchSize;
+        int endIdx = std::min(startIdx + batchSize, totalMeshes);
+        int currentBatchSize = endIdx - startIdx;
+        
+        std::cout << "\n[Batch " << (batch + 1) << "/" << numBatches << "] ";
+        std::cout << "Processing meshes " << startIdx << "-" << (endIdx - 1) 
+                  << " (" << currentBatchSize << " meshes)" << std::endl;
+        
+        // Progress callback
+        if (config.progressCallback) {
+            config.progressCallback("Loading Geometry", startIdx, totalMeshes);
+        }
+        
+        // Process this batch
+        for (int i = startIdx; i < endIdx; ++i) {
+            aiNode* node = meshNodePairs[i].first;
+            unsigned int meshIdx = meshNodePairs[i].second;
+            unsigned int sceneMeshIdx = node->mMeshes[meshIdx];
+            
+            if (sceneMeshIdx >= scene->mNumMeshes) {
+                std::cerr << "  WARNING: Invalid mesh index " << sceneMeshIdx << std::endl;
+                continue;
+            }
+            
+            aiMesh* aimesh = scene->mMeshes[sceneMeshIdx];
+            ProcessMesh(aimesh, scene);
+            
+            // Progress indicator every 100 meshes
+            if ((i - startIdx + 1) % 100 == 0) {
+                std::cout << "  Processed " << (i - startIdx + 1) << "/" << currentBatchSize << " meshes in batch..." << std::endl;
+            }
+        }
+        
+        std::cout << "  ✓ Batch " << (batch + 1) << " complete: " 
+                  << m_meshes.size() << " total meshes loaded" << std::endl;
+        
+        // Memory check
+        EstimateMemoryUsage();
+        if (config.maxMemoryMB > 0 && m_loadStats.estimatedMemoryMB > config.maxMemoryMB) {
+            std::cerr << "\n⚠ WARNING: Estimated memory usage (" << m_loadStats.estimatedMemoryMB 
+                      << " MB) exceeds limit (" << config.maxMemoryMB << " MB)" << std::endl;
+            std::cerr << "  Consider using a smaller batch size or increasing memory limit" << std::endl;
+            std::cerr << "  Loaded " << m_meshes.size() << " / " << totalMeshes << " meshes" << std::endl;
+            
+            // Continue loading but warn user
+            // return false; // Uncomment to stop on memory limit
+        }
+    }
+    
+    // Final progress callback
+    if (config.progressCallback) {
+        config.progressCallback("Loading Geometry", totalMeshes, totalMeshes);
+    }
+    
+    std::cout << "\n✓ All batches complete: " << m_meshes.size() << " meshes loaded" << std::endl;
+    return true;
+}
+
+void Scene::EstimateMemoryUsage() {
+    m_loadStats.totalMeshes = static_cast<int>(m_meshes.size());
+    m_loadStats.totalMaterials = static_cast<int>(m_materials.size());
+    m_loadStats.totalTriangles = 0;
+    m_loadStats.totalVertices = 0;
+    
+    size_t vertexMemory = 0;
+    size_t indexMemory = 0;
+    
+    for (const auto& mesh : m_meshes) {
+        int numVerts = static_cast<int>(mesh->GetVertices().size());
+        int numIndices = static_cast<int>(mesh->GetIndices().size());
+        
+        m_loadStats.totalVertices += numVerts;
+        m_loadStats.totalTriangles += numIndices / 3;
+        
+        // GPUVertex: position(12) + normal(12) + texCoord(8) + tangent(12) = 44 bytes
+        // Actual struct with padding: 48 bytes
+        vertexMemory += numVerts * 48;
+        
+        // Index buffer: 4 bytes per index
+        indexMemory += numIndices * 4;
+    }
+    
+    // Material buffer: assume 128 bytes per material (GPUMaterial struct)
+    size_t materialMemory = m_materials.size() * 128;
+    
+    // Texture memory estimation: count unique textures
+    std::set<const Texture*> uniqueTextures;
+    size_t textureMemory = 0;
+    
+    for (const auto& mat : m_materials) {
+        auto albedoTex = mat->GetAlbedoTexture();
+        if (albedoTex && albedoTex->GetWidth() > 0) {
+            if (uniqueTextures.find(albedoTex.get()) == uniqueTextures.end()) {
+                uniqueTextures.insert(albedoTex.get());
+                // RGBA8: 4 bytes per pixel
+                textureMemory += albedoTex->GetWidth() * albedoTex->GetHeight() * 4;
+            }
+        }
+    }
+    
+    m_loadStats.totalTextures = static_cast<int>(uniqueTextures.size());
+    
+    // Total memory (convert to MB)
+    size_t totalBytes = vertexMemory + indexMemory + materialMemory + textureMemory;
+    m_loadStats.estimatedMemoryMB = totalBytes / (1024 * 1024);
 }
 
 } // namespace ACG

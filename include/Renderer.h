@@ -4,6 +4,7 @@
 #include "Scene.h"
 #include "Camera.h"
 #include "Denoiser.h"
+#include "VirtualTextureSystem.h"
 #include <d3d12.h>
 #include <dxgi1_6.h>
 #include <wrl.h>
@@ -40,6 +41,7 @@ namespace ACG {
 
         void LoadScene(const std::string& path, bool useCustomMTLParser = true);
         void LoadSceneAsync(const std::string& path, bool useCustomMTLParser = true); // Async version using independent command resources
+        void LoadSceneAsyncEx(const std::string& path, const SceneLoadConfig& config); // Extended version with batch loading
         void RenderToFile(const std::string& outputPath, int samplesPerPixel, int maxBounces);
         void SetEnvironmentMap(const std::string& path);  // Load HDR/EXR environment map
         void ClearEnvironmentMap();  // Clear/unload environment map
@@ -86,7 +88,20 @@ namespace ACG {
         void CreateAccelerationStructures(ID3D12GraphicsCommandList4* cmdList);
         void CreateShaderResources(ID3D12GraphicsCommandList4* cmdList);
         void CreateShaderBindingTable();
-        void UploadTexturesToGPU(ID3D12GraphicsCommandList4* cmdList, const std::vector<std::shared_ptr<Texture>>& textures);
+        // Resource creation (allocation only, no data upload)
+        void CreateTextureArrayResource(int totalTextures, UINT maxWidth, UINT maxHeight);
+        
+        // Data upload (assumes resource already created)
+        void UploadTextureBatchData(ID3D12GraphicsCommandList4* cmdList, 
+                                    const std::vector<std::shared_ptr<Texture>>& textures, 
+                                    int startIndex, UINT maxWidth, UINT maxHeight);
+        
+        // State transition and descriptor creation
+        void FinalizeTextureArray(ID3D12GraphicsCommandList4* cmdList, int totalTextures);
+        
+        // Virtual Texture System SRV creation
+        void CreateVirtualTextureSRVs();
+        
         Microsoft::WRL::ComPtr<ID3D12Resource> UploadEnvironmentMap(ID3D12GraphicsCommandList4* cmdList, const std::shared_ptr<Texture>& envMap);
         
         void CheckRaytracingSupport();
@@ -175,6 +190,10 @@ namespace ACG {
         Camera m_camera;
         
         bool m_dxrSupported;
+        
+        // Virtual Texture System
+        VirtualTextureSystem m_virtualTextureSystem;
+        bool m_useVirtualTextures;
         
         // Offline rendering resources (independent from real-time rendering)
         Microsoft::WRL::ComPtr<ID3D12CommandAllocator> m_offlineCommandAllocator;

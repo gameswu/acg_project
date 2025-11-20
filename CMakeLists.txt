@@ -33,13 +33,22 @@ file(GLOB_RECURSE SRC_FILES
     "src/*.cpp"
 )
 
+# Ensure VirtualTextureSystem.cpp is included
+list(APPEND SRC_FILES "${CMAKE_SOURCE_DIR}/src/VirtualTextureSystem.cpp")
+
 # 收集所有头文件
 file(GLOB_RECURSE HEADER_FILES 
     "include/*.h"
 )
 
+# 添加资源文件
+set(RESOURCE_FILES
+    "${CMAKE_SOURCE_DIR}/ACG_Project.rc"
+    "${CMAKE_SOURCE_DIR}/include/resource.h"
+)
+
 # 生成可执行文件
-add_executable(${PROJECT_NAME} WIN32 ${SRC_FILES} ${HEADER_FILES})
+add_executable(${PROJECT_NAME} WIN32 ${SRC_FILES} ${HEADER_FILES} ${RESOURCE_FILES})
 
 # 查找 vcpkg 安装的依赖包
 find_package(glm REQUIRED)

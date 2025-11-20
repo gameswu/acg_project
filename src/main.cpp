@@ -22,6 +22,7 @@
 #include "imgui_impl_win32.h"
 #include "imgui_impl_dx12.h"
 #include <glm/glm.hpp>
+#include "resource.h"
 
 #include "GUI.h"
 
@@ -104,12 +105,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     
     const wchar_t CLASS_NAME[] = L"ACG DXR Window Class";
 
+    // Load application icon from embedded resource
+    HICON hIcon = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_APP_ICON));
+
     WNDCLASS wc = {};
     wc.lpfnWndProc = WindowProc;
     wc.hInstance = hInstance;
     wc.lpszClassName = CLASS_NAME;
     wc.style = CS_HREDRAW | CS_VREDRAW;
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wc.hIcon = hIcon; // Set the class icon
 
     if (!RegisterClass(&wc)) {
         MessageBox(nullptr, L"Window Registration Failed!", L"Error", MB_ICONEXCLAMATION | MB_OK);
@@ -138,6 +143,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     if (hwnd == nullptr) {
         MessageBox(nullptr, L"Window Creation Failed!", L"Error", MB_ICONEXCLAMATION | MB_OK);
         return 0;
+    }
+
+    // Set window icons (large and small) for title bar and taskbar
+    if (hIcon != NULL) {
+        SendMessage(hwnd, WM_SETICON, ICON_BIG, (LPARAM)hIcon);
+        SendMessage(hwnd, WM_SETICON, ICON_SMALL, (LPARAM)hIcon);
     }
 
     try {

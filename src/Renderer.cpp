@@ -56,7 +56,8 @@ namespace ACG {
         m_isRendering(false),
         m_offlineFenceValue(0),
         m_offlineFenceEvent(nullptr),
-        m_stopRenderRequested(false)
+        m_stopRenderRequested(false),
+        m_useVirtualTextures(false)
     {
         // 初始化OIDN降噪器
         m_denoiser = std::make_unique<Denoiser>();
@@ -119,12 +120,40 @@ namespace ACG {
     }
 
     void Renderer::LoadSceneAsync(const std::string& path, bool useCustomMTLParser) {
+        // Use default batch loading configuration
+        SceneLoadConfig config;
+        config.useCustomMTLParser = useCustomMTLParser;
+        config.enableBatchLoading = true;
+        config.maxMeshesPerBatch = 500;
+        config.maxTexturesPerBatch = 64;
+        config.maxMemoryMB = 4096;
+        LoadSceneAsyncEx(path, config);
+    }
+
+    void Renderer::LoadSceneAsyncEx(const std::string& path, const SceneLoadConfig& config) {
         try {
-            std::cout << "[Async] Loading scene from file..." << std::endl;
+            std::cout << "[Async] Loading scene from file with batch configuration..." << std::endl;
+            std::cout << "[Async] Batch loading: " << (config.enableBatchLoading ? "Enabled" : "Disabled") << std::endl;
+            if (config.enableBatchLoading) {
+                std::cout << "[Async]   Max meshes/batch: " << config.maxMeshesPerBatch << std::endl;
+                std::cout << "[Async]   Max textures/batch: " << config.maxTexturesPerBatch << std::endl;
+                std::cout << "[Async]   Memory limit: " << config.maxMemoryMB << " MB" << std::endl;
+            }
             std::cout.flush();
             
             m_scene = std::make_unique<Scene>();
-            m_scene->LoadFromFile(path, useCustomMTLParser);
+            bool loadSuccess = m_scene->LoadFromFileEx(path, config);
+            
+            if (!loadSuccess) {
+                throw std::runtime_error("Scene loading failed");
+            }
+            
+            // Display loading statistics
+            const auto& stats = m_scene->GetLoadStats();
+            std::cout << "[Async] Scene loaded: " << stats.totalMeshes << " meshes, " 
+                      << stats.totalTriangles << " triangles, " 
+                      << stats.totalVertices << " vertices" << std::endl;
+            std::cout << "[Async] Estimated memory: " << stats.estimatedMemoryMB << " MB" << std::endl;
             
             std::cout << "[Async] Creating shader resources..." << std::endl;
             std::cout.flush();
@@ -297,8 +326,22 @@ namespace ACG {
             D3D12_GPU_DESCRIPTOR_HANDLE envMapHandle = m_srvUavHeap->GetGPUDescriptorHandleForHeapStart();
             envMapHandle.ptr += 6 * m_srvUavDescriptorSize; // slot 6 for environment map
             renderCommandList->SetComputeRootDescriptorTable(7, envMapHandle);
+            
+            // Root parameter 8: Virtual Texture Cache SRV table (bind to descriptor slot 7, t5)
+            if (m_useVirtualTextures) {
+                D3D12_GPU_DESCRIPTOR_HANDLE vtCacheHandle = m_srvUavHeap->GetGPUDescriptorHandleForHeapStart();
+                vtCacheHandle.ptr += 7 * m_srvUavDescriptorSize; // slot 7 for virtual texture cache
+                renderCommandList->SetComputeRootDescriptorTable(8, vtCacheHandle);
+            }
+            
+            // Root parameter 9: Indirection Texture SRV table (bind to descriptor slot 8, t6)
+            if (m_useVirtualTextures) {
+                D3D12_GPU_DESCRIPTOR_HANDLE indirectionHandle = m_srvUavHeap->GetGPUDescriptorHandleForHeapStart();
+                indirectionHandle.ptr += 8 * m_srvUavDescriptorSize; // slot 8 for indirection texture
+                renderCommandList->SetComputeRootDescriptorTable(9, indirectionHandle);
+            }
 
-            // Root parameter 8: Camera constants (32-bit constants)
+            // Root parameter 10: Camera constants (32-bit constants)
             // Compute camera matrices
             glm::vec3 pos = m_camera.GetPosition();
             glm::vec3 dir = m_camera.GetDirection();
@@ -331,7 +374,7 @@ namespace ACG {
             cameraConstants.sunColorEnabled = glm::vec4(m_sunColor, 1.0f);  // Always 1.0, controlled by intensityolled by intensity
             
             // Set root constants (CameraConstants size in DWORDs)
-            renderCommandList->SetComputeRoot32BitConstants(8, sizeof(CameraConstants) / 4, &cameraConstants, 0);
+            renderCommandList->SetComputeRoot32BitConstants(10, sizeof(CameraConstants) / 4, &cameraConstants, 0);
 
             // Dispatch rays with accumulation
             D3D12_DISPATCH_RAYS_DESC dispatchDesc = {};
@@ -400,7 +443,7 @@ namespace ACG {
                 cameraConstants.padding = 0.0f;
                 cameraConstants.sunDirIntensity = glm::vec4(m_sunDirection, m_sunIntensity);
                 cameraConstants.sunColorEnabled = glm::vec4(m_sunColor, 1.0f);  // Always 1.0, controlled by intensity
-                renderCommandList->SetComputeRoot32BitConstants(8, sizeof(CameraConstants) / 4, &cameraConstants, 0);
+                renderCommandList->SetComputeRoot32BitConstants(10, sizeof(CameraConstants) / 4, &cameraConstants, 0);
                 
                 // PIX: Mark individual sample
                 PIXBeginEvent(renderCommandList.Get(), PIX_COLOR_INDEX(2), "Sample %d", sampleIdx + 1);
@@ -490,7 +533,21 @@ namespace ACG {
                         envMapHandle.ptr += 6 * m_srvUavDescriptorSize; // slot 6 for environment map
                         renderCommandList->SetComputeRootDescriptorTable(7, envMapHandle);
                         
-                        // Root parameter 8: Camera constants (need to update frameIndex for next batch)
+                        // Root parameter 8: Virtual Texture Cache SRV table (bind to descriptor slot 7, t5)
+                        if (m_useVirtualTextures) {
+                            D3D12_GPU_DESCRIPTOR_HANDLE vtCacheHandle = m_srvUavHeap->GetGPUDescriptorHandleForHeapStart();
+                            vtCacheHandle.ptr += 7 * m_srvUavDescriptorSize; // slot 7 for virtual texture cache
+                            renderCommandList->SetComputeRootDescriptorTable(8, vtCacheHandle);
+                        }
+                        
+                        // Root parameter 9: Indirection Texture SRV table (bind to descriptor slot 8, t6)
+                        if (m_useVirtualTextures) {
+                            D3D12_GPU_DESCRIPTOR_HANDLE indirectionHandle = m_srvUavHeap->GetGPUDescriptorHandleForHeapStart();
+                            indirectionHandle.ptr += 8 * m_srvUavDescriptorSize; // slot 8 for indirection texture
+                            renderCommandList->SetComputeRootDescriptorTable(9, indirectionHandle);
+                        }
+                        
+                        // Root parameter 10: Camera constants (need to update frameIndex for next batch)
                         // Note: Next batch starts at sampleIdx + 1
                         CameraConstants nextCameraConstants;
                         nextCameraConstants.viewInverse = cameraToWorld;
@@ -502,7 +559,7 @@ namespace ACG {
                         nextCameraConstants.sunDirIntensity = glm::vec4(m_sunDirection, m_sunIntensity);
                         nextCameraConstants.sunColorEnabled = glm::vec4(m_sunColor, 1.0f);  // Always 1.0, controlled by intensity
                         
-                        renderCommandList->SetComputeRoot32BitConstants(8, sizeof(CameraConstants) / 4, &nextCameraConstants, 0);
+                        renderCommandList->SetComputeRoot32BitConstants(10, sizeof(CameraConstants) / 4, &nextCameraConstants, 0);
                         
                         PIXBeginEvent(renderCommandList.Get(), PIX_COLOR_INDEX(1), "Path Tracing Loop");
                     }
@@ -845,7 +902,7 @@ namespace ACG {
 
         // Create SRV/UAV heap for DXR (raytracing resources)
         D3D12_DESCRIPTOR_HEAP_DESC srvUavHeapDesc = {};
-        srvUavHeapDesc.NumDescriptors = 12; // UAV(output) + SRV(TLAS, vertices, indices, triangleMaterials, materials, textures, environment map)
+        srvUavHeapDesc.NumDescriptors = 14; // UAV(output) + SRV(TLAS, vertices, indices, triangleMaterials, materials, textures, environment map, virtual texture cache, indirection texture)
         srvUavHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
         srvUavHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         ThrowIfFailed(m_device->CreateDescriptorHeap(&srvUavHeapDesc, IID_PPV_ARGS(&m_srvUavHeap)));
@@ -1046,20 +1103,22 @@ namespace ACG {
 
     void Renderer::CreateRaytracingRootSignature() {
         // Create a root signature with global resources
-        CD3DX12_DESCRIPTOR_RANGE1 ranges[8];
+        CD3DX12_DESCRIPTOR_RANGE1 ranges[10];  // Extended for Virtual Textures
         ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0); // u0: output texture
         ranges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0); // t0: acceleration structure
         ranges[2].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1, 0); // t1 space0: vertices
         ranges[3].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1, 1); // t1 space1: indices
         ranges[4].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1, 2); // t1 space2: triangle material indices
         ranges[5].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 2); // t2: materials
-        ranges[6].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 3); // t3: textures
+        ranges[6].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 3); // t3: textures (standard texture array)
         ranges[7].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 4); // t4: environment map
+        ranges[8].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 5); // t5: virtual texture cache
+        ranges[9].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 6); // t6: indirection texture
 
         // Static sampler for texture sampling
         CD3DX12_STATIC_SAMPLER_DESC samplerDesc(0, D3D12_FILTER_MIN_MAG_MIP_LINEAR);
 
-        CD3DX12_ROOT_PARAMETER1 rootParameters[9];
+        CD3DX12_ROOT_PARAMETER1 rootParameters[11];  // Extended for Virtual Textures
         rootParameters[0].InitAsDescriptorTable(1, &ranges[0]); // Output UAV
         rootParameters[1].InitAsShaderResourceView(0); // Acceleration structure (SRV)
         rootParameters[2].InitAsDescriptorTable(1, &ranges[2]); // Vertices (t1, space0)
@@ -1068,8 +1127,10 @@ namespace ACG {
         rootParameters[5].InitAsShaderResourceView(2); // Materials (t2) - ROOT DESCRIPTOR
         rootParameters[6].InitAsDescriptorTable(1, &ranges[6]); // Textures (t3)
         rootParameters[7].InitAsDescriptorTable(1, &ranges[7]); // Environment map (t4)
+        rootParameters[8].InitAsDescriptorTable(1, &ranges[8]); // Virtual texture cache (t5)
+        rootParameters[9].InitAsDescriptorTable(1, &ranges[9]); // Indirection texture (t6)
         // Scene constants (b0): view and projection matrices
-        rootParameters[8].InitAsConstants(sizeof(CameraConstants) / 4, 0);
+        rootParameters[10].InitAsConstants(sizeof(CameraConstants) / 4, 0);
 
         CD3DX12_VERSIONED_ROOT_SIGNATURE_DESC rootSignatureDesc;
         rootSignatureDesc.Init_1_1(_countof(rootParameters), rootParameters, 1, &samplerDesc,
@@ -1083,7 +1144,7 @@ namespace ACG {
             signature->GetBufferSize(), IID_PPV_ARGS(&m_raytracingGlobalRootSignature)),
             "Failed to create root signature");
             
-        std::cout << "Root signature created" << std::endl;
+        std::cout << "Root signature created (with Virtual Texture support)" << std::endl;
     }
 
 // Sun setter implementations (moved from header for logging)
@@ -1482,6 +1543,244 @@ void ACG::Renderer::SetSunIntensity(float intensity) {
             }
         }
 
+        // NOTE: Material buffer creation is DEFERRED until after texture system initialization
+        // This allows us to adjust texture indices if using Virtual Textures
+
+        // Upload textures to GPU (with batch processing for large texture sets)
+        if (!textures.empty()) {
+            std::cout << "Uploading " << textures.size() << " textures to GPU..." << std::endl;
+            
+            // **STEP 1: Pre-calculate total texture requirements**
+            int totalTextures = static_cast<int>(textures.size());
+            UINT maxWidth = 0;
+            UINT maxHeight = 0;
+            for (const auto& tex : textures) {
+                maxWidth = std::max(maxWidth, static_cast<UINT>(tex->GetWidth()));
+                maxHeight = std::max(maxHeight, static_cast<UINT>(tex->GetHeight()));
+            }
+            
+            // Calculate memory requirements
+            size_t arrayMemoryMB = (size_t)maxWidth * maxHeight * 4 * totalTextures / (1024 * 1024);
+            std::cout << "  Total textures: " << totalTextures << std::endl;
+            std::cout << "  Max dimensions: " << maxWidth << "x" << maxHeight << std::endl;
+            std::cout << "  Estimated VRAM (Texture Array): " << arrayMemoryMB << " MB" << std::endl;
+            
+            // **DECISION POINT: Use Virtual Textures for very large texture sets**
+            // Virtual Textures use DX12 Tiled Resources for on-demand streaming
+            const size_t MAX_TEXTURE_ARRAY_VRAM_MB = 2048;  // 2GB limit for conventional arrays
+            const UINT MAX_TEXTURE_DIMENSION = 2048;  // Max dimension per texture in array
+            
+            bool useVirtualTextures = false;
+            
+            if (arrayMemoryMB > MAX_TEXTURE_ARRAY_VRAM_MB) {
+                std::cout << "  ⚠ Texture array would require " << arrayMemoryMB << " MB (exceeds " 
+                          << MAX_TEXTURE_ARRAY_VRAM_MB << " MB limit)" << std::endl;
+                std::cout << "  Attempting to use Virtual Texture System..." << std::endl;
+                
+                // Try to initialize Virtual Texture System
+                VirtualTextureConfig vtConfig;
+                vtConfig.tileSize = 256;
+                vtConfig.maxPhysicalPages = 4096;  // 256MB physical memory
+                vtConfig.maxVirtualTextures = 512;
+                
+                if (m_virtualTextureSystem.Initialize(m_device.Get(), vtConfig)) {
+                    std::cout << "  ✓ Virtual Texture System initialized successfully" << std::endl;
+                    
+                    // Add each texture to virtual texture system
+                    bool allTexturesAdded = true;
+                    for (int i = 0; i < totalTextures; ++i) {
+                        int32_t vtIndex = m_virtualTextureSystem.AddVirtualTexture(textures[i]);
+                        if (vtIndex < 0) {
+                            std::cerr << "  ✗ ERROR: Failed to add texture " << i << " to virtual texture system" << std::endl;
+                            allTexturesAdded = false;
+                            break;
+                        }
+                    }
+                    
+                    if (allTexturesAdded) {
+                        // Upload all tiles
+                        if (m_virtualTextureSystem.UploadAllTiles(cmdList, m_commandQueue.Get())) {
+                            // Create indirection texture
+                            if (m_virtualTextureSystem.CreateIndirectionTexture(cmdList, m_commandQueue.Get())) {
+                                // Create SRVs for Virtual Textures
+                                CreateVirtualTextureSRVs();
+                                
+                                useVirtualTextures = true;
+                                m_useVirtualTextures = true;
+                                std::cout << "  ✓ Virtual Texture System ready" << std::endl;
+                            } else {
+                                std::cerr << "  ✗ Failed to create indirection texture" << std::endl;
+                            }
+                        } else {
+                            std::cerr << "  ✗ Failed to upload tiles" << std::endl;
+                        }
+                    }
+                }
+                
+                if (!useVirtualTextures) {
+                    std::cerr << "  ✗ Virtual Texture initialization failed, falling back to downsampling" << std::endl;
+                }
+            }
+            
+            // **FALLBACK: Use conventional texture array with downsampling**
+            if (!useVirtualTextures) {
+                m_useVirtualTextures = false;
+                
+                // Apply aggressive downsampling if needed
+                bool needsDownsampling = false;
+                if (maxWidth > MAX_TEXTURE_DIMENSION || maxHeight > MAX_TEXTURE_DIMENSION) {
+                    needsDownsampling = true;
+                }
+                if (arrayMemoryMB > MAX_TEXTURE_ARRAY_VRAM_MB) {
+                    needsDownsampling = true;
+                }
+                
+                if (needsDownsampling) {
+                    float memoryRatio = static_cast<float>(MAX_TEXTURE_ARRAY_VRAM_MB) / static_cast<float>(arrayMemoryMB);
+                    float dimensionScale = std::sqrt(std::min(memoryRatio, 1.0f));
+                    
+                    UINT targetMaxWidth = static_cast<UINT>(maxWidth * dimensionScale);
+                    UINT targetMaxHeight = static_cast<UINT>(maxHeight * dimensionScale);
+                    
+                    targetMaxWidth = std::min(targetMaxWidth, MAX_TEXTURE_DIMENSION);
+                    targetMaxHeight = std::min(targetMaxHeight, MAX_TEXTURE_DIMENSION);
+                    targetMaxWidth = std::max(targetMaxWidth, 256U);
+                    targetMaxHeight = std::max(targetMaxHeight, 256U);
+                    
+                    std::cout << "  Downsampling textures: " << maxWidth << "x" << maxHeight 
+                              << " -> " << targetMaxWidth << "x" << targetMaxHeight << std::endl;
+                    std::cout << "    Scale factor: " << (dimensionScale * 100.0f) << "%" << std::endl;
+                    
+                    maxWidth = targetMaxWidth;
+                    maxHeight = targetMaxHeight;
+                    
+                    size_t newMemoryMB = (size_t)maxWidth * maxHeight * 4 * totalTextures / (1024 * 1024);
+                    std::cout << "    New estimated VRAM: " << newMemoryMB << " MB" << std::endl;
+                }
+            }
+            
+            // **STEP 2: Create texture array resource**
+            if (!useVirtualTextures) {
+                if (m_textureAtlas == nullptr) {
+                D3D12_RESOURCE_DESC texArrayDesc = {};
+                texArrayDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+                texArrayDesc.Width = maxWidth;
+                texArrayDesc.Height = maxHeight;
+                texArrayDesc.DepthOrArraySize = static_cast<UINT16>(totalTextures);
+                texArrayDesc.MipLevels = 1;
+                texArrayDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+                texArrayDesc.SampleDesc.Count = 1;
+                texArrayDesc.SampleDesc.Quality = 0;
+                texArrayDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+                texArrayDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+                
+                CD3DX12_HEAP_PROPERTIES defaultHeapProps(D3D12_HEAP_TYPE_DEFAULT);
+                ThrowIfFailed(m_device->CreateCommittedResource(
+                    &defaultHeapProps,
+                    D3D12_HEAP_FLAG_NONE,
+                    &texArrayDesc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    nullptr,
+                    IID_PPV_ARGS(&m_textureAtlas)
+                ));
+                m_textureAtlas->SetName(L"Texture Array");
+                std::cout << "  ✓ Texture array created: " << maxWidth << "x" << maxHeight 
+                          << " x " << totalTextures << " slices" << std::endl;
+            }
+            
+            // **STEP 3: Batch upload data**
+            const int MAX_TEXTURES_PER_BATCH = 64;
+            
+            if (totalTextures > MAX_TEXTURES_PER_BATCH) {
+                std::cout << "  Using BATCH UPLOAD (" << MAX_TEXTURES_PER_BATCH 
+                          << " textures per batch)" << std::endl;
+                
+                int numBatches = (totalTextures + MAX_TEXTURES_PER_BATCH - 1) / MAX_TEXTURES_PER_BATCH;
+                
+                for (int batchIdx = 0; batchIdx < numBatches; ++batchIdx) {
+                    int batchStart = batchIdx * MAX_TEXTURES_PER_BATCH;
+                    int batchEnd = std::min(batchStart + MAX_TEXTURES_PER_BATCH, totalTextures);
+                    int batchSize = batchEnd - batchStart;
+                    
+                    std::cout << "  [Batch " << (batchIdx + 1) << "/" << numBatches << "] "
+                              << "Uploading textures " << batchStart << "-" << (batchEnd - 1) 
+                              << " (" << batchSize << " textures)" << std::endl;
+                    
+                    std::vector<std::shared_ptr<Texture>> batchTextures(
+                        textures.begin() + batchStart,
+                        textures.begin() + batchEnd
+                    );
+                    
+                    try {
+                        // Create independent command list for this batch
+                        Microsoft::WRL::ComPtr<ID3D12CommandAllocator> batchAllocator;
+                        ThrowIfFailed(m_device->CreateCommandAllocator(
+                            D3D12_COMMAND_LIST_TYPE_DIRECT,
+                            IID_PPV_ARGS(&batchAllocator)),
+                            "Failed to create batch allocator");
+                        
+                        Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> tempBatchList;
+                        ThrowIfFailed(m_device->CreateCommandList(
+                            0,
+                            D3D12_COMMAND_LIST_TYPE_DIRECT,
+                            batchAllocator.Get(),
+                            nullptr,
+                            IID_PPV_ARGS(&tempBatchList)),
+                            "Failed to create batch command list");
+                        
+                        Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList4> batchCmdList;
+                        ThrowIfFailed(tempBatchList.As(&batchCmdList),
+                            "Failed to query batch command list interface");
+                        
+                        // Upload this batch (no resource creation, just data upload)
+                        UploadTextureBatchData(batchCmdList.Get(), batchTextures, batchStart, maxWidth, maxHeight);
+                        
+                        // Execute and wait for this batch
+                        ThrowIfFailed(batchCmdList->Close(), "Failed to close batch command list");
+                        ID3D12CommandList* lists[] = { batchCmdList.Get() };
+                        m_commandQueue->ExecuteCommandLists(1, lists);
+                        WaitForGpu();
+                        
+                        std::cout << "    ✓ Batch " << (batchIdx + 1) << " completed" << std::endl;
+                    } catch (const std::exception& e) {
+                        std::cerr << "    ✗ Batch " << (batchIdx + 1) << " failed: " << e.what() << std::endl;
+                        throw;
+                    }
+                }
+            } else {
+                // Small texture set, upload all at once using caller's cmdList
+                UploadTextureBatchData(cmdList, textures, 0, maxWidth, maxHeight);
+            }
+            
+            // **STEP 4: Transition resource state (after all batches complete)**
+            auto barrier = CD3DX12_RESOURCE_BARRIER::Transition(
+                m_textureAtlas.Get(),
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+            );
+            cmdList->ResourceBarrier(1, &barrier);
+            
+            // **STEP 5: Create SRV (once, after all uploads)**
+            D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+            srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            srvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+            srvDesc.Texture2DArray.MostDetailedMip = 0;
+            srvDesc.Texture2DArray.MipLevels = 1;
+            srvDesc.Texture2DArray.FirstArraySlice = 0;
+            srvDesc.Texture2DArray.ArraySize = totalTextures;
+            
+            D3D12_CPU_DESCRIPTOR_HANDLE srvHandle = m_srvUavHeap->GetCPUDescriptorHandleForHeapStart();
+            UINT descriptorSize = m_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            D3D12_CPU_DESCRIPTOR_HANDLE textureSrvHandle = { srvHandle.ptr + descriptorSize * 5 };
+            
+            m_device->CreateShaderResourceView(m_textureAtlas.Get(), &srvDesc, textureSrvHandle);
+            
+            std::cout << "  ✓ All textures uploaded and SRV created" << std::endl;
+            } // end if (!useVirtualTextures)
+        } // end if (!textures.empty())
+        
+        // **CREATE MATERIAL BUFFER**
         size_t materialBufferSize = sizeof(GPUMaterial) * materialsCPU.size();
         std::cout << "Creating material buffer: " << materialsCPU.size() << " materials, " 
                   << materialBufferSize << " bytes total, " << sizeof(GPUMaterial) << " bytes per material." << std::endl;
@@ -1490,12 +1789,6 @@ void ACG::Renderer::SetSunIntensity(float intensity) {
             std::cout << "  Material buffer created: GPU address = " << m_materialBuffer->GetGPUVirtualAddress() << std::endl;
         } else {
             std::cout << "  ERROR: Material buffer size is 0!" << std::endl;
-        }
-
-        // Upload textures to GPU
-        if (!textures.empty()) {
-            std::cout << "Uploading " << textures.size() << " textures to GPU..." << std::endl;
-            UploadTexturesToGPU(cmdList, textures);
         }
 
         // Create output texture (UAV)
@@ -1679,30 +1972,26 @@ void ACG::Renderer::SetSunIntensity(float intensity) {
         std::cout << "Shader resources uploaded: vertices=" << vertices.size() << " indices=" << indices.size() << " materials=" << materialsCPU.size() << std::endl;
     }
 
-    void Renderer::UploadTexturesToGPU(ID3D12GraphicsCommandList4* cmdList, const std::vector<std::shared_ptr<Texture>>& textures) {
-        if (textures.empty()) {
-            std::cout << "  No textures to upload" << std::endl;
+    // ==================== TEXTURE MANAGEMENT (CLEAN ARCHITECTURE) ====================
+    
+    /**
+     * @brief Create texture array resource (Step 1: Resource Allocation)
+     * This only allocates GPU memory, does not upload any data
+     */
+    void Renderer::CreateTextureArrayResource(int totalTextures, UINT maxWidth, UINT maxHeight) {
+        if (m_textureAtlas != nullptr) {
+            std::cout << "  Warning: Texture array already exists, skipping creation" << std::endl;
             return;
         }
-
-        std::cout << "  Uploading " << textures.size() << " textures to GPU..." << std::endl;
         
-        // Find max texture dimensions
-        UINT maxWidth = 0;
-        UINT maxHeight = 0;
-        for (const auto& tex : textures) {
-            maxWidth = std::max(maxWidth, static_cast<UINT>(tex->GetWidth()));
-            maxHeight = std::max(maxHeight, static_cast<UINT>(tex->GetHeight()));
-            std::cout << "    [" << (&tex - &textures[0]) << "] " << tex->GetWidth() << "x" << tex->GetHeight() 
-                      << " (" << tex->GetChannels() << " channels)" << std::endl;
-        }
+        std::cout << "  [Resource Allocation] Creating texture array: " 
+                  << maxWidth << "x" << maxHeight << " x " << totalTextures << " slices" << std::endl;
         
-        // Create Texture2DArray
         D3D12_RESOURCE_DESC texArrayDesc = {};
         texArrayDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
         texArrayDesc.Width = maxWidth;
         texArrayDesc.Height = maxHeight;
-        texArrayDesc.DepthOrArraySize = static_cast<UINT16>(textures.size());
+        texArrayDesc.DepthOrArraySize = static_cast<UINT16>(totalTextures);
         texArrayDesc.MipLevels = 1;
         texArrayDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
         texArrayDesc.SampleDesc.Count = 1;
@@ -1718,54 +2007,165 @@ void ACG::Renderer::SetSunIntensity(float intensity) {
             D3D12_RESOURCE_STATE_COPY_DEST,
             nullptr,
             IID_PPV_ARGS(&m_textureAtlas)
-        ));
+        ), "Failed to create texture array");
+        
         m_textureAtlas->SetName(L"Texture Array");
+        std::cout << "  ✓ Texture array resource created" << std::endl;
+    }
+    
+    /**
+     * @brief Upload texture data to existing texture array (Step 2: Data Upload)
+     * Assumes texture array resource was already created by CreateTextureArrayResource
+     */
+    void Renderer::UploadTextureBatchData(ID3D12GraphicsCommandList4* cmdList, 
+                                         const std::vector<std::shared_ptr<Texture>>& textures,
+                                         int startIndex, UINT maxWidth, UINT maxHeight) {
+        if (textures.empty()) {
+            return;
+        }
         
-        // Upload each texture
-        const UINT64 uploadBufferSize = GetRequiredIntermediateSize(m_textureAtlas.Get(), 0, textures.size());
+        if (m_textureAtlas == nullptr) {
+            throw std::runtime_error("Texture array must be created before uploading data");
+        }
         
+        std::cout << "  [Data Upload] Uploading " << textures.size() << " textures starting at index " << startIndex << std::endl;
+        
+        // Calculate upload buffer size for this batch
+        const UINT64 uploadBufferSize = GetRequiredIntermediateSize(m_textureAtlas.Get(), startIndex, textures.size());
+        
+        // Create temporary upload buffer for this batch
         CD3DX12_HEAP_PROPERTIES uploadHeapProps(D3D12_HEAP_TYPE_UPLOAD);
         auto uploadBufferDesc = CD3DX12_RESOURCE_DESC::Buffer(uploadBufferSize);
         
+        Microsoft::WRL::ComPtr<ID3D12Resource> batchUploadBuffer;
         ThrowIfFailed(m_device->CreateCommittedResource(
             &uploadHeapProps,
             D3D12_HEAP_FLAG_NONE,
             &uploadBufferDesc,
             D3D12_RESOURCE_STATE_GENERIC_READ,
             nullptr,
-            IID_PPV_ARGS(&m_textureUpload)
-        ));
+            IID_PPV_ARGS(&batchUploadBuffer)
+        ), "Failed to create upload buffer");
         
-        // Prepare subresource data for each texture
+        // Prepare subresource data
         std::vector<D3D12_SUBRESOURCE_DATA> subresources;
-        std::vector<std::vector<BYTE>> textureData;  // Keep data alive
-        textureData.reserve(textures.size());  // Prevent reallocation
+        std::vector<std::vector<BYTE>> textureData;
+        textureData.reserve(textures.size());
         
         for (size_t i = 0; i < textures.size(); ++i) {
             const auto& tex = textures[i];
             
-            // Convert texture data to RGBA if needed
-            std::vector<BYTE> rgba(maxWidth * maxHeight * 4, 0);
             const unsigned char* srcData = tex->GetRawData();
             int srcChannels = tex->GetChannels();
             int srcWidth = tex->GetWidth();
             int srcHeight = tex->GetHeight();
             
-            for (int y = 0; y < srcHeight; ++y) {
-                for (int x = 0; x < srcWidth; ++x) {
-                    int srcIdx = (y * srcWidth + x) * srcChannels;
-                    int dstIdx = (y * maxWidth + x) * 4;
-                    
-                    if (srcChannels >= 3) {
-                        rgba[dstIdx + 0] = srcData[srcIdx + 0];  // R
-                        rgba[dstIdx + 1] = srcData[srcIdx + 1];  // G
-                        rgba[dstIdx + 2] = srcData[srcIdx + 2];  // B
-                        rgba[dstIdx + 3] = (srcChannels == 4) ? srcData[srcIdx + 3] : 255;  // A
-                    } else if (srcChannels == 1) {
-                        rgba[dstIdx + 0] = srcData[srcIdx];  // R
-                        rgba[dstIdx + 1] = srcData[srcIdx];  // G
-                        rgba[dstIdx + 2] = srcData[srcIdx];  // B
-                        rgba[dstIdx + 3] = 255;  // A
+            // Calculate target dimensions for this texture (maintain aspect ratio)
+            UINT dstWidth = maxWidth;
+            UINT dstHeight = maxHeight;
+            
+            if (srcWidth > 0 && srcHeight > 0) {
+                float aspectRatio = static_cast<float>(srcWidth) / static_cast<float>(srcHeight);
+                
+                if (srcWidth > srcHeight) {
+                    dstWidth = maxWidth;
+                    dstHeight = static_cast<UINT>(maxWidth / aspectRatio);
+                } else {
+                    dstHeight = maxHeight;
+                    dstWidth = static_cast<UINT>(maxHeight * aspectRatio);
+                }
+                
+                // Ensure dimensions don't exceed max
+                dstWidth = std::min(dstWidth, maxWidth);
+                dstHeight = std::min(dstHeight, maxHeight);
+                dstWidth = std::max(dstWidth, 1U);
+                dstHeight = std::max(dstHeight, 1U);
+            }
+            
+            // Allocate texture buffer (full size, will be padded)
+            std::vector<BYTE> rgba(maxWidth * maxHeight * 4, 0);
+            
+            // Resample texture using bilinear interpolation if size differs
+            if (dstWidth != srcWidth || dstHeight != srcHeight) {
+                std::cout << "    Resampling texture " << i << ": " << srcWidth << "x" << srcHeight 
+                          << " -> " << dstWidth << "x" << dstHeight << std::endl;
+                
+                for (UINT y = 0; y < dstHeight; ++y) {
+                    for (UINT x = 0; x < dstWidth; ++x) {
+                        // Calculate source coordinates (bilinear interpolation)
+                        float srcX = (static_cast<float>(x) + 0.5f) * srcWidth / dstWidth - 0.5f;
+                        float srcY = (static_cast<float>(y) + 0.5f) * srcHeight / dstHeight - 0.5f;
+                        
+                        int x0 = static_cast<int>(std::floor(srcX));
+                        int y0 = static_cast<int>(std::floor(srcY));
+                        int x1 = std::min(x0 + 1, srcWidth - 1);
+                        int y1 = std::min(y0 + 1, srcHeight - 1);
+                        x0 = std::max(x0, 0);
+                        y0 = std::max(y0, 0);
+                        
+                        float fx = srcX - x0;
+                        float fy = srcY - y0;
+                        
+                        // Sample 4 neighboring pixels
+                        for (int c = 0; c < 4; ++c) {
+                            float val00, val10, val01, val11;
+                            
+                            if (c < srcChannels) {
+                                int idx00 = (y0 * srcWidth + x0) * srcChannels + c;
+                                int idx10 = (y0 * srcWidth + x1) * srcChannels + c;
+                                int idx01 = (y1 * srcWidth + x0) * srcChannels + c;
+                                int idx11 = (y1 * srcWidth + x1) * srcChannels + c;
+                                
+                                val00 = srcData[idx00];
+                                val10 = srcData[idx10];
+                                val01 = srcData[idx01];
+                                val11 = srcData[idx11];
+                            } else if (c == 3 && srcChannels < 4) {
+                                // Alpha channel
+                                val00 = val10 = val01 = val11 = 255.0f;
+                            } else if (srcChannels == 1 && c < 3) {
+                                // Grayscale to RGB
+                                int idx00 = (y0 * srcWidth + x0) * srcChannels;
+                                int idx10 = (y0 * srcWidth + x1) * srcChannels;
+                                int idx01 = (y1 * srcWidth + x0) * srcChannels;
+                                int idx11 = (y1 * srcWidth + x1) * srcChannels;
+                                
+                                val00 = srcData[idx00];
+                                val10 = srcData[idx10];
+                                val01 = srcData[idx01];
+                                val11 = srcData[idx11];
+                            } else {
+                                val00 = val10 = val01 = val11 = 0.0f;
+                            }
+                            
+                            // Bilinear interpolation
+                            float val0 = val00 * (1.0f - fx) + val10 * fx;
+                            float val1 = val01 * (1.0f - fx) + val11 * fx;
+                            float val = val0 * (1.0f - fy) + val1 * fy;
+                            
+                            int dstIdx = (y * maxWidth + x) * 4 + c;
+                            rgba[dstIdx] = static_cast<BYTE>(std::min(std::max(val, 0.0f), 255.0f));
+                        }
+                    }
+                }
+            } else {
+                // Direct copy (no resampling needed)
+                for (int y = 0; y < srcHeight; ++y) {
+                    for (int x = 0; x < srcWidth; ++x) {
+                        int srcIdx = (y * srcWidth + x) * srcChannels;
+                        int dstIdx = (y * maxWidth + x) * 4;
+                        
+                        if (srcChannels >= 3) {
+                            rgba[dstIdx + 0] = srcData[srcIdx + 0];
+                            rgba[dstIdx + 1] = srcData[srcIdx + 1];
+                            rgba[dstIdx + 2] = srcData[srcIdx + 2];
+                            rgba[dstIdx + 3] = (srcChannels == 4) ? srcData[srcIdx + 3] : 255;
+                        } else if (srcChannels == 1) {
+                            rgba[dstIdx + 0] = srcData[srcIdx];
+                            rgba[dstIdx + 1] = srcData[srcIdx];
+                            rgba[dstIdx + 2] = srcData[srcIdx];
+                            rgba[dstIdx + 3] = 255;
+                        }
                     }
                 }
             }
@@ -1780,10 +2180,27 @@ void ACG::Renderer::SetSunIntensity(float intensity) {
         }
         
         // Upload to GPU
-        UpdateSubresources(cmdList, m_textureAtlas.Get(), m_textureUpload.Get(), 
-                          0, 0, static_cast<UINT>(subresources.size()), subresources.data());
+        UpdateSubresources(cmdList, m_textureAtlas.Get(), batchUploadBuffer.Get(),
+                          0, startIndex, static_cast<UINT>(subresources.size()), subresources.data());
         
-        // Transition to shader resource
+        // Keep upload buffer alive (stored as member to prevent premature destruction)
+        m_textureUpload = batchUploadBuffer;
+        
+        std::cout << "  ✓ Batch data uploaded to GPU" << std::endl;
+    }
+    
+    /**
+     * @brief Finalize texture array (Step 3: State Transition & Descriptor Creation)
+     * Transitions resource to shader-readable state and creates SRV
+     */
+    void Renderer::FinalizeTextureArray(ID3D12GraphicsCommandList4* cmdList, int totalTextures) {
+        if (m_textureAtlas == nullptr) {
+            throw std::runtime_error("Texture array must exist before finalization");
+        }
+        
+        std::cout << "  [Finalization] Transitioning texture array to shader resource state" << std::endl;
+        
+        // Transition resource state
         auto barrier = CD3DX12_RESOURCE_BARRIER::Transition(
             m_textureAtlas.Get(),
             D3D12_RESOURCE_STATE_COPY_DEST,
@@ -1791,7 +2208,7 @@ void ACG::Renderer::SetSunIntensity(float intensity) {
         );
         cmdList->ResourceBarrier(1, &barrier);
         
-        // Create SRV in descriptor heap (slot t3 = index 3)
+        // Create SRV in descriptor heap (slot 5 for t3)
         D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
         srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         srvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -1799,17 +2216,44 @@ void ACG::Renderer::SetSunIntensity(float intensity) {
         srvDesc.Texture2DArray.MostDetailedMip = 0;
         srvDesc.Texture2DArray.MipLevels = 1;
         srvDesc.Texture2DArray.FirstArraySlice = 0;
-        srvDesc.Texture2DArray.ArraySize = static_cast<UINT>(textures.size());
+        srvDesc.Texture2DArray.ArraySize = totalTextures;
         
         D3D12_CPU_DESCRIPTOR_HANDLE srvHandle = m_srvUavHeap->GetCPUDescriptorHandleForHeapStart();
         UINT descriptorSize = m_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-        D3D12_CPU_DESCRIPTOR_HANDLE textureSrvHandle = { srvHandle.ptr + descriptorSize * 5 };  // Slot 5 for t3 (avoid collision)
+        D3D12_CPU_DESCRIPTOR_HANDLE textureSrvHandle = { srvHandle.ptr + descriptorSize * 5 };
         
         m_device->CreateShaderResourceView(m_textureAtlas.Get(), &srvDesc, textureSrvHandle);
         
-        std::cout << "  ✓ Texture array uploaded: " << textures.size() << " textures, " 
-                  << maxWidth << "x" << maxHeight << " per slice" << std::endl;
+        std::cout << "  ✓ Texture array finalized: " << totalTextures << " textures ready for rendering" << std::endl;
     }
+    
+    /**
+     * @brief Create Virtual Texture SRVs (for Virtual Texture System)
+     * Creates SRVs for physical page cache (t5) and indirection texture (t6)
+     */
+    void Renderer::CreateVirtualTextureSRVs() {
+        if (!m_useVirtualTextures) {
+            return;
+        }
+        
+        std::cout << "  Creating Virtual Texture SRVs..." << std::endl;
+        
+        D3D12_CPU_DESCRIPTOR_HANDLE srvHandle = m_srvUavHeap->GetCPUDescriptorHandleForHeapStart();
+        UINT descriptorSize = m_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        
+        // Slot 7: Virtual Texture Cache (t5) - physical page cache
+        D3D12_CPU_DESCRIPTOR_HANDLE virtualTextureCacheSrv = { srvHandle.ptr + descriptorSize * 7 };
+        
+        // Slot 8: Indirection Texture (t6) - lookup table
+        D3D12_CPU_DESCRIPTOR_HANDLE indirectionTextureSrv = { srvHandle.ptr + descriptorSize * 8 };
+        
+        // Call Virtual Texture System to create its SRVs
+        m_virtualTextureSystem.CreateShaderResourceView(m_device.Get(), virtualTextureCacheSrv, indirectionTextureSrv);
+        
+        std::cout << "  ✓ Virtual Texture SRVs created (slots 7 and 8)" << std::endl;
+    }
+
+    // ==================== ENVIRONMENT MAP ====================
 
     Microsoft::WRL::ComPtr<ID3D12Resource> Renderer::UploadEnvironmentMap(ID3D12GraphicsCommandList4* cmdList, const std::shared_ptr<Texture>& envMap) {
         if (!envMap || !envMap->IsHDR()) {
@@ -2216,4 +2660,5 @@ void ACG::Renderer::SetSunIntensity(float intensity) {
         
         std::cout << "Environment map cleared" << std::endl;
     }
-}
+
+} // namespace ACG

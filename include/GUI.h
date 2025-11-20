@@ -24,6 +24,12 @@ struct GUIState {
     bool autoRenderOnLoad = false;
     bool useCustomMTLParser = true;  // Use custom MTL parser for OBJ files
     
+    // Batch loading settings for large scenes
+    bool enableBatchLoading = true;
+    int maxMeshesPerBatch = 500;
+    int maxTexturesPerBatch = 64;
+    int maxMemoryMB = 4096;  // 4GB default
+    
     // Lighting settings
     float envLightIntensity = 0.5f;
     float sunIntensity = 0.0f;

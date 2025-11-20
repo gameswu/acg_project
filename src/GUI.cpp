@@ -173,6 +173,34 @@ void RenderSettingsWindow(ACG::Renderer* renderer, GUIState& state, HWND hwnd) {
         ImGui::SetTooltip("Enable custom MTL parser for accurate material loading from OBJ files.\nDisabled automatically for non-OBJ formats (FBX, GLTF, etc.)");
     }
     
+    // Batch loading configuration
+    ImGui::Separator();
+    ImGui::Text("Batch Loading (for large scenes)");
+    ImGui::Checkbox("Enable Batch Loading", &state.enableBatchLoading);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Load large scenes in batches to avoid memory overflow.\nRecommended for scenes with >500 meshes or >1M triangles.");
+    }
+    
+    if (state.enableBatchLoading) {
+        ImGui::PushItemWidth(150);
+        ImGui::SliderInt("Meshes/Batch", &state.maxMeshesPerBatch, 100, 2000);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Number of meshes to process in each batch.\nLower = less memory, slower loading");
+        }
+        
+        ImGui::SliderInt("Textures/Batch", &state.maxTexturesPerBatch, 16, 128);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Maximum textures to load per batch");
+        }
+        
+        ImGui::SliderInt("Memory Limit (MB)", &state.maxMemoryMB, 1024, 8192);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Estimated memory usage limit (warning only)");
+        }
+        ImGui::PopItemWidth();
+    }
+    ImGui::Separator();
+    
     ImGui::InputText("Output Path", state.outputPath, sizeof(state.outputPath));
     ImGui::SameLine();
     if (ImGui::Button("Browse##Output")) {
@@ -225,6 +253,12 @@ void RenderControlsWindow(ACG::Renderer* renderer, GUIState& state) {
                 int renderHeight = state.height;
                 bool useCustomMTL = state.useCustomMTLParser;
                 
+                // Batch loading configuration
+                bool enableBatch = state.enableBatchLoading;
+                int meshesPerBatch = state.maxMeshesPerBatch;
+                int texturesPerBatch = state.maxTexturesPerBatch;
+                int memoryLimit = state.maxMemoryMB;
+                
                 // Join previous thread if exists
                 if (g_renderThread && g_renderThread->joinable()) {
                     g_renderThread->join();
@@ -247,7 +281,7 @@ void RenderControlsWindow(ACG::Renderer* renderer, GUIState& state) {
                 // Record start time
                 auto startTime = std::chrono::steady_clock::now();
                 
-                g_renderThread = std::make_unique<std::thread>([renderer, modelPathStr, outputPathStr, envMapPathStr, samples, bounces, renderWidth, renderHeight, needsSceneLoad, needsEnvMapLoad, useCustomMTL, startTime, &state]() {
+                g_renderThread = std::make_unique<std::thread>([renderer, modelPathStr, outputPathStr, envMapPathStr, samples, bounces, renderWidth, renderHeight, needsSceneLoad, needsEnvMapLoad, useCustomMTL, enableBatch, meshesPerBatch, texturesPerBatch, memoryLimit, startTime, &state]() {
                     try {
                         // Set rendering flags at the start
                         g_isRendering.store(true);
@@ -259,7 +293,16 @@ void RenderControlsWindow(ACG::Renderer* renderer, GUIState& state) {
                         if (needsSceneLoad) {
                             std::cout << "[Async] Loading scene: " << modelPathStr << std::endl;
                             std::cout.flush();
-                            renderer->LoadSceneAsync(modelPathStr, useCustomMTL);
+                            
+                            // Configure batch loading
+                            ACG::SceneLoadConfig config;
+                            config.useCustomMTLParser = useCustomMTL;
+                            config.enableBatchLoading = enableBatch;
+                            config.maxMeshesPerBatch = meshesPerBatch;
+                            config.maxTexturesPerBatch = texturesPerBatch;
+                            config.maxMemoryMB = memoryLimit;
+                            
+                            renderer->LoadSceneAsyncEx(modelPathStr, config);
                         } else {
                             std::cout << "[Async] Using already loaded scene" << std::endl;
                             std::cout.flush();

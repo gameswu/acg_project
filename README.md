@@ -1,6 +1,11 @@
 # ACG Project
 <div align="center">
-<i>2025 Fall Advanced Computer Graphics</i>
+<img src="docs/images/logo.png" alt="ACG Logo" width="200"/>
+
+<img src="https://img.shields.io/github/license/gameswu/acg_project.svg" alt="License"/>
+<img src="https://img.shields.io/badge/Course-ACG-blue" alt="Custom Badge"/>
+<img src="https://img.shields.io/badge/Semester-Fall%202025-blue" alt="Custom Badge"/>
+<img src="https://img.shields.io/badge/Nvidia-DXR%20Supported-brightgreen?logo=nvidia&logoColor=green" alt="DXR Supported"/>
 </div>
 
 This repository contains the code and resources for the Advanced Computer Graphics (ACG) project for the Fall 2025 semester. The project focuses on ray tracing techniques and rendering algorithms.
@@ -60,9 +65,11 @@ acg_project/
 │   ├── Mesh.h           # Geometry mesh
 │   ├── MTLParser.h      # MTL file parser
 │   ├── Renderer.h       # GPU renderer (DirectX 12)
+│   ├── Resource.h       # Resource definitions (icons, etc.)
 │   ├── Sampler.h        # Sampler (importance sampling, MIS)
 │   ├── Scene.h          # Scene management
-│   └── Texture.h        # Texture system (supports Mipmap)
+│   ├── Texture.h        # Texture system (supports Mipmap)
+│   └── VirtualTextureSystem.h # Virtual Texture System
 │
 ├── src/                 # Source files directory
 │   ├── Camera.cpp
@@ -77,6 +84,7 @@ acg_project/
 │   ├── Sampler.cpp
 │   ├── Scene.cpp
 │   ├── Texture.cpp
+│   ├── VirtualTextureSystem.cpp
 │   └── main.cpp         # Main program entry point
 │
 ├── shaders/             # Shader files directory
@@ -90,8 +98,12 @@ acg_project/
 │
 ├── docs/                # Documentation directory
 ├── tests/               # Test scenes and scripts
+├── ACG_Project.rc       # Resource script for application icon
 ├── CMakeLists.txt       # CMake build configuration
 ├── vcpkg.json           # vcpkg dependency configuration
+├── requirements.txt     # Python dependencies for test scripts
+├── logo.ico             # Application icon file
+├── LICENSE              # License file
 └── README.md            # Project description
 ```
 
