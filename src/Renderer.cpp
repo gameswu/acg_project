@@ -1779,6 +1779,16 @@ void ACG::Renderer::SetSunIntensity(float intensity) {
             std::cout << "  ✓ All textures uploaded and SRV created" << std::endl;
             } // end if (!useVirtualTextures)
         } // end if (!textures.empty())
+
+        // If virtual texturing is disabled, force params3.xy = 0 so shaders use the atlas path.
+        // Otherwise the shader will think every material uses the VT system and sample from
+        // g_virtualTextureCache even when that resource is not bound, resulting in white materials.
+        if (!m_useVirtualTextures) {
+            for (auto& mat : materialsCPU) {
+                mat.params3.x = 0.0f;
+                mat.params3.y = 0.0f;
+            }
+        }
         
         // **CREATE MATERIAL BUFFER**
         size_t materialBufferSize = sizeof(GPUMaterial) * materialsCPU.size();
