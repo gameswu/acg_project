@@ -1544,13 +1544,21 @@ void ACG::Renderer::SetSunIntensity(float intensity) {
                 
                 // Set texture size and normalized scale if texture exists
                 if (texIdx >= 0 && texIdx < textures.size()) {
-                    float texWidth = static_cast<float>(textures[texIdx]->GetWidth());
-                    float texHeight = static_cast<float>(textures[texIdx]->GetHeight());
-                    float scaleX = (atlasMaxWidth > 0) ? texWidth / static_cast<float>(atlasMaxWidth) : 1.0f;
-                    float scaleY = (atlasMaxHeight > 0) ? texHeight / static_cast<float>(atlasMaxHeight) : 1.0f;
+                    float srcW = static_cast<float>(textures[texIdx]->GetWidth());
+                    float srcH = static_cast<float>(textures[texIdx]->GetHeight());
+                    // Compute destination size using uniform scale that fits within atlas max
+                    float scale = 1.0f;
+                    if (atlasMaxWidth > 0 && atlasMaxHeight > 0) {
+                        scale = std::min(static_cast<float>(atlasMaxWidth) / srcW,
+                                         static_cast<float>(atlasMaxHeight) / srcH);
+                    }
+                    float dstW = std::max(1.0f, std::floor(srcW * scale + 0.5f));
+                    float dstH = std::max(1.0f, std::floor(srcH * scale + 0.5f));
+                    float normScaleX = (atlasMaxWidth > 0) ? (dstW / static_cast<float>(atlasMaxWidth)) : 1.0f;
+                    float normScaleY = (atlasMaxHeight > 0) ? (dstH / static_cast<float>(atlasMaxHeight)) : 1.0f;
                     // params3.xy = original texture pixel size
-                    // params3.zw = normalized scale within texture array slice
-                    mat.params3 = glm::vec4(texWidth, texHeight, scaleX, scaleY);
+                    // params3.zw = normalized scale (dst size / atlas max)
+                    mat.params3 = glm::vec4(srcW, srcH, normScaleX, normScaleY);
                 } else {
                     mat.params3 = glm::vec4(0.0f, 0.0f, 0.0f, 0.0f);
                 }
@@ -2093,21 +2101,14 @@ void ACG::Renderer::SetSunIntensity(float intensity) {
             UINT dstHeight = maxHeight;
             
             if (srcWidth > 0 && srcHeight > 0) {
-                float aspectRatio = static_cast<float>(srcWidth) / static_cast<float>(srcHeight);
-                
-                if (srcWidth > srcHeight) {
-                    dstWidth = maxWidth;
-                    dstHeight = static_cast<UINT>(maxWidth / aspectRatio);
-                } else {
-                    dstHeight = maxHeight;
-                    dstWidth = static_cast<UINT>(maxHeight * aspectRatio);
-                }
-                
-                // Ensure dimensions don't exceed max
-                dstWidth = std::min(dstWidth, maxWidth);
-                dstHeight = std::min(dstHeight, maxHeight);
-                dstWidth = std::max(dstWidth, 1U);
-                dstHeight = std::max(dstHeight, 1U);
+                // Compute uniform scale to fit source within atlas max while preserving aspect
+                float scaleW = static_cast<float>(maxWidth) / static_cast<float>(srcWidth);
+                float scaleH = static_cast<float>(maxHeight) / static_cast<float>(srcHeight);
+                float scale = std::min(scaleW, scaleH);
+                UINT calcW = static_cast<UINT>(std::max(1.0f, std::floor(srcWidth * scale + 0.5f)));
+                UINT calcH = static_cast<UINT>(std::max(1.0f, std::floor(srcHeight * scale + 0.5f)));
+                dstWidth = std::min(calcW, maxWidth);
+                dstHeight = std::min(calcH, maxHeight);
             }
             
             // Allocate texture buffer (full size, will be padded)
