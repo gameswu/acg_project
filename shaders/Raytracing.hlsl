@@ -134,9 +134,12 @@ void RayGen()
     // CRITICAL: Each sample must have different seed to generate different random sequences
     uint rngState = InitRNG(dispatchIdx, frameIndex, frameIndex * 17);
     
-    // For pinhole camera, NO pixel jitter - always sample pixel center
-    // Variance comes from random bounce directions in path tracing
-    float2 pixelCenter = (float2)dispatchIdx + float2(0.5, 0.5);
+    // Subpixel jitter for anti-aliasing: sample uniformly inside pixel
+    // Use per-pixel RNG to produce two independent jitter offsets in [0,1)
+    // This implements industry-standard random subpixel sampling for AA.
+    float jitterX = Random(rngState);
+    float jitterY = Random(rngState);
+    float2 pixelCenter = (float2)dispatchIdx + float2(jitterX, jitterY);
     float2 uv = pixelCenter / (float2)renderTargetSize; // [0,1]
     
     // Simple pinhole camera model
