@@ -115,6 +115,8 @@ acg_project/
 >
 > We only support DX12 on Windows, and the hardware supports DirectX Raytracing (DXR).
 
+uv is needed to create a virtual environment for python dependencies. Then run `setup_loader.bat` first to setup the python scene loader.
+
 We provide a GUI for users to configure rendering settings and load scenes. The GUI allows you to adjust parameters such as samples per pixel, maximum bounces, and load different 3D models.
 
 <div align="center">
@@ -155,7 +157,12 @@ This project requires the following dependencies:
 
 For debugging and performance analysis, we use [PIX for Windows](https://devblogs.microsoft.com/pix/).
 
-[MTL format](https://paulbourke.net/dataformats/mtl/) and [OBJ format](https://paulbourke.net/dataformats/obj/obj_spec.pdf) are used for material and model files, respectively.
+We know support Wavefront OBJ files and Blender files as scene inputs. As python loader is used to parse these files, we use uv as following:
+```bash
+uv venv --python 3.11 # bpy requires python 3.11
+.venv\Scripts\activate # On Windows
+uv pip install -r requirements.txt
+```
 
 ### Building the Project
 
@@ -176,9 +183,6 @@ To build the project, follow these steps:
 We offer several test scenes located in the `tests` directory. You can load these scenes through the GUI by specifying the model path in the Render Settings section. Using the python script to unzip all test scenes:
 
 ```bash
-python -m venv .venv
-.venv\Scripts\activate # On Windows
-pip install -r requirements.txt
 cd tests
 python download.py
 python unzip.py

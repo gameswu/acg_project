@@ -1,2 +1,11 @@
-# Optional dependencies for auxiliary scripts
+# Wavefront OBJ/MTL parser
+PyWavefront>=1.3.3
+
+# Blender Python API
+bpy>=5.0.0
+
+# Numpy for numerical operations
+numpy>=1.21.0
+
+# Auxiliary scripts
 requests>=2.31.0

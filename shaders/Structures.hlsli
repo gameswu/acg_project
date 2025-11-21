@@ -10,54 +10,120 @@ struct Vertex {
     float _pad;       // 4 bytes padding -> total 48 bytes (aligned to 16)
 };
 
-// Material structure designed for GPU path tracing
-// Layout follows Wavefront MTL specification (v4.2, October 1995)
-// All fields are float4 (16-byte aligned) for consistent memory access
-//
-// MTL Material Properties Mapping:
-// - albedo.rgb  = Kd (Diffuse reflectivity, 0.0-1.0)
-// - albedo.a    = d (Dissolve factor, 1.0=opaque)
-// - emission.rgb = Ke (Emissive color, 0.0+)
-// - specular.rgb = Ks (Specular reflectivity, 0.0-1.0)
-// - specular.a  = Ns (Specular exponent, 0-1000)
-// - params1.w   = Ni (Optical density/IOR, 0.001-10)
-// - params2.z   = illum (Illumination model, 0-10)
-//
-// Illumination Models (MTL spec):
-// 0  = Flat color (no lighting)
-// 1  = Diffuse (Lambertian)
-// 2  = Diffuse + Specular (Blinn-Phong) [most common]
-// 3  = Reflection (ray traced)
-// 4  = Glass (transparency + reflection)
-// 5  = Fresnel Mirror (perfect reflection)
-// 6  = Refraction (Fresnel off)
-// 7  = Refraction + Fresnel (realistic glass)
-// 8  = Reflection (no ray trace)
-// 9  = Glass (no ray trace)
-// 10 = Shadow matte
+// ============================================================================
+// Material Layer Flags (must match MaterialLayers.h)
+// ============================================================================
+#define LAYER_NONE           0
+#define LAYER_CLEARCOAT      (1 << 0)
+#define LAYER_TRANSMISSION   (1 << 1)
+#define LAYER_SHEEN          (1 << 2)
+#define LAYER_SUBSURFACE     (1 << 3)
+#define LAYER_ANISOTROPY     (1 << 4)
+#define LAYER_IRIDESCENCE    (1 << 5)
+#define LAYER_VOLUME         (1 << 6)
+
+// ============================================================================
+// Material Structure (64 bytes, matches MaterialData in Material.h)
+// ============================================================================
 struct Material {
-    float4 albedo;              // 0-15: Kd (RGB) + d (A)
-    float4 emission;            // 16-31: Ke (RGB) + intensity (A)
-    float4 specular;            // 32-47: Ks (RGB) + Ns (A)
-    float4 params1;             // 48-63: type, metallic, roughness, Ni
-    float4 params2;             // 64-79: transmission, albedoTextureIndex, illum, subsurface
-    float4 params3;             // 80-95: textureWidth, textureHeight, textureScaleX, textureScaleY
-    // Total: 96 bytes (6 * 16) - guaranteed aligned
+    // Base PBR properties (32 bytes)
+    float3 baseColor;           // 0-11: RGB diffuse/albedo
+    float metallic;             // 12-15: Metallic factor [0,1]
     
-    // Helper accessors for type-safe parameter access
-    uint GetType() { return uint(round(params1.x)); }
-    float GetMetallic() { return params1.y; }
-    float GetRoughness() { return params1.z; }
-    float GetIOR() { return params1.w; }
-    float GetTransmission() { return params2.x; }
-    int GetAlbedoTextureIndex() { return int(round(params2.y)); }
-    int GetIllum() { return int(round(params2.z)); }
-    float GetSubsurface() { return params2.w; }
-    float2 GetTextureSize() { return params3.xy; }
-    float2 GetTextureScale() { return params3.zw; }
+    float3 emission;            // 16-27: Emissive color (HDR)
+    float roughness;            // 28-31: Surface roughness [0,1]
     
-    // Texture sampling helpers (for future use)
-    bool HasAlbedoTexture() { return GetAlbedoTextureIndex() >= 0; }
+    float ior;                  // 32-35: Index of refraction
+    float opacity;              // 36-39: Opacity [0,1]
+    uint layerFlags;            // 40-43: Bit flags for enabled layers
+    uint extendedDataIndex;     // 44-47: Index into layer buffer
+    
+    // Texture indices (16 bytes)
+    int baseColorTexIdx;        // 48-51: Base color texture (-1 = none)
+    int normalTexIdx;           // 52-55: Normal map (-1 = none)
+    int metallicRoughnessTexIdx;// 56-59: Packed texture (-1 = none)
+    int emissionTexIdx;         // 60-63: Emission texture (-1 = none)
+    
+    // Total: 64 bytes
+};
+
+// ============================================================================
+// Extended Layer Structures (32 bytes each, matches MaterialLayers.h)
+// ============================================================================
+
+struct ClearcoatLayer {
+    float strength;             // 0-3
+    float roughness;            // 4-7
+    float ior;                  // 8-11
+    float padding0;             // 12-15
+    
+    float3 tint;                // 16-27
+    int textureIdx;             // 28-31
+};
+
+struct TransmissionLayer {
+    float strength;             // 0-3
+    float roughness;            // 4-7
+    float depth;                // 8-11
+    int textureIdx;             // 12-15
+    
+    float3 color;               // 16-27
+    float padding0;             // 28-31
+};
+
+struct SheenLayer {
+    float3 color;               // 0-11
+    float roughness;            // 12-15
+    
+    float3 tint;                // 16-27
+    int textureIdx;             // 28-31
+};
+
+struct SubsurfaceLayer {
+    float3 color;               // 0-11
+    float radius;               // 12-15
+    
+    float3 radiusScale;         // 16-27
+    float anisotropy;           // 28-31
+};
+
+struct AnisotropyLayer {
+    float strength;             // 0-3
+    float rotation;             // 4-7
+    float aspectRatio;          // 8-11
+    int textureIdx;             // 12-15
+    
+    float3 tangent;             // 16-27
+    float padding0;             // 28-31
+};
+
+struct IridescenceLayer {
+    float strength;             // 0-3
+    float ior;                  // 4-7
+    float thicknessMin;         // 8-11
+    float thicknessMax;         // 12-15
+    
+    int textureIdx;             // 16-19
+    int thicknessTexIdx;        // 20-23
+    int2 padding;               // 24-31
+};
+
+struct VolumeLayer {
+    float3 scatterColor;        // 0-11
+    float scatterDistance;      // 12-15
+    
+    float3 absorptionColor;     // 16-27
+    float density;              // 28-31
+};
+
+// ============================================================================
+// Material Extended Data (Union replacement for HLSL)
+// ============================================================================
+// In C++ this is a union of all layer types. In HLSL we use raw float4x2 storage.
+// Total: 32 bytes = 8 floats = 2 float4s
+struct MaterialExtendedData {
+    float4 data0;  // Bytes 0-15
+    float4 data1;  // Bytes 16-31
 };
 
 struct Light {

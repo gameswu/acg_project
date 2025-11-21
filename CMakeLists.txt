@@ -54,8 +54,6 @@ add_executable(${PROJECT_NAME} WIN32 ${SRC_FILES} ${HEADER_FILES} ${RESOURCE_FIL
 find_package(glm REQUIRED)
 find_package(imgui CONFIG REQUIRED)
 find_package(Stb REQUIRED)
-find_package(assimp CONFIG REQUIRED)
-find_package(nlohmann_json CONFIG REQUIRED)
 find_package(OpenEXR CONFIG REQUIRED)
 find_package(tinyexr CONFIG REQUIRED)
 find_package(miniz CONFIG REQUIRED)
@@ -64,8 +62,6 @@ find_package(miniz CONFIG REQUIRED)
 target_link_libraries(${PROJECT_NAME} PRIVATE 
     glm::glm
     imgui::imgui
-    assimp::assimp
-    nlohmann_json::nlohmann_json
     OpenEXR::OpenEXR
     unofficial::tinyexr::tinyexr
     miniz::miniz
@@ -140,24 +136,95 @@ add_custom_command(TARGET ${PROJECT_NAME} PRE_BUILD
     ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/shaders
 )
 
-# 复制 DXC 编译器 DLL 到 bin 目录
-# DXC 位于 Windows SDK 中
-set(WINDOWS_SDK_BIN_PATH "C:/Program Files (x86)/Windows Kits/10/bin/10.0.26100.0/x64")
-if(EXISTS "${WINDOWS_SDK_BIN_PATH}/dxcompiler.dll")
-    add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${WINDOWS_SDK_BIN_PATH}/dxcompiler.dll"
-        ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/dxcompiler.dll
-        COMMENT "Copying dxcompiler.dll from Windows SDK"
-    )
-    add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${WINDOWS_SDK_BIN_PATH}/dxil.dll"
-        ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/dxil.dll
-        COMMENT "Copying dxil.dll from Windows SDK"
-    )
+# ============================================================================
+# Python Loader Setup (Direct Script Approach)
+# ============================================================================
+
+message(STATUS "Copying Python loader to bin/loader/")
+
+# Create loader directory
+add_custom_command(TARGET ${PROJECT_NAME} PRE_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory
+    ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/loader
+    COMMENT "Creating loader directory"
+)
+
+# Copy entire loader directory to bin
+add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+    ${CMAKE_SOURCE_DIR}/loader
+    ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/loader
+    COMMENT "Copying loader directory"
+)
+
+# Copy setup script to bin
+add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    ${CMAKE_SOURCE_DIR}/setup_loader.bat
+    ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/setup_loader.bat
+    COMMENT "Copying setup_loader.bat"
+)
+
+# Copy requirements.txt to bin
+add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    ${CMAKE_SOURCE_DIR}/requirements.txt
+    ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/loader/requirements.txt
+    COMMENT "Copying requirements.txt"
+)
+
+message(STATUS "Python loader will use virtual environment at bin/loader/.venv")
+message(STATUS "Run setup_loader.bat in project root to setup environment first")
+
+
+# ============================================================================
+# Copy DXC Compiler DLLs from Windows SDK
+# ============================================================================
+
+# Find Windows SDK installation directory
+set(WINDOWS_SDK_BASE "C:/Program Files (x86)/Windows Kits/10/bin")
+
+if(EXISTS ${WINDOWS_SDK_BASE})
+    # Get all SDK version directories and sort them
+    file(GLOB SDK_VERSIONS "${WINDOWS_SDK_BASE}/10.0.*")
+    list(SORT SDK_VERSIONS)
+    list(REVERSE SDK_VERSIONS)  # Latest version first
+    
+    # Try each version until we find DXC DLLs
+    set(DXC_FOUND FALSE)
+    foreach(SDK_VERSION_PATH ${SDK_VERSIONS})
+        get_filename_component(SDK_VERSION ${SDK_VERSION_PATH} NAME)
+        set(WINDOWS_SDK_BIN_PATH "${SDK_VERSION_PATH}/x64")
+        
+        if(EXISTS "${WINDOWS_SDK_BIN_PATH}/dxcompiler.dll" AND EXISTS "${WINDOWS_SDK_BIN_PATH}/dxil.dll")
+            message(STATUS "Found Windows SDK ${SDK_VERSION}")
+            message(STATUS "DXC DLLs location: ${WINDOWS_SDK_BIN_PATH}")
+            
+            add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${WINDOWS_SDK_BIN_PATH}/dxcompiler.dll"
+                ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/dxcompiler.dll
+                COMMENT "Copying dxcompiler.dll from Windows SDK ${SDK_VERSION}"
+            )
+            add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${WINDOWS_SDK_BIN_PATH}/dxil.dll"
+                ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/dxil.dll
+                COMMENT "Copying dxil.dll from Windows SDK ${SDK_VERSION}"
+            )
+            
+            set(DXC_FOUND TRUE)
+            break()
+        endif()
+    endforeach()
+    
+    if(NOT DXC_FOUND)
+        message(WARNING "DXC DLLs not found in any Windows SDK version at ${WINDOWS_SDK_BASE}")
+        message(WARNING "You may need to install Windows SDK or copy DXC DLLs manually")
+    endif()
 else()
-    message(WARNING "DXC DLLs not found at ${WINDOWS_SDK_BIN_PATH}, you may need to copy them manually")
+    message(WARNING "Windows SDK not found at ${WINDOWS_SDK_BASE}")
+    message(WARNING "You may need to copy dxcompiler.dll and dxil.dll manually to bin/")
 endif()
 
 # 设置Visual Studio的源文件组织

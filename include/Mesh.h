@@ -1,5 +1,6 @@
 #pragma once
 
+#include <string>
 #include <vector>
 #include <memory>
 #include <glm/glm.hpp>
@@ -25,11 +26,13 @@ public:
     void SetVertices(const std::vector<Vertex>& vertices);
     void SetIndices(const std::vector<uint32_t>& indices);
     void SetMaterialIndex(int index) { m_materialIndex = index; }
+    void SetName(const std::string& name) { m_name = name; }
     
     // 获取网格数据
     const std::vector<Vertex>& GetVertices() const { return m_vertices; }
     const std::vector<uint32_t>& GetIndices() const { return m_indices; }
     int GetMaterialIndex() const { return m_materialIndex; }
+    std::string GetName() const { return m_name; }
     
     // 生成基本几何体
     static std::shared_ptr<Mesh> CreateSphere(float radius, int segments);
@@ -45,6 +48,7 @@ public:
     glm::vec3 GetBBoxMax() const { return m_bboxMax; }
 
 private:
+    std::string m_name;
     std::vector<Vertex> m_vertices;
     std::vector<uint32_t> m_indices;
     int m_materialIndex;

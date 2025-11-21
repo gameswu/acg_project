@@ -9,6 +9,8 @@
 #include <atomic>
 #include <mutex>
 #include <iostream>
+#include <fstream>
+#include <sstream>
 #include <cmath>
 #include <chrono>
 #include <glm/glm.hpp>
@@ -43,6 +45,190 @@ void ShutdownGUI() {
     if (g_renderThread && g_renderThread->joinable()) {
         g_renderThread->join();
     }
+}
+
+// Load PPM image and create D3D12 texture for display
+bool LoadPPMToTexture(const std::string& ppmPath, ACG::Renderer* renderer, GUIState& state) {
+    std::ifstream file(ppmPath, std::ios::binary);
+    if (!file.is_open()) {
+        std::cerr << "Failed to open PPM file: " << ppmPath << std::endl;
+        return false;
+    }
+
+    std::string magic;
+    int width, height, maxval;
+    file >> magic >> width >> height >> maxval;
+    file.get(); // Skip whitespace
+
+    if (magic != "P6") {
+        std::cerr << "Only P6 PPM format is supported" << std::endl;
+        return false;
+    }
+
+    // Read pixel data (RGB)
+    std::vector<uint8_t> pixels(width * height * 3);
+    file.read(reinterpret_cast<char*>(pixels.data()), pixels.size());
+    file.close();
+
+    // Convert RGB to RGBA
+    std::vector<uint8_t> rgbaPixels(width * height * 4);
+    for (int i = 0; i < width * height; ++i) {
+        rgbaPixels[i * 4 + 0] = pixels[i * 3 + 0]; // R
+        rgbaPixels[i * 4 + 1] = pixels[i * 3 + 1]; // G
+        rgbaPixels[i * 4 + 2] = pixels[i * 3 + 2]; // B
+        rgbaPixels[i * 4 + 3] = 255;                // A
+    }
+
+    // Clean up old resources
+    if (state.renderResultTexture) {
+        state.renderResultTexture->Release();
+        state.renderResultTexture = nullptr;
+    }
+    if (state.renderResultSRVHeap) {
+        state.renderResultSRVHeap->Release();
+        state.renderResultSRVHeap = nullptr;
+    }
+
+    ID3D12Device* device = renderer->GetDevice();
+
+    // Create texture resource
+    D3D12_RESOURCE_DESC texDesc = {};
+    texDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    texDesc.Width = width;
+    texDesc.Height = height;
+    texDesc.DepthOrArraySize = 1;
+    texDesc.MipLevels = 1;
+    texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    texDesc.SampleDesc.Count = 1;
+    texDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+
+    D3D12_HEAP_PROPERTIES heapProps = {};
+    heapProps.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+    HRESULT hr = device->CreateCommittedResource(
+        &heapProps,
+        D3D12_HEAP_FLAG_NONE,
+        &texDesc,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+        nullptr,
+        IID_PPV_ARGS(&state.renderResultTexture)
+    );
+
+    if (FAILED(hr)) {
+        std::cerr << "Failed to create texture resource" << std::endl;
+        return false;
+    }
+
+    // Create upload buffer
+    UINT64 uploadBufferSize = GetRequiredIntermediateSize(state.renderResultTexture, 0, 1);
+    
+    D3D12_HEAP_PROPERTIES uploadHeapProps = {};
+    uploadHeapProps.Type = D3D12_HEAP_TYPE_UPLOAD;
+
+    D3D12_RESOURCE_DESC uploadBufferDesc = {};
+    uploadBufferDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    uploadBufferDesc.Width = uploadBufferSize;
+    uploadBufferDesc.Height = 1;
+    uploadBufferDesc.DepthOrArraySize = 1;
+    uploadBufferDesc.MipLevels = 1;
+    uploadBufferDesc.Format = DXGI_FORMAT_UNKNOWN;
+    uploadBufferDesc.SampleDesc.Count = 1;
+    uploadBufferDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    ID3D12Resource* uploadBuffer = nullptr;
+    hr = device->CreateCommittedResource(
+        &uploadHeapProps,
+        D3D12_HEAP_FLAG_NONE,
+        &uploadBufferDesc,
+        D3D12_RESOURCE_STATE_GENERIC_READ,
+        nullptr,
+        IID_PPV_ARGS(&uploadBuffer)
+    );
+
+    if (FAILED(hr)) {
+        std::cerr << "Failed to create upload buffer" << std::endl;
+        state.renderResultTexture->Release();
+        state.renderResultTexture = nullptr;
+        return false;
+    }
+
+    // Create command list for upload
+    ID3D12CommandAllocator* cmdAllocator = nullptr;
+    ID3D12GraphicsCommandList* cmdList = nullptr;
+    
+    device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&cmdAllocator));
+    device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, cmdAllocator, nullptr, IID_PPV_ARGS(&cmdList));
+
+    // Upload texture data
+    D3D12_SUBRESOURCE_DATA subresourceData = {};
+    subresourceData.pData = rgbaPixels.data();
+    subresourceData.RowPitch = width * 4;
+    subresourceData.SlicePitch = subresourceData.RowPitch * height;
+
+    UpdateSubresources(cmdList, state.renderResultTexture, uploadBuffer, 0, 0, 1, &subresourceData);
+
+    // Transition to shader resource
+    D3D12_RESOURCE_BARRIER barrier = {};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = state.renderResultTexture;
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    cmdList->ResourceBarrier(1, &barrier);
+
+    cmdList->Close();
+
+    // Execute command list
+    ID3D12CommandQueue* cmdQueue = nullptr;
+    D3D12_COMMAND_QUEUE_DESC queueDesc = {};
+    queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&cmdQueue));
+    
+    ID3D12CommandList* cmdLists[] = { cmdList };
+    cmdQueue->ExecuteCommandLists(1, cmdLists);
+
+    // Wait for upload to complete
+    ID3D12Fence* fence = nullptr;
+    device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
+    HANDLE fenceEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+    cmdQueue->Signal(fence, 1);
+    fence->SetEventOnCompletion(1, fenceEvent);
+    WaitForSingleObject(fenceEvent, INFINITE);
+    CloseHandle(fenceEvent);
+
+    // Clean up
+    fence->Release();
+    cmdQueue->Release();
+    cmdList->Release();
+    cmdAllocator->Release();
+    uploadBuffer->Release();
+
+    // Create SRV descriptor heap
+    D3D12_DESCRIPTOR_HEAP_DESC srvHeapDesc = {};
+    srvHeapDesc.NumDescriptors = 1;
+    srvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    srvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+
+    hr = device->CreateDescriptorHeap(&srvHeapDesc, IID_PPV_ARGS(&state.renderResultSRVHeap));
+    if (FAILED(hr)) {
+        std::cerr << "Failed to create SRV heap" << std::endl;
+        state.renderResultTexture->Release();
+        state.renderResultTexture = nullptr;
+        return false;
+    }
+
+    // Create SRV
+    D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+    srvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srvDesc.Texture2D.MipLevels = 1;
+
+    device->CreateShaderResourceView(state.renderResultTexture, &srvDesc, 
+        state.renderResultSRVHeap->GetCPUDescriptorHandleForHeapStart());
+
+    std::cout << "Successfully loaded PPM image: " << width << "x" << height << std::endl;
+    return true;
 }
 
 std::string OpenFileDialog(HWND hwnd, const char* filter, const char* title) {
@@ -160,14 +346,11 @@ void RenderSettingsWindow(ACG::Renderer* renderer, GUIState& state, HWND hwnd) {
         }
     }
     
-    ImGui::Checkbox("Use Custom MTL Parser (OBJ only)", &state.useCustomMTLParser);
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Enable custom MTL parser for accurate material loading from OBJ files.\nDisabled automatically for non-OBJ formats (FBX, GLTF, etc.)");
-    }
+    // Python loader now handles all formats automatically
     
-    // Batch loading configuration
+    // Batch loading configuration (deprecated - kept for UI state)
     ImGui::Separator();
-    ImGui::Text("Batch Loading (for large scenes)");
+    ImGui::Text("Scene Loading");
     ImGui::Checkbox("Enable Batch Loading", &state.enableBatchLoading);
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip("Load large scenes in batches to avoid memory overflow.\nRecommended for scenes with >500 meshes or >1M triangles.");
@@ -243,13 +426,6 @@ void RenderControlsWindow(ACG::Renderer* renderer, GUIState& state) {
                 int bounces = state.maxBounces;
                 int renderWidth = state.width;
                 int renderHeight = state.height;
-                bool useCustomMTL = state.useCustomMTLParser;
-                
-                // Batch loading configuration
-                bool enableBatch = state.enableBatchLoading;
-                int meshesPerBatch = state.maxMeshesPerBatch;
-                int texturesPerBatch = state.maxTexturesPerBatch;
-                int memoryLimit = state.maxMemoryMB;
                 
                 // Join previous thread if exists
                 if (g_renderThread && g_renderThread->joinable()) {
@@ -273,7 +449,7 @@ void RenderControlsWindow(ACG::Renderer* renderer, GUIState& state) {
                 // Record start time
                 auto startTime = std::chrono::steady_clock::now();
                 
-                g_renderThread = std::make_unique<std::thread>([renderer, modelPathStr, outputPathStr, envMapPathStr, samples, bounces, renderWidth, renderHeight, needsSceneLoad, needsEnvMapLoad, useCustomMTL, enableBatch, meshesPerBatch, texturesPerBatch, memoryLimit, startTime, &state]() {
+                g_renderThread = std::make_unique<std::thread>([renderer, modelPathStr, outputPathStr, envMapPathStr, samples, bounces, renderWidth, renderHeight, needsSceneLoad, needsEnvMapLoad, startTime, &state]() {
                     try {
                         // Set rendering flags at the start
                         g_isRendering.store(true);
@@ -286,15 +462,14 @@ void RenderControlsWindow(ACG::Renderer* renderer, GUIState& state) {
                             std::cout << "[Async] Loading scene: " << modelPathStr << std::endl;
                             std::cout.flush();
                             
-                            // Configure batch loading
-                            ACG::SceneLoadConfig config;
-                            config.useCustomMTLParser = useCustomMTL;
-                            config.enableBatchLoading = enableBatch;
-                            config.maxMeshesPerBatch = meshesPerBatch;
-                            config.maxTexturesPerBatch = texturesPerBatch;
-                            config.maxMemoryMB = memoryLimit;
+                            auto sceneLoadStart = std::chrono::steady_clock::now();
                             
-                            renderer->LoadSceneAsyncEx(modelPathStr, config);
+                            // Use Python loader (automatically handles all formats)
+                            renderer->LoadSceneAsync(modelPathStr);
+                            
+                            auto sceneLoadEnd = std::chrono::steady_clock::now();
+                            auto sceneLoadDuration = std::chrono::duration_cast<std::chrono::milliseconds>(sceneLoadEnd - sceneLoadStart);
+                            state.modelLoadTime = sceneLoadDuration.count() / 1000.0f;
                         } else {
                             std::cout << "[Async] Using already loaded scene" << std::endl;
                             std::cout.flush();
@@ -363,6 +538,11 @@ void RenderControlsWindow(ACG::Renderer* renderer, GUIState& state) {
                         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
                         state.lastRenderTime = duration.count() / 1000.0f;  // Convert to seconds
                         
+                        // Load rendered image for display
+                        if (LoadPPMToTexture(outputPathStr, renderer, state)) {
+                            std::cout << "Render result loaded for display" << std::endl;
+                        }
+                        
                         std::lock_guard<std::mutex> lock(g_renderMutex);
                         g_renderResultMessage = "Rendering complete!\nOutput saved to:\n" + outputPathStr;
                         
@@ -410,6 +590,21 @@ void RenderControlsWindow(ACG::Renderer* renderer, GUIState& state) {
         ImGui::PopStyleColor();
         ImGui::SameLine();
         ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.0f, 1.0f), "Rendering in background...");
+    }
+    
+    // Show timing information below Start button
+    ImGui::Separator();
+    
+    if (state.lastRenderTime > 0.0f) {
+        ImGui::Text("Last Render Time: %.2f seconds", state.lastRenderTime);
+    } else {
+        ImGui::Text("Last Render Time: N/A");
+    }
+    
+    if (state.modelLoadTime > 0.0f) {
+        ImGui::Text("Model Load Time: %.2f seconds", state.modelLoadTime);
+    } else {
+        ImGui::Text("Model Load Time: N/A");
     }
     
     // Show rendering progress info
@@ -520,54 +715,68 @@ void RenderCameraWindow(ACG::Renderer* renderer, GUIState& state) {
     ImGui::End();
 }
 
-void RenderStatisticsWindow(ACG::Renderer* renderer, GUIState& state) {
-    ImGui::Begin("Renderer Statistics", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
+void RenderResultWindow(ACG::Renderer* renderer, GUIState& state) {
+    ImGui::SetNextWindowSize(ImVec2(850, 650), ImGuiCond_FirstUseEver);
+    ImGui::Begin("Render Result");
     
-    const char* statusText = g_isRendering.load() ? "Rendering" : "Idle";
-    ImGui::Text("Status: %s", statusText);
+    // Get available content region
+    ImVec2 contentRegion = ImGui::GetContentRegionAvail();
+    float windowWidth = contentRegion.x;
+    float windowHeight = contentRegion.y;
     
-    // Show rendering progress
-    if (g_isRendering.load()) {
+    // Check if rendering
+    bool isRendering = g_isRendering.load();
+    
+    if (isRendering) {
+        // Show progress overlay in center
         int currentSample = g_currentSample.load();
         int totalSamples = g_totalSamples.load();
+        
+        // Create a centered region for progress display
+        ImVec2 textSize = ImGui::CalcTextSize("Rendering...");
+        ImGui::SetCursorPosX((windowWidth - textSize.x) * 0.5f);
+        ImGui::SetCursorPosY(windowHeight * 0.4f);
+        ImGui::Text("Rendering...");
+        
         if (totalSamples > 0) {
             float progress = static_cast<float>(currentSample) / static_cast<float>(totalSamples);
             char progressText[128];
             sprintf_s(progressText, "%d / %d samples (%.1f%%)", currentSample, totalSamples, progress * 100.0f);
-            ImGui::ProgressBar(progress, ImVec2(-1, 0), progressText);
+            
+            // Center progress bar
+            ImVec2 progressBarSize(windowWidth * 0.6f, 0);
+            ImGui::SetCursorPosX((windowWidth - progressBarSize.x) * 0.5f);
+            ImGui::ProgressBar(progress, progressBarSize, progressText);
         } else {
-            ImGui::ProgressBar(0.0f, ImVec2(-1, 0), "Initializing...");
+            ImVec2 progressBarSize(windowWidth * 0.6f, 0);
+            ImGui::SetCursorPosX((windowWidth - progressBarSize.x) * 0.5f);
+            ImGui::ProgressBar(0.0f, progressBarSize, "Initializing...");
         }
     } else {
-        ImGui::ProgressBar(0.0f, ImVec2(-1, 0), "Idle");
-    }
-    
-    // Display render time
-    if (g_isRendering.load()) {
-        // Note: We don't have easy access to start time here unless we store it in state
-        // For now, just show "in progress"
-        ImGui::Text("Render Time: (in progress)");
-    } else if (state.lastRenderTime > 0.0f) {
-        ImGui::Text("Render Time: %.1f seconds (last render)", state.lastRenderTime);
-    } else {
-        ImGui::Text("Render Time: N/A");
-    }
-    
-    ImGui::Separator();
-    ImGui::Text("Scene Info:");
-    ACG::Scene* scene = renderer->GetScene();
-    if (scene) {
-        ImGui::Text("  Meshes: %zu", scene->GetMeshes().size());
-        ImGui::Text("  Materials: %zu", scene->GetMaterials().size());
-        ImGui::Text("  Lights: %zu", scene->GetLights().size());
-    } else {
-        ImGui::Text("  No scene loaded");
+        // Show render result if available
+        if (state.renderResultTexture && state.renderResultSRVHeap) {
+            // Get descriptor handle for ImGui
+            D3D12_CPU_DESCRIPTOR_HANDLE srvHandle = state.renderResultSRVHeap->GetCPUDescriptorHandleForHeapStart();
+            D3D12_GPU_DESCRIPTOR_HANDLE srvGPUHandle = state.renderResultSRVHeap->GetGPUDescriptorHandleForHeapStart();
+            
+            // Display the texture
+            ImGui::Image((ImTextureID)srvGPUHandle.ptr, ImVec2(static_cast<float>(state.width), static_cast<float>(state.height)));
+        } else {
+            // No result available
+            ImVec2 textSize = ImGui::CalcTextSize("No render result available");
+            ImGui::SetCursorPosX((windowWidth - textSize.x) * 0.5f);
+            ImGui::SetCursorPosY(windowHeight * 0.5f);
+            ImGui::Text("No render result available");
+            
+            ImGui::SetCursorPosX((windowWidth - 200) * 0.5f);
+            ImGui::TextWrapped("Start a render to see results here");
+        }
     }
     
     ImGui::End();
 }
 
-void RenderLogWindow(std::vector<std::string>& logMessages) {
+void RenderLogWindow(const std::vector<std::string>& logMessages) {
     ImGui::Begin("Log Details");
     
     static bool autoScroll = true;
@@ -575,7 +784,7 @@ void RenderLogWindow(std::vector<std::string>& logMessages) {
     ImGui::Checkbox("Auto-scroll", &autoScroll);
     ImGui::SameLine();
     if (ImGui::Button("Clear")) {
-        logMessages.clear();
+        // Cannot clear const vector, just skip
     }
     
     ImGui::Separator();
@@ -618,7 +827,7 @@ void RenderGUI(ACG::Renderer* renderer, GUIState& state, HWND hwnd) {
     RenderSettingsWindow(renderer, state, hwnd);
     RenderControlsWindow(renderer, state);
     RenderCameraWindow(renderer, state);
-    RenderStatisticsWindow(renderer, state);
+    RenderResultWindow(renderer, state);
     
     if (state.pLogMessages) {
         RenderLogWindow(*state.pLogMessages);

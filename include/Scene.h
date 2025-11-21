@@ -8,12 +8,6 @@
 #include "Material.h"
 #include "Light.h"
 
-// Forward declarations for Assimp types (geometry loading only)
-struct aiScene;
-struct aiNode;
-struct aiMesh;
-struct aiMaterial;
-
 namespace ACG {
 
 /**
@@ -28,11 +22,6 @@ using LoadProgressCallback = std::function<void(const std::string& stage, int cu
  * @brief Scene loading configuration
  */
 struct SceneLoadConfig {
-    bool useCustomMTLParser = true;
-    bool enableBatchLoading = true;      // Enable batch loading for large scenes
-    int maxMeshesPerBatch = 500;         // Max meshes per batch (0 = unlimited)
-    int maxTexturesPerBatch = 64;        // Max textures per batch
-    size_t maxMemoryMB = 4096;           // Max memory usage in MB (0 = unlimited)
     LoadProgressCallback progressCallback = nullptr;
 };
 
@@ -49,8 +38,12 @@ public:
     void AddMaterial(std::shared_ptr<Material> material);
     void AddLight(std::shared_ptr<Light> light);
     
-    // 加载场景 - 支持分批加载配置
-    bool LoadFromFile(const std::string& filename, bool useCustomMTLParser = true);
+    // 设置场景数据（用于Python加载器）
+    void SetMeshes(const std::vector<std::shared_ptr<Mesh>>& meshes) { m_meshes = meshes; }
+    void SetMaterials(const std::vector<std::shared_ptr<Material>>& materials) { m_materials = materials; }
+    
+    // 加载场景 - 使用Python加载器
+    bool LoadFromFile(const std::string& filename);
     bool LoadFromFileEx(const std::string& filename, const SceneLoadConfig& config);
     
     // 获取场景数据
@@ -67,6 +60,11 @@ public:
     glm::vec3 GetBBoxMin() const { return m_bboxMin; }
     glm::vec3 GetBBoxMax() const { return m_bboxMax; }
     
+    // 材质层管理 (新增)
+    void CollectAllMaterialLayers();
+    const std::vector<MaterialExtendedData>& GetMaterialLayers() const { return m_materialLayers; }
+    uint32_t AddMaterialLayer(const MaterialExtendedData& layer);
+    
     // 获取加载统计信息
     struct LoadStats {
         int totalMeshes = 0;
@@ -75,22 +73,20 @@ public:
         int totalMaterials = 0;
         int totalTextures = 0;
         size_t estimatedMemoryMB = 0;
+        int totalMaterialLayers = 0;  // 新增
     };
     const LoadStats& GetLoadStats() const { return m_loadStats; }
 
 private:
-    // Internal helper functions for mesh processing
-    void ProcessNode(aiNode* node, const aiScene* scene);
-    void ProcessMesh(aiMesh* mesh, const aiScene* scene);
     void CalculateBoundingBox();
-    
-    // Batch loading helpers
-    bool LoadGeometryBatched(const aiScene* scene, const SceneLoadConfig& config);
     void EstimateMemoryUsage();
     
     std::vector<std::shared_ptr<Mesh>> m_meshes;
     std::vector<std::shared_ptr<Material>> m_materials;
     std::vector<std::shared_ptr<Light>> m_lights;
+    
+    // 材质层数据 (新增)
+    std::vector<MaterialExtendedData> m_materialLayers;
     
     std::string m_name;
     glm::vec3 m_bboxMin;
@@ -100,3 +96,4 @@ private:
 };
 
 } // namespace ACG
+

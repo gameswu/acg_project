@@ -3,6 +3,7 @@
 #include <Windows.h>
 #include <string>
 #include <vector>
+#include <d3d12.h>
 
 // Forward declarations
 namespace ACG {
@@ -49,6 +50,11 @@ struct GUIState {
     bool envLightInitialized = false;
     bool outputPathInitialized = false;
     float lastRenderTime = 0.0f;
+    float modelLoadTime = 0.0f;
+    
+    // Render result texture for display
+    ID3D12Resource* renderResultTexture = nullptr;
+    ID3D12DescriptorHeap* renderResultSRVHeap = nullptr;
     
     // Pointers to external data
     std::vector<std::string>* pLogMessages = nullptr;
@@ -71,7 +77,7 @@ std::string SaveFileDialog(HWND hwnd, const char* filter, const char* title);
 void RenderSettingsWindow(ACG::Renderer* renderer, GUIState& state, HWND hwnd);
 void RenderControlsWindow(ACG::Renderer* renderer, GUIState& state);
 void RenderCameraWindow(ACG::Renderer* renderer, GUIState& state);
-void RenderStatisticsWindow(ACG::Renderer* renderer, GUIState& state);
+void RenderResultWindow(ACG::Renderer* renderer, GUIState& state);
 void RenderLogWindow(const std::vector<std::string>& logMessages);
 
 } // namespace GUI

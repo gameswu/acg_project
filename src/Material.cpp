@@ -5,271 +5,249 @@
 namespace ACG {
 
 Material::Material()
-    : m_type(MaterialType::Diffuse)
-    // MTL specification defaults
-    , m_ambient(0.0f, 0.0f, 0.0f)          // Ka: No ambient by default
-    , m_albedo(0.8f, 0.8f, 0.8f)           // Kd: Standard gray diffuse
-    , m_specular(0.0f, 0.0f, 0.0f)         // Ks: No specular by default
-    , m_emission(0.0f, 0.0f, 0.0f)         // Ke: Non-emissive
-    , m_transmissionFilter(1.0f, 1.0f, 1.0f) // Tf: No filtering (white)
-    , m_specularExponent(0.0f)             // Ns: No highlight
-    , m_dissolve(1.0f)                     // d: Fully opaque
-    , m_opticalDensity(1.5f)               // Ni: Glass IOR
-    , m_illum(2)                           // illum: Diffuse+Specular (most common)
-    // PBR-converted properties
+    : m_baseColor(0.8f, 0.8f, 0.8f)
     , m_metallic(0.0f)
     , m_roughness(0.5f)
+    , m_emission(0.0f, 0.0f, 0.0f)
     , m_ior(1.5f)
-    , m_transmission(0.0f)
-    , m_subsurfaceRadius(0.0f)
-    , m_subsurfaceColor(1.0f)
+    , m_opacity(1.0f)
+    , m_layerFlags(0)
+    , m_extendedDataBaseIndex(0)
+    , m_baseColorTexture(nullptr)
+    , m_normalTexture(nullptr)
+    , m_metallicRoughnessTexture(nullptr)
+    , m_emissionTexture(nullptr)
+    , m_baseColorTexIdx(-1)
+    , m_normalTexIdx(-1)
+    , m_metallicRoughnessTexIdx(-1)
+    , m_emissionTexIdx(-1)
 {
 }
 
 Material::~Material() {
 }
 
-glm::vec3 Material::Evaluate(const glm::vec3& wo, const glm::vec3& wi, const glm::vec3& normal, const glm::vec2& texCoord) const {
-    // Get albedo (with texture if available)
-    glm::vec3 albedo = m_albedo;
-    if (m_albedoTexture) {
-        glm::vec4 texColor = m_albedoTexture->SampleBilinear(texCoord.x, texCoord.y);
-        albedo = glm::vec3(texColor.r, texColor.g, texColor.b);
-    }
-    
-    float NdotL = std::max(0.0f, glm::dot(normal, wi));
-    float NdotV = std::max(0.0f, glm::dot(normal, wo));
-    
-    switch (m_type) {
-        case MaterialType::Diffuse: {
-            // Lambertian BRDF
-            return albedo / glm::pi<float>();
+
+// Layer management - using vector instead of map (C++17 compatible)
+void Material::SetClearcoatLayer(const ClearcoatLayer& layer) {
+    m_layerFlags |= LAYER_CLEARCOAT;
+    MaterialExtendedData data;
+    data.clearcoat = layer;
+    m_extendedLayers.push_back(data);
+}
+
+const ClearcoatLayer* Material::GetClearcoatLayer() const {
+    if (m_layerFlags & LAYER_CLEARCOAT) {
+        for (const auto& layer : m_extendedLayers) {
+            // Simple heuristic: check if clearcoat flag is set and return first match
+            // In practice, Scene will manage layer ordering
+            return &layer.clearcoat;
         }
-        
-        case MaterialType::Specular: {
-            // Cook-Torrance microfacet model
-            glm::vec3 h = glm::normalize(wo + wi);
-            float NdotH = std::max(0.0f, glm::dot(normal, h));
-            float VdotH = std::max(0.0f, glm::dot(wo, h));
-            
-            // Get roughness (with texture if available)
-            float roughness = m_roughness;
-            if (m_roughnessTexture) {
-                glm::vec4 texRoughness = m_roughnessTexture->SampleBilinear(texCoord.x, texCoord.y);
-                roughness = texRoughness.r;
+    }
+    return nullptr;
+}
+
+void Material::SetTransmissionLayer(const TransmissionLayer& layer) {
+    m_layerFlags |= LAYER_TRANSMISSION;
+    MaterialExtendedData data;
+    data.transmission = layer;
+    m_extendedLayers.push_back(data);
+}
+
+const TransmissionLayer* Material::GetTransmissionLayer() const {
+    if (m_layerFlags & LAYER_TRANSMISSION) {
+        for (const auto& layer : m_extendedLayers) {
+            return &layer.transmission;
+        }
+    }
+    return nullptr;
+}
+
+void Material::SetSheenLayer(const SheenLayer& layer) {
+    m_layerFlags |= LAYER_SHEEN;
+    MaterialExtendedData data;
+    data.sheen = layer;
+    m_extendedLayers.push_back(data);
+}
+
+const SheenLayer* Material::GetSheenLayer() const {
+    if (m_layerFlags & LAYER_SHEEN) {
+        for (const auto& layer : m_extendedLayers) {
+            return &layer.sheen;
+        }
+    }
+    return nullptr;
+}
+
+void Material::SetSubsurfaceLayer(const SubsurfaceLayer& layer) {
+    m_layerFlags |= LAYER_SUBSURFACE;
+    MaterialExtendedData data;
+    data.subsurface = layer;
+    m_extendedLayers.push_back(data);
+}
+
+const SubsurfaceLayer* Material::GetSubsurfaceLayer() const {
+    if (m_layerFlags & LAYER_SUBSURFACE) {
+        for (const auto& layer : m_extendedLayers) {
+            return &layer.subsurface;
+        }
+    }
+    return nullptr;
+}
+
+void Material::SetAnisotropyLayer(const AnisotropyLayer& layer) {
+    m_layerFlags |= LAYER_ANISOTROPY;
+    MaterialExtendedData data;
+    data.anisotropy = layer;
+    m_extendedLayers.push_back(data);
+}
+
+const AnisotropyLayer* Material::GetAnisotropyLayer() const {
+    if (m_layerFlags & LAYER_ANISOTROPY) {
+        for (const auto& layer : m_extendedLayers) {
+            return &layer.anisotropy;
+        }
+    }
+    return nullptr;
+}
+
+void Material::SetIridescenceLayer(const IridescenceLayer& layer) {
+    m_layerFlags |= LAYER_IRIDESCENCE;
+    MaterialExtendedData data;
+    data.iridescence = layer;
+    m_extendedLayers.push_back(data);
+}
+
+const IridescenceLayer* Material::GetIridescenceLayer() const {
+    if (m_layerFlags & LAYER_IRIDESCENCE) {
+        for (const auto& layer : m_extendedLayers) {
+            return &layer.iridescence;
+        }
+    }
+    return nullptr;
+}
+
+void Material::SetVolumeLayer(const VolumeLayer& layer) {
+    m_layerFlags |= LAYER_VOLUME;
+    MaterialExtendedData data;
+    data.volume = layer;
+    m_extendedLayers.push_back(data);
+}
+
+const VolumeLayer* Material::GetVolumeLayer() const {
+    if (m_layerFlags & LAYER_VOLUME) {
+        for (const auto& layer : m_extendedLayers) {
+            return &layer.volume;
+        }
+    }
+    return nullptr;
+}
+
+// GPU data conversion
+MaterialData Material::ToGPUData() const {
+    MaterialData data;
+    // Pack into vec4s
+    data.baseColor_metallic = glm::vec4(m_baseColor, m_metallic);
+    data.emission_roughness = glm::vec4(m_emission, m_roughness);
+    
+    // Pack ior, opacity, flags, index into vec4 (using memcpy for uint32_t)
+    data.ior_opacity_flags_idx.x = m_ior;
+    data.ior_opacity_flags_idx.y = m_opacity;
+    std::memcpy(&data.ior_opacity_flags_idx.z, &m_layerFlags, sizeof(uint32_t));
+    std::memcpy(&data.ior_opacity_flags_idx.w, &m_extendedDataBaseIndex, sizeof(uint32_t));
+    
+    // Pack texture indices (use memcpy to preserve bit pattern for int interpretation in shader)
+    std::memcpy(&data.texIndices.x, &m_baseColorTexIdx, sizeof(int32_t));
+    std::memcpy(&data.texIndices.y, &m_normalTexIdx, sizeof(int32_t));
+    std::memcpy(&data.texIndices.z, &m_metallicRoughnessTexIdx, sizeof(int32_t));
+    std::memcpy(&data.texIndices.w, &m_emissionTexIdx, sizeof(int32_t));
+    
+    return data;
+}
+
+// MTL compatibility methods (convert old format to PBR)
+void Material::SetSpecularExponent(float ns) {
+    // Convert Phong exponent to roughness
+    // ns typically ranges from 0 (rough) to 1000+ (smooth)
+    // roughness ranges from 0 (smooth) to 1 (rough)
+    m_roughness = std::sqrt(2.0f / (ns + 2.0f));
+}
+
+void Material::SetSpecular(const glm::vec3& specular) {
+    // Convert specular color to metallic
+    // High specular = more metallic-like
+    float avg = (specular.r + specular.g + specular.b) / 3.0f;
+    m_metallic = glm::clamp(avg, 0.0f, 1.0f);
+}
+
+void Material::SetTransmissionFilter(const glm::vec3& tf) {
+    // If transmission filter is not white, material is transmissive
+    if (glm::length(tf - glm::vec3(1.0f)) > 0.01f) {
+        TransmissionLayer layer;
+        layer.strength = 1.0f;
+        layer.color = tf;
+        layer.roughness = m_roughness;
+        layer.depth = 1.0f;
+        layer.textureIdx = -1;
+        SetTransmissionLayer(layer);
+    }
+}
+
+void Material::SetIllum(int illum) {
+    // MTL illumination models:
+    // 0: Color on, ambient off
+    // 1: Color on, ambient on
+    // 2: Highlight on (default)
+    // 3: Reflection on, ray trace on
+    // 4-10: Various glass/reflection modes
+    
+    switch (illum) {
+        case 0:
+        case 1:
+        case 2:
+            // Standard diffuse/specular
+            break;
+        case 3:
+        case 4:
+        case 6:
+        case 7:
+            // Glass/transmission
+            if (!HasLayer(LAYER_TRANSMISSION)) {
+                TransmissionLayer layer;
+                layer.strength = 0.9f;
+                layer.color = glm::vec3(1.0f);
+                layer.roughness = m_roughness;
+                layer.depth = 1.0f;
+                layer.textureIdx = -1;
+                SetTransmissionLayer(layer);
             }
-            
-            // GGX normal distribution
-            float alpha = roughness * roughness;
-            float alpha2 = alpha * alpha;
-            float NdotH2 = NdotH * NdotH;
-            float denom = NdotH2 * (alpha2 - 1.0f) + 1.0f;
-            float D = alpha2 / (glm::pi<float>() * denom * denom);
-            
-            // Schlick-GGX geometry
-            float k = (roughness + 1.0f) * (roughness + 1.0f) / 8.0f;
-            float G1_V = NdotV / (NdotV * (1.0f - k) + k);
-            float G1_L = NdotL / (NdotL * (1.0f - k) + k);
-            float G = G1_V * G1_L;
-            
-            // Fresnel (Schlick approximation)
-            glm::vec3 F0 = glm::mix(glm::vec3(0.04f), albedo, m_metallic);
-            glm::vec3 F = F0 + (glm::vec3(1.0f) - F0) * std::pow(1.0f - VdotH, 5.0f);
-            
-            // Specular BRDF
-            glm::vec3 specular = (D * G * F) / std::max(4.0f * NdotV * NdotL, 0.001f);
-            
-            // Diffuse component for non-metallic
-            glm::vec3 kD = (glm::vec3(1.0f) - F) * (1.0f - m_metallic);
-            glm::vec3 diffuse = kD * albedo / glm::pi<float>();
-            
-            return diffuse + specular;
-        }
-        
-        case MaterialType::Transmissive: {
-            // Simplified glass BSDF
-            glm::vec3 h = glm::normalize(wo + wi);
-            float VdotH = std::max(0.0f, glm::dot(wo, h));
-            
-            // Fresnel for dielectric
-            float F0 = ((1.0f - m_ior) / (1.0f + m_ior)) * ((1.0f - m_ior) / (1.0f + m_ior));
-            float F = F0 + (1.0f - F0) * std::pow(1.0f - VdotH, 5.0f);
-            
-            // Reflection or refraction
-            bool isReflection = glm::dot(wi, normal) > 0.0f;
-            if (isReflection) {
-                return glm::vec3(F) * albedo;
-            } else {
-                return glm::vec3(1.0f - F) * albedo;
-            }
-        }
-        
-        case MaterialType::Emissive:
-            return m_emission;
-        
+            break;
         default:
-            return albedo / glm::pi<float>();
+            break;
     }
 }
 
-glm::vec3 Material::Evaluate(const glm::vec3& wo, const glm::vec3& wi, const glm::vec3& normal) const {
-    // Call the texture version with a dummy UV coordinate
-    return Evaluate(wo, wi, normal, glm::vec2(0.0f));
+// Texture setters
+void Material::SetBaseColorTexture(std::shared_ptr<Texture> texture, int32_t texIdx) {
+    m_baseColorTexture = texture;
+    m_baseColorTexIdx = texIdx;
 }
 
-glm::vec3 Material::Sample(const glm::vec3& wo, const glm::vec3& normal, glm::vec3& wi, float& pdf) const {
-    // Build local coordinate system
-    glm::vec3 tangent, bitangent;
-    if (std::abs(normal.x) > 0.1f) {
-        tangent = glm::normalize(glm::cross(glm::vec3(0.0f, 1.0f, 0.0f), normal));
-    } else {
-        tangent = glm::normalize(glm::cross(glm::vec3(1.0f, 0.0f, 0.0f), normal));
-    }
-    bitangent = glm::cross(normal, tangent);
-    
-    switch (m_type) {
-        case MaterialType::Diffuse: {
-            // Cosine-weighted hemisphere sampling
-            float r1 = static_cast<float>(rand()) / RAND_MAX;
-            float r2 = static_cast<float>(rand()) / RAND_MAX;
-            
-            float phi = 2.0f * glm::pi<float>() * r1;
-            float cosTheta = std::sqrt(r2);
-            float sinTheta = std::sqrt(1.0f - r2);
-            
-            glm::vec3 localDir = glm::vec3(
-                std::cos(phi) * sinTheta,
-                std::sin(phi) * sinTheta,
-                cosTheta
-            );
-            
-            wi = localDir.x * tangent + localDir.y * bitangent + localDir.z * normal;
-            pdf = cosTheta / glm::pi<float>();
-            return m_albedo / glm::pi<float>();
-        }
-        
-        case MaterialType::Specular: {
-            // GGX importance sampling
-            float r1 = static_cast<float>(rand()) / RAND_MAX;
-            float r2 = static_cast<float>(rand()) / RAND_MAX;
-            
-            float alpha = m_roughness * m_roughness;
-            float alpha2 = alpha * alpha;
-            
-            float phi = 2.0f * glm::pi<float>() * r1;
-            float cosTheta = std::sqrt((1.0f - r2) / (1.0f + (alpha2 - 1.0f) * r2));
-            float sinTheta = std::sqrt(1.0f - cosTheta * cosTheta);
-            
-            glm::vec3 h = glm::vec3(
-                std::cos(phi) * sinTheta,
-                std::sin(phi) * sinTheta,
-                cosTheta
-            );
-            h = h.x * tangent + h.y * bitangent + h.z * normal;
-            
-            wi = glm::reflect(-wo, h);
-            
-            float NdotH = std::max(0.0f, cosTheta);
-            float VdotH = std::max(0.0f, glm::dot(wo, h));
-            
-            // GGX PDF
-            float denom = NdotH * NdotH * (alpha2 - 1.0f) + 1.0f;
-            float D = alpha2 / (glm::pi<float>() * denom * denom);
-            pdf = D * NdotH / (4.0f * VdotH);
-            
-            return Evaluate(wo, wi, normal);
-        }
-        
-        case MaterialType::Transmissive: {
-            // Fresnel for glass
-            float r = static_cast<float>(rand()) / RAND_MAX;
-            float cosI = glm::dot(wo, normal);
-            float F0 = ((1.0f - m_ior) / (1.0f + m_ior)) * ((1.0f - m_ior) / (1.0f + m_ior));
-            float F = F0 + (1.0f - F0) * std::pow(1.0f - std::abs(cosI), 5.0f);
-            
-            if (r < F) {
-                // Reflection
-                wi = glm::reflect(-wo, normal);
-                pdf = F;
-            } else {
-                // Refraction
-                float eta = cosI > 0.0f ? 1.0f / m_ior : m_ior;
-                wi = glm::refract(-wo, normal * glm::sign(cosI), eta);
-                pdf = 1.0f - F;
-            }
-            
-            return Evaluate(wo, wi, normal);
-        }
-        
-        case MaterialType::Emissive:
-            wi = normal;
-            pdf = 1.0f;
-            return m_emission;
-        
-        default:
-            wi = normal;
-            pdf = 1.0f;
-            return m_albedo;
-    }
+void Material::SetNormalTexture(std::shared_ptr<Texture> texture, int32_t texIdx) {
+    m_normalTexture = texture;
+    m_normalTexIdx = texIdx;
 }
 
-float Material::PDF(const glm::vec3& wo, const glm::vec3& wi, const glm::vec3& normal) const {
-    float NdotL = std::max(0.0f, glm::dot(normal, wi));
-    
-    switch (m_type) {
-        case MaterialType::Diffuse:
-            return NdotL / glm::pi<float>();
-        
-        case MaterialType::Specular: {
-            glm::vec3 h = glm::normalize(wo + wi);
-            float NdotH = std::max(0.0f, glm::dot(normal, h));
-            float VdotH = std::max(0.0f, glm::dot(wo, h));
-            
-            float alpha = m_roughness * m_roughness;
-            float alpha2 = alpha * alpha;
-            float denom = NdotH * NdotH * (alpha2 - 1.0f) + 1.0f;
-            float D = alpha2 / (glm::pi<float>() * denom * denom);
-            
-            return D * NdotH / (4.0f * VdotH);
-        }
-        
-        case MaterialType::Transmissive: {
-            float cosI = glm::dot(wo, normal);
-            float F0 = ((1.0f - m_ior) / (1.0f + m_ior)) * ((1.0f - m_ior) / (1.0f + m_ior));
-            float F = F0 + (1.0f - F0) * std::pow(1.0f - std::abs(cosI), 5.0f);
-            
-            bool isReflection = glm::dot(wi, normal) > 0.0f;
-            return isReflection ? F : (1.0f - F);
-        }
-        
-        default:
-            return 1.0f;
-    }
+void Material::SetMetallicRoughnessTexture(std::shared_ptr<Texture> texture, int32_t texIdx) {
+    m_metallicRoughnessTexture = texture;
+    m_metallicRoughnessTexIdx = texIdx;
 }
 
-// Specialized materials
-
-DiffuseMaterial::DiffuseMaterial(const glm::vec3& albedo) {
-    m_type = MaterialType::Diffuse;
-    m_albedo = albedo;
-}
-
-SpecularMaterial::SpecularMaterial(const glm::vec3& albedo, float roughness) {
-    m_type = MaterialType::Specular;
-    m_albedo = albedo;
-    m_roughness = roughness;
-}
-
-TransmissiveMaterial::TransmissiveMaterial(const glm::vec3& albedo, float ior) {
-    m_type = MaterialType::Transmissive;
-    m_albedo = albedo;
-    m_ior = ior;
-    m_transmission = 1.0f;
-}
-
-PrincipledBSDFMaterial::PrincipledBSDFMaterial() {
-    m_type = MaterialType::PrincipledBSDF;
-    // TODO: Set up default Disney principled BRDF parameters
+void Material::SetEmissionTexture(std::shared_ptr<Texture> texture, int32_t texIdx) {
+    m_emissionTexture = texture;
+    m_emissionTexIdx = texIdx;
 }
 
 } // namespace ACG
+
+

@@ -55,6 +55,8 @@ Texture2DArray<float4> g_textures : register(t3);  // Standard texture array (fa
 Texture2D<float4> g_environmentMap : register(t4);  // HDR environment map
 Texture2D<float4> g_virtualTextureCache : register(t5);  // Virtual Texture physical page cache
 Texture2DArray<uint> g_indirectionTexture : register(t6);  // Virtual Texture indirection lookup
+StructuredBuffer<MaterialExtendedData> g_materialLayers : register(t7);  // Extended material layers
+StructuredBuffer<float2> g_textureScales : register(t8);  // UV scale factors for resampled textures
 SamplerState g_sampler : register(s0);
 
 // Convert ray direction to equirectangular UV coordinates
@@ -321,30 +323,15 @@ void ClosestHit(inout RadiancePayload payload, in BuiltInTriangleIntersectionAtt
     // tests or by evaluating environment on miss rays. Per requirement, we DO NOT add
     // sun contribution here. Sun is applied when a ray reaches infinity (in the Miss shader).
     
-    // ========== MTL ILLUMINATION MODEL CLASSIFICATION ==========
-    // Get illum model (authoritative material type identifier)
-    int illum = mat.GetIllum();
-    uint materialType = mat.GetType();
-    
-    // MTL Specification: Illumination Models (page 5-7)
-    // illum 0: Flat color (no lighting)
-    // illum 1: Diffuse (Lambertian)
-    // illum 2: Diffuse + Specular (Blinn-Phong) [MOST COMMON]
-    // illum 3: Reflection (ray traced mirror)
-    // illum 4: Glass (transparency + reflection)
-    // illum 5: Fresnel Mirror (perfect reflection)
-    // illum 6: Refraction (glass without Fresnel)
-    // illum 7: Refraction + Fresnel (realistic glass)
-    // illum 8: Reflection (no ray trace)
-    // illum 9: Glass (no ray trace)
-    // illum 10: Shadow matte
+    // ========== MATERIAL TYPE CLASSIFICATION ==========
+    // New PBR material system: use layer flags and properties
+    // Check for transmission layer (glass/transparent materials)
+    bool hasTransmission = (mat.layerFlags & LAYER_TRANSMISSION) != 0;
     
     // Handle refractive/transmissive materials
-    // Use materialType (set by CPU) rather than illum for accurate classification
-    // This handles Blender's illum=4 exports correctly (many are diffuse, not glass)
-    if (materialType == 2) {
+    if (hasTransmission) {
         // Glass material with reflection and refraction
-        float ior = mat.GetIOR();
+        float ior = mat.ior;
         float3 N = normal;
         float cosI = -dot(rayDir, N);
         float etaI = 1.0; // Air
@@ -371,15 +358,13 @@ void ClosestHit(inout RadiancePayload payload, in BuiltInTriangleIntersectionAtt
         // Russian roulette between reflection and refraction
         float rand = Random(payload.rngState);
 
-        // Robust transmission fallback: CPU may leave transmission == 0 when 'd' is default.
-        // Use material's stored transmission if available, otherwise derive a safe fallback
-        // from the albedo (Tf) so glass is not black.
-        float trans = mat.GetTransmission();
+        // Use opacity for transmission: opacity=1 is opaque, opacity=0 is fully transmissive
+        // For transmission, we want the inverse: trans = 1 - opacity
+        float trans = 1.0 - mat.opacity;
         if (trans <= 0.001f) {
-            // Derive a conservative fallback from albedo (albedo for transmissive materials
-            // is set to Tf on CPU). Use a small minimum to avoid complete energy loss.
-            float avgAlbedo = (mat.albedo.r + mat.albedo.g + mat.albedo.b) * (1.0 / 3.0);
-            trans = max(avgAlbedo, 0.01f);
+            // Derive a conservative fallback from base color
+            float avgColor = (mat.baseColor.r + mat.baseColor.g + mat.baseColor.b) * (1.0 / 3.0);
+            trans = max(avgColor, 0.01f);
         }
 
         // Compute small offset to avoid self-intersections
@@ -398,7 +383,7 @@ void ClosestHit(inout RadiancePayload payload, in BuiltInTriangleIntersectionAtt
             // Determine current and target IOR from payload stack
             float iorCurrent = payload.iorStack[payload.iorStackTop];
             bool entering = dot(rayDir, normal) < 0.0; // entering if ray goes against normal
-            float iorTarget = entering ? mat.GetIOR() : (payload.iorStackTop > 0 ? payload.iorStack[payload.iorStackTop - 1] : 1.0f);
+            float iorTarget = entering ? mat.ior : (payload.iorStackTop > 0 ? payload.iorStack[payload.iorStackTop - 1] : 1.0f);
 
             float etaLocal = iorCurrent / iorTarget;
             float kLocal = 1.0 - etaLocal * etaLocal * (1.0 - cosI * cosI);
@@ -416,25 +401,24 @@ void ClosestHit(inout RadiancePayload payload, in BuiltInTriangleIntersectionAtt
                 if (entering) {
                     uint newTop = min(payload.iorStackTop + 1, 3);
                     payload.iorStackTop = newTop;
-                    payload.iorStack[payload.iorStackTop] = mat.GetIOR();
+                    payload.iorStack[payload.iorStackTop] = mat.ior;
                 } else {
                     if (payload.iorStackTop > 0) payload.iorStackTop--;
                 }
 
-                // Apply color filtering (albedo/Tf) and transmission amount
-                payload.throughput *= mat.albedo.rgb * trans;
+                // Apply color filtering (base color) and transmission amount
+                payload.throughput *= mat.baseColor * trans;
             }
         }
         return;
     }
-    // Handle mirror/reflective materials
-    // Use materialType for accurate classification
-    else if (materialType == 1) {
-        // Perfect mirror reflection using Ks (specular reflectivity)
+    // Handle mirror/reflective materials (high metallic, low roughness)
+    else if (mat.metallic > 0.9 && mat.roughness < 0.1) {
+        // Perfect mirror reflection
         float3 reflectDir = reflect(rayDir, normal);
         
-        // Use Ks (specular color) as reflectance
-        float3 reflectance = mat.specular.rgb;
+        // Use base color as reflectance for metallic surfaces
+        float3 reflectance = mat.baseColor;
         // Do not force an artificial high reflectance fallback here; respect Ks provided by material.
         // If Ks is zero, reflection will contribute nothing (correct physical behavior).
         payload.throughput *= reflectance;
@@ -448,31 +432,14 @@ void ClosestHit(inout RadiancePayload payload, in BuiltInTriangleIntersectionAtt
         // MTL spec: illum 0 = flat color, illum 1 = diffuse, illum 2 = diffuse+specular
         
         // Get base albedo (color or texture)
-        float3 albedo = mat.albedo.rgb;
+        float3 albedo = mat.baseColor;
         
-            // Sample texture if available (texture overrides base albedo)
-            if (mat.HasAlbedoTexture()) {
-                int texIndex = mat.GetAlbedoTextureIndex();
-                
-                // Check if using Virtual Texture System
-                // If material has texture size info (params3.xy), use Virtual Texture
-                float2 textureSize = float2(mat.params3.x, mat.params3.y);
-                if (textureSize.x > 0.0 && textureSize.y > 0.0) {
-                    // Virtual Texture path: use indirection-based sampling
-                    float2 wrappedUV = frac(texCoord);
-                    float4 texColor = SampleVirtualTexture(texIndex, wrappedUV, textureSize);
-                    albedo = texColor.rgb;
-                } else {
-                    // Fallback: standard texture array (for downsampled textures)
-                    float2 atlasScale = float2(mat.params3.z, mat.params3.w);
-                    // Only sample if scale is valid (non-zero)
-                    if (atlasScale.x > 0.0 && atlasScale.y > 0.0) {
-                        float2 scaledUV = frac(texCoord) * atlasScale;
-                        float4 texColor = g_textures.SampleLevel(g_sampler, float3(scaledUV, texIndex), 0);
-                        albedo = texColor.rgb;
-                    }
-                }
-            }
+        // Sample texture if available (texture overrides base albedo)
+        if (mat.baseColorTexIdx >= 0) {
+            int texIndex = mat.baseColorTexIdx;
+            float4 texColor = g_textures.SampleLevel(g_sampler, float3(texCoord, texIndex), 0);
+            albedo = texColor.rgb;
+        }
         
         // For path tracing with cosine-weighted sampling:
         // BRDF = albedo / PI

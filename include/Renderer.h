@@ -39,9 +39,8 @@ namespace ACG {
         void OnDestroy();
         void OnResize(UINT width, UINT height);
 
-        void LoadScene(const std::string& path, bool useCustomMTLParser = true);
-        void LoadSceneAsync(const std::string& path, bool useCustomMTLParser = true); // Async version using independent command resources
-        void LoadSceneAsyncEx(const std::string& path, const SceneLoadConfig& config); // Extended version with batch loading
+        void LoadScene(const std::string& path);
+        void LoadSceneAsync(const std::string& path); // Async version using independent command resources
         void RenderToFile(const std::string& outputPath, int samplesPerPixel, int maxBounces);
         void SetEnvironmentMap(const std::string& path);  // Load HDR/EXR environment map
         void ClearEnvironmentMap();  // Clear/unload environment map
@@ -96,7 +95,8 @@ namespace ACG {
         // Data upload (assumes resource already created)
         void UploadTextureBatchData(ID3D12GraphicsCommandList4* cmdList, 
                                     const std::vector<std::shared_ptr<Texture>>& textures, 
-                                    int startIndex, UINT maxWidth, UINT maxHeight);
+                                    int startIndex, UINT maxWidth, UINT maxHeight,
+                                    std::vector<glm::vec2>* outUvScales = nullptr);
         
         // State transition and descriptor creation
         void FinalizeTextureArray(ID3D12GraphicsCommandList4* cmdList, int totalTextures);
@@ -157,6 +157,7 @@ namespace ACG {
         Microsoft::WRL::ComPtr<ID3D12Resource> m_indexUpload;
         Microsoft::WRL::ComPtr<ID3D12Resource> m_triangleMaterialUpload;
         Microsoft::WRL::ComPtr<ID3D12Resource> m_materialUpload;
+        Microsoft::WRL::ComPtr<ID3D12Resource> m_materialLayersUpload;  // Upload heap for material layers (新增)
         Microsoft::WRL::ComPtr<ID3D12Resource> m_textureUpload;  // Upload heap for textures
 
         // DXR Shader Resources
@@ -167,8 +168,11 @@ namespace ACG {
         Microsoft::WRL::ComPtr<ID3D12Resource> m_indexBuffer;
         Microsoft::WRL::ComPtr<ID3D12Resource> m_triangleBuffer;
         Microsoft::WRL::ComPtr<ID3D12Resource> m_materialBuffer;
+        Microsoft::WRL::ComPtr<ID3D12Resource> m_materialLayersBuffer;  // Extended material layers (新增)
         Microsoft::WRL::ComPtr<ID3D12Resource> m_triangleMaterialBuffer; // Material index per triangle
         Microsoft::WRL::ComPtr<ID3D12Resource> m_textureAtlas;
+        Microsoft::WRL::ComPtr<ID3D12Resource> m_textureScalesBuffer;  // UV scale factors (float2 per texture)
+        Microsoft::WRL::ComPtr<ID3D12Resource> m_textureScalesUpload;  // Upload heap for texture scales
         Microsoft::WRL::ComPtr<ID3D12Resource> m_environmentMap;  // HDR environment map
 
         // Descriptor indices in the shader-visible heap
@@ -176,6 +180,7 @@ namespace ACG {
         UINT m_srvIndex_Vertices; // SRV index for vertex buffer
         UINT m_srvIndex_Indices;  // SRV index for index buffer
         UINT m_srvIndex_Materials; // SRV index for materials
+        UINT m_srvIndex_MaterialLayers; // SRV index for material layers (新增)
         UINT m_uavIndex_Output;    // UAV index for output texture
 
         // DXR Shader Binding Table

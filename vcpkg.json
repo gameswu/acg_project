@@ -8,8 +8,6 @@
       "features": [ "win32-binding", "dx12-binding", "docking-experimental" ]
     },
     "stb",
-    "assimp",
-    "nlohmann-json",
     "d3dx12",
     "openexr",
     "tinyexr",

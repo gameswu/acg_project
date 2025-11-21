@@ -2,163 +2,186 @@
 
 #include <glm/glm.hpp>
 #include <memory>
+#include <string>
+#include <cstdint>
 #include "Texture.h"
+#include "MaterialLayers.h"
 
 namespace ACG {
 
-enum class MaterialType {
-    Diffuse,
-    Specular,
-    Transmissive,      // Glass, water
-    PrincipledBSDF,    // Disney principled BRDF
-    Emissive,
-    Subsurface         // Subsurface scattering
+/**
+ * @brief GPU-aligned Material Structure (64 bytes)
+ * 
+ * Implements a dynamic layered material system supporting:
+ * - Base PBR properties (metallic-roughness workflow)
+ * - Optional extended layers (clearcoat, transmission, sheen, etc.)
+ * - Virtual texture support
+ * - Backward compatible with MTL format
+ * 
+ * Memory Layout: 64 bytes total (cache-line friendly)
+ * - Base properties: 32 bytes
+ * - Texture indices: 16 bytes
+ * - Layer info: 16 bytes
+ * 
+ * Extended layers are stored separately and accessed via extendedDataIndex.
+ */
+struct MaterialData {
+    // Base PBR properties (32 bytes = 4 vec4s)
+    glm::vec4 baseColor_metallic;  // RGB diffuse color / albedo, W = metallic [0,1]
+    glm::vec4 emission_roughness;  // RGB emission (HDR), W = roughness [0,1]
+    glm::vec4 ior_opacity_flags_idx; // X=IOR, Y=opacity, Z=layerFlags(as float), W=extendedDataIndex(as float)
+    glm::vec4 texIndices;          // X=baseColorTex, Y=normalTex, Z=metallicRoughnessTex, W=emissionTex (all as floats, cast to int)
+    
+    // Constructor
+    MaterialData() 
+        : baseColor_metallic(0.8f, 0.8f, 0.8f, 0.0f),
+          emission_roughness(0.0f, 0.0f, 0.0f, 0.5f),
+          ior_opacity_flags_idx(1.5f, 1.0f, 0.0f, 0.0f),
+          texIndices(-1.0f, -1.0f, -1.0f, -1.0f) {}
+          
+    // Helper accessors
+    glm::vec3 GetBaseColor() const { return glm::vec3(baseColor_metallic); }
+    float GetMetallic() const { return baseColor_metallic.w; }
+    glm::vec3 GetEmission() const { return glm::vec3(emission_roughness); }
+    float GetRoughness() const { return emission_roughness.w; }
+    float GetIOR() const { return ior_opacity_flags_idx.x; }
+    float GetOpacity() const { return ior_opacity_flags_idx.y; }
+    uint32_t GetLayerFlags() const { 
+        uint32_t flags; 
+        std::memcpy(&flags, &ior_opacity_flags_idx.z, sizeof(uint32_t)); 
+        return flags; 
+    }
+    uint32_t GetExtendedDataIndex() const { 
+        uint32_t idx; 
+        std::memcpy(&idx, &ior_opacity_flags_idx.w, sizeof(uint32_t)); 
+        return idx; 
+    }
 };
+static_assert(sizeof(MaterialData) == 64, "MaterialData must be exactly 64 bytes");
 
 /**
- * @brief Material properties for path tracing
+ * @brief Material Class (CPU-side representation)
  * 
- * Implements Wavefront MTL material specification (v4.2, October 1995)
- * 
- * Supported MTL properties:
- * - Ka: Ambient reflectivity (RGB 0.0-1.0)
- * - Kd: Diffuse reflectivity (RGB 0.0-1.0)
- * - Ks: Specular reflectivity (RGB 0.0-1.0)
- * - Ke: Emissive color (RGB, typically 0.0-1.0+)
- * - Tf: Transmission filter (RGB 0.0-1.0)
- * - Ns: Specular exponent (0-1000, focus of highlight)
- * - Ni: Optical density / Index of Refraction (0.001-10)
- * - d:  Dissolve factor (0.0-1.0, 1.0=opaque)
- * - illum: Illumination model (0-10)
- * 
- * Illumination Models (from MTL spec):
- * 0  = Flat color (no lighting)
- * 1  = Diffuse (Lambertian)
- * 2  = Diffuse + Specular (Blinn-Phong) [most common]
- * 3  = Reflection (ray traced)
- * 4  = Glass (transparency + reflection)
- * 5  = Fresnel Mirror (perfect reflection)
- * 6  = Refraction (Fresnel off)
- * 7  = Refraction + Fresnel (realistic glass)
- * 8  = Reflection (no ray trace)
- * 9  = Glass (no ray trace)
- * 10 = Shadow matte
+ * High-level material interface with MTL compatibility.
+ * Converts to MaterialData for GPU upload.
  */
 class Material {
 public:
     Material();
     virtual ~Material();
 
-    // Basic properties
-    void SetType(MaterialType type) { m_type = type; }
-    MaterialType GetType() const { return m_type; }
-    
-    // MTL color properties (Ka, Kd, Ks, Ke, Tf)
-    void SetAmbient(const glm::vec3& ambient) { m_ambient = ambient; }
-    void SetAlbedo(const glm::vec3& albedo) { m_albedo = albedo; }  // Kd
-    void SetSpecular(const glm::vec3& specular) { m_specular = specular; }  // Ks
-    void SetEmission(const glm::vec3& emission) { m_emission = emission; }  // Ke
-    void SetTransmissionFilter(const glm::vec3& tf) { m_transmissionFilter = tf; }  // Tf
-    
-    glm::vec3 GetAmbient() const { return m_ambient; }
-    glm::vec3 GetAlbedo() const { return m_albedo; }
-    glm::vec3 GetSpecular() const { return m_specular; }
-    glm::vec3 GetEmission() const { return m_emission; }
-    glm::vec3 GetTransmissionFilter() const { return m_transmissionFilter; }
-    
-    // MTL scalar properties
-    void SetSpecularExponent(float ns) { m_specularExponent = ns; }  // Ns (0-1000)
-    void SetDissolve(float d) { m_dissolve = d; }  // d (0.0-1.0, 1.0=opaque)
-    void SetOpticalDensity(float ni) { m_opticalDensity = ni; }  // Ni (IOR)
-    void SetIllum(int illum) { m_illum = illum; }  // illum (0-10)
-    
-    float GetSpecularExponent() const { return m_specularExponent; }
-    float GetDissolve() const { return m_dissolve; }
-    float GetOpticalDensity() const { return m_opticalDensity; }
-    int GetIllum() const { return m_illum; }
-    
-    // PBR-converted properties (for shader compatibility)
+    // Name
+    void SetName(const std::string& name) { m_name = name; }
+    std::string GetName() const { return m_name; }
+
+    // Basic PBR properties
+    void SetBaseColor(const glm::vec3& color) { m_baseColor = color; }
     void SetMetallic(float metallic) { m_metallic = metallic; }
     void SetRoughness(float roughness) { m_roughness = roughness; }
-    void SetIOR(float ior) { m_ior = ior; }  // Alias for Ni
-    void SetTransmission(float transmission) { m_transmission = transmission; }
+    void SetEmission(const glm::vec3& emission) { m_emission = emission; }
+    void SetIOR(float ior) { m_ior = ior; }
+    void SetOpacity(float opacity) { m_opacity = opacity; }
     
+    glm::vec3 GetBaseColor() const { return m_baseColor; }
     float GetMetallic() const { return m_metallic; }
     float GetRoughness() const { return m_roughness; }
+    glm::vec3 GetEmission() const { return m_emission; }
     float GetIOR() const { return m_ior; }
-    float GetTransmission() const { return m_transmission; }
+    float GetOpacity() const { return m_opacity; }
     
-    // Subsurface scattering
-    void SetSubsurfaceRadius(const glm::vec3& radius) { m_subsurfaceRadius = radius; }
-    void SetSubsurfaceColor(const glm::vec3& color) { m_subsurfaceColor = color; }
+    // Legacy MTL compatibility (maps to PBR)
+    void SetAlbedo(const glm::vec3& albedo) { m_baseColor = albedo; }  // Kd -> baseColor
+    void SetSpecular(const glm::vec3& specular);  // Ks -> metallic conversion
+    void SetSpecularExponent(float ns);  // Ns -> roughness conversion
+    void SetDissolve(float d) { m_opacity = d; }  // d -> opacity
+    void SetOpticalDensity(float ni) { m_ior = ni; }  // Ni -> IOR
+    void SetTransmissionFilter(const glm::vec3& tf);  // Tf -> transmission layer
+    void SetIllum(int illum);  // illum -> layer flags + properties
+    
+    glm::vec3 GetAlbedo() const { return m_baseColor; }
+    float GetDissolve() const { return m_opacity; }
+    float GetOpticalDensity() const { return m_ior; }
+    
+    // Extended layers
+    bool HasLayer(MaterialLayerFlags layer) const { return (m_layerFlags & layer) != 0; }
+    void AddLayer(MaterialLayerFlags layer) { m_layerFlags |= layer; }
+    void RemoveLayer(MaterialLayerFlags layer) { m_layerFlags &= ~layer; }
+    uint32_t GetLayerFlags() const { return m_layerFlags; }
+    
+    void SetClearcoatLayer(const ClearcoatLayer& layer);
+    void SetTransmissionLayer(const TransmissionLayer& layer);
+    void SetSheenLayer(const SheenLayer& layer);
+    void SetSubsurfaceLayer(const SubsurfaceLayer& layer);
+    void SetAnisotropyLayer(const AnisotropyLayer& layer);
+    void SetIridescenceLayer(const IridescenceLayer& layer);
+    void SetVolumeLayer(const VolumeLayer& layer);
+    
+    const ClearcoatLayer* GetClearcoatLayer() const;
+    const TransmissionLayer* GetTransmissionLayer() const;
+    const SheenLayer* GetSheenLayer() const;
+    const SubsurfaceLayer* GetSubsurfaceLayer() const;
+    const AnisotropyLayer* GetAnisotropyLayer() const;
+    const IridescenceLayer* GetIridescenceLayer() const;
+    const VolumeLayer* GetVolumeLayer() const;
     
     // Textures
-    void SetAlbedoTexture(std::shared_ptr<Texture> texture) { m_albedoTexture = texture; }
-    void SetNormalTexture(std::shared_ptr<Texture> texture) { m_normalTexture = texture; }
-    void SetRoughnessTexture(std::shared_ptr<Texture> texture) { m_roughnessTexture = texture; }
-    void SetMetallicTexture(std::shared_ptr<Texture> texture) { m_metallicTexture = texture; }
+    void SetBaseColorTexture(std::shared_ptr<Texture> texture, int32_t texIdx = -1);
+    void SetNormalTexture(std::shared_ptr<Texture> texture, int32_t texIdx = -1);
+    void SetMetallicRoughnessTexture(std::shared_ptr<Texture> texture, int32_t texIdx = -1);
+    void SetEmissionTexture(std::shared_ptr<Texture> texture, int32_t texIdx = -1);
     
-    std::shared_ptr<Texture> GetAlbedoTexture() const { return m_albedoTexture; }
+    std::shared_ptr<Texture> GetBaseColorTexture() const { return m_baseColorTexture; }
+    std::shared_ptr<Texture> GetNormalTexture() const { return m_normalTexture; }
+    std::shared_ptr<Texture> GetMetallicRoughnessTexture() const { return m_metallicRoughnessTexture; }
+    std::shared_ptr<Texture> GetEmissionTexture() const { return m_emissionTexture; }
     
-    // Evaluate material
-    virtual glm::vec3 Evaluate(const glm::vec3& wo, const glm::vec3& wi, const glm::vec3& normal) const;
-    virtual glm::vec3 Evaluate(const glm::vec3& wo, const glm::vec3& wi, const glm::vec3& normal, const glm::vec2& texCoord) const;
-    virtual glm::vec3 Sample(const glm::vec3& wo, const glm::vec3& normal, glm::vec3& wi, float& pdf) const;
-    virtual float PDF(const glm::vec3& wo, const glm::vec3& wi, const glm::vec3& normal) const;
+    int32_t GetBaseColorTexIdx() const { return m_baseColorTexIdx; }
+    int32_t GetNormalTexIdx() const { return m_normalTexIdx; }
+    int32_t GetMetallicRoughnessTexIdx() const { return m_metallicRoughnessTexIdx; }
+    int32_t GetEmissionTexIdx() const { return m_emissionTexIdx; }
+    
+    // Virtual texture support
+    void SetTextureSize(const glm::vec2& size) { m_textureSize = size; }
+    glm::vec2 GetTextureSize() const { return m_textureSize; }
+    
+    // Convert to GPU data structure
+    MaterialData ToGPUData() const;
+    
+    // Get extended layer data for GPU upload
+    const std::vector<MaterialExtendedData>& GetExtendedLayers() const { return m_extendedLayers; }
+    uint32_t GetExtendedDataBaseIndex() const { return m_extendedDataBaseIndex; }
+    void SetExtendedDataBaseIndex(uint32_t index) { m_extendedDataBaseIndex = index; }
 
 protected:
-    MaterialType m_type;
+    // Name
+    std::string m_name;
     
-    // MTL Specification color properties
-    glm::vec3 m_ambient;           // Ka: Ambient reflectivity (RGB 0.0-1.0)
-    glm::vec3 m_albedo;            // Kd: Diffuse reflectivity (RGB 0.0-1.0)
-    glm::vec3 m_specular;          // Ks: Specular reflectivity (RGB 0.0-1.0)
-    glm::vec3 m_emission;          // Ke: Emissive color (RGB 0.0+)
-    glm::vec3 m_transmissionFilter; // Tf: Transmission filter (RGB 0.0-1.0)
+    // Base PBR properties
+    glm::vec3 m_baseColor;
+    float m_metallic;
+    glm::vec3 m_emission;
+    float m_roughness;
+    float m_ior;
+    float m_opacity;
     
-    // MTL Specification scalar properties
-    float m_specularExponent;      // Ns: Specular exponent (0-1000)
-    float m_dissolve;              // d: Dissolve/opacity (0.0-1.0, 1.0=opaque)
-    float m_opticalDensity;        // Ni: Index of refraction (0.001-10)
-    int m_illum;                   // illum: Illumination model (0-10)
+    // Layer management
+    uint32_t m_layerFlags;
+    std::vector<MaterialExtendedData> m_extendedLayers;  // CPU-side layer storage
+    uint32_t m_extendedDataBaseIndex;  // GPU buffer offset (set by Scene)
     
-    // PBR-converted properties (derived from MTL for shader use)
-    float m_metallic;              // Metallic factor (0.0-1.0)
-    float m_roughness;             // Roughness factor (0.0-1.0)
-    float m_ior;                   // Index of refraction (alias for Ni)
-    float m_transmission;          // Transmission amount (derived from d)
-    
-    // Subsurface scattering
-    glm::vec3 m_subsurfaceRadius;
-    glm::vec3 m_subsurfaceColor;
-    
-    // Textures
-    std::shared_ptr<Texture> m_albedoTexture;
+    // Texture references and indices
+    std::shared_ptr<Texture> m_baseColorTexture;
     std::shared_ptr<Texture> m_normalTexture;
-    std::shared_ptr<Texture> m_roughnessTexture;
-    std::shared_ptr<Texture> m_metallicTexture;
-};
-
-// Specialized material types
-
-class DiffuseMaterial : public Material {
-public:
-    DiffuseMaterial(const glm::vec3& albedo);
-};
-
-class SpecularMaterial : public Material {
-public:
-    SpecularMaterial(const glm::vec3& albedo, float roughness);
-};
-
-class TransmissiveMaterial : public Material {
-public:
-    TransmissiveMaterial(const glm::vec3& albedo, float ior);
-};
-
-class PrincipledBSDFMaterial : public Material {
-public:
-    PrincipledBSDFMaterial();
+    std::shared_ptr<Texture> m_metallicRoughnessTexture;
+    std::shared_ptr<Texture> m_emissionTexture;
+    
+    int32_t m_baseColorTexIdx;
+    int32_t m_normalTexIdx;
+    int32_t m_metallicRoughnessTexIdx;
+    int32_t m_emissionTexIdx;
+    
+    // Virtual texture
+    glm::vec2 m_textureSize;
 };
 
 } // namespace ACG
