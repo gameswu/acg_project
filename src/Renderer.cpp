@@ -368,8 +368,14 @@ namespace ACG {
             cameraConstants.maxBounces = static_cast<uint32_t>(m_maxBounces);
             cameraConstants.environmentLightIntensity = m_environmentLightIntensity;
             cameraConstants.padding = 0.0f;
+            cameraConstants.cameraParams = glm::vec4(
+                m_camera.GetFOV(),
+                static_cast<float>(m_width) / static_cast<float>(m_height),
+                m_camera.GetAperture(),
+                m_camera.GetFocusDistance()
+            );
             cameraConstants.sunDirIntensity = glm::vec4(m_sunDirection, m_sunIntensity);
-            cameraConstants.sunColorEnabled = glm::vec4(m_sunColor, 1.0f);  // Always 1.0, controlled by intensityolled by intensity
+            cameraConstants.sunColorEnabled = glm::vec4(m_sunColor, 1.0f);  // Always 1.0, controlled by intensity
             
             // Set root constants (CameraConstants size in DWORDs)
             renderCommandList->SetComputeRoot32BitConstants(10, sizeof(CameraConstants) / 4, &cameraConstants, 0);
@@ -439,6 +445,12 @@ namespace ACG {
                 cameraConstants.maxBounces = static_cast<uint32_t>(maxBounces);
                 cameraConstants.environmentLightIntensity = m_environmentLightIntensity;
                 cameraConstants.padding = 0.0f;
+                cameraConstants.cameraParams = glm::vec4(
+                    m_camera.GetFOV(),
+                    static_cast<float>(m_width) / static_cast<float>(m_height),
+                    m_camera.GetAperture(),
+                    m_camera.GetFocusDistance()
+                );
                 cameraConstants.sunDirIntensity = glm::vec4(m_sunDirection, m_sunIntensity);
                 cameraConstants.sunColorEnabled = glm::vec4(m_sunColor, 1.0f);  // Always 1.0, controlled by intensity
                 renderCommandList->SetComputeRoot32BitConstants(10, sizeof(CameraConstants) / 4, &cameraConstants, 0);
@@ -554,6 +566,12 @@ namespace ACG {
                         nextCameraConstants.maxBounces = static_cast<uint32_t>(maxBounces);
                         nextCameraConstants.environmentLightIntensity = m_environmentLightIntensity;
                         nextCameraConstants.padding = 0.0f;
+                        nextCameraConstants.cameraParams = glm::vec4(
+                            m_camera.GetFOV(),
+                            static_cast<float>(m_width) / static_cast<float>(m_height),
+                            m_camera.GetAperture(),
+                            m_camera.GetFocusDistance()
+                        );
                         nextCameraConstants.sunDirIntensity = glm::vec4(m_sunDirection, m_sunIntensity);
                         nextCameraConstants.sunColorEnabled = glm::vec4(m_sunColor, 1.0f);  // Always 1.0, controlled by intensity
                         

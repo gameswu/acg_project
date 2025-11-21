@@ -73,6 +73,8 @@ namespace ACG {
             uint32_t maxBounces;
             float environmentLightIntensity;
             float padding;
+            // cameraParams: x = FOV (degrees), y = aspectRatio, z = aperture, w = focusDistance
+            glm::vec4 cameraParams;
             // Sun parameters packed as vec4 for safe alignment
             glm::vec4 sunDirIntensity; // xyz = direction (toward light), w = intensity
             glm::vec4 sunColorEnabled; // rgb = color, a = enabled (0 or 1)

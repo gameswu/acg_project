@@ -33,6 +33,8 @@ cbuffer SceneConstantBuffer : register(b0)
     uint maxBounces;
     float environmentLightIntensity;
     float _padding;
+    // cameraParams: x = FOV (degrees), y = aspectRatio, z = aperture, w = focusDistance
+    float4 cameraParams;
     // Sun (directional) parameters
     float4 sunDirIntensity; // xyz = direction (toward light), w = intensity
     float4 sunColorEnabled; // rgb = color, a = enabled (0 or 1)
@@ -143,9 +145,9 @@ void RayGen()
     float2 uv = pixelCenter / (float2)renderTargetSize; // [0,1]
     
     // Simple pinhole camera model
-    // Assume FOV of 60 degrees
-    float aspectRatio = (float)renderTargetSize.x / (float)renderTargetSize.y;
-    float fov = 60.0 * 3.14159265 / 180.0; // 60 degrees in radians
+    // FOV is provided by CPU via cameraParams.x (degrees). Use cameraParams.y for aspect ratio.
+    float aspectRatio = cameraParams.y;
+    float fov = cameraParams.x * 3.14159265 / 180.0; // convert degrees -> radians
     float tanHalfFov = tan(fov * 0.5);
     
     // NDC coordinates ([-1,1] range)

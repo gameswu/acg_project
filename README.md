@@ -46,7 +46,7 @@ We are planning to implement a GPU-based renderer that meets the following cours
 - Lighting: Options include:
     - Point light and area light (basic) :construction:
     - Environment lighting with HDR, such as skybox (2pts) :white_check_mark:
-- Anti-aliasing: Implement an anti-aliasing algorithm (basic) :x:
+- Anti-aliasing: Implement an anti-aliasing algorithm (basic) :white_check_mark:
 - Simulation-based content creation: Up to 2pts :construction:
 </details>
 
