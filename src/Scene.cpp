@@ -50,100 +50,16 @@ bool Scene::LoadFromFileEx(const std::string& filename, const SceneLoadConfig& c
     std::filesystem::path filePath(filename);
     m_name = filePath.stem().string();
     
-    std::string loadPath = filename;
-    
-    // 如果不是ACG文件，需要先转换为ACG
+    // Only ACG files are supported - no automatic conversion
     if (filePath.extension() != ".acg") {
-        std::cout << "Converting model file to binary format..." << std::endl;
-        std::cout << "Input format: " << filePath.extension().string() << std::endl;
-        
-        // 获取可执行文件目录
-        std::filesystem::path exePath;
-#ifdef _WIN32
-        wchar_t exePathBuffer[MAX_PATH];
-        GetModuleFileNameW(NULL, exePathBuffer, MAX_PATH);
-        exePath = std::filesystem::path(exePathBuffer).parent_path();
-#else
-        exePath = std::filesystem::current_path();
-#endif
-        
-        // 生成临时ACG文件路径（使用bin/tmp目录）
-        std::filesystem::path tempDir = exePath / "tmp";
-        std::filesystem::create_directories(tempDir);
-        std::filesystem::path tempPath = tempDir / (filePath.stem().string() + ".acg");
-        
-        // 构建Python命令（使用虚拟环境中的Python）
-        std::filesystem::path loaderScript = exePath / "loader" / "main.py";
-        std::filesystem::path absoluteObjPath = std::filesystem::absolute(filePath);
-        
-        // 检查loader脚本是否存在
-        if (!std::filesystem::exists(loaderScript)) {
-            std::cerr << "ERROR: Loader script not found: " << loaderScript << std::endl;
-            std::cerr << "Please ensure loader directory exists in bin/" << std::endl;
-            return false;
-        }
-        
-        // 使用虚拟环境中的Python
-        std::filesystem::path venvPython = exePath / "loader" / ".venv" / "Scripts" / "python.exe";
-        std::string pythonExe;
-        
-        if (std::filesystem::exists(venvPython)) {
-            pythonExe = "\"" + venvPython.string() + "\"";
-            std::cout << "Using virtual environment Python: " << venvPython << std::endl;
-        } else {
-            pythonExe = "python";
-            std::cout << "WARNING: Virtual environment not found, using system Python" << std::endl;
-            std::cout << "Expected path: " << venvPython << std::endl;
-        }
-        
-        std::string pythonCmd = pythonExe + " \"" + loaderScript.string() + "\" \"" + 
-                               absoluteObjPath.string() + "\" \"" + 
-                               tempPath.string() + "\" --binary";
-        
-        std::cout << "Running converter..." << std::endl;
-        std::cout << "Command: " << pythonCmd << std::endl;
-        std::cout << "Output file: " << tempPath << std::endl;
-        
-#ifdef _WIN32
-        // Windows: 重定向输出以捕获错误信息
-        std::string cmdWithRedirect = "cmd /c \"" + pythonCmd + " 2>&1\"";
-        
-        FILE* pipe = _popen(cmdWithRedirect.c_str(), "r");
-        if (!pipe) {
-            std::cerr << "ERROR: Failed to start Python converter" << std::endl;
-            return false;
-        }
-        
-        char outputBuffer[256];
-        std::string output;
-        while (fgets(outputBuffer, sizeof(outputBuffer), pipe) != nullptr) {
-            output += outputBuffer;
-            std::cout << outputBuffer;  // 实时输出
-        }
-        
-        int exitCode = _pclose(pipe);
-        
-        if (exitCode != 0) {
-            std::cerr << "ERROR: Python converter failed with code " << exitCode << std::endl;
-            std::cerr << "Output: " << output << std::endl;
-            return false;
-        }
-#else
-        int result = system(pythonCmd.c_str());
-        if (result != 0) {
-            std::cerr << "ERROR: Failed to convert OBJ to binary format" << std::endl;
-            return false;
-        }
-#endif
-        
-        if (!std::filesystem::exists(tempPath)) {
-            std::cerr << "ERROR: Converted file not found: " << tempPath << std::endl;
-            return false;
-        }
-        
-        loadPath = tempPath.string();
-        std::cout << "Conversion complete: " << loadPath << std::endl;
+        std::cerr << "ERROR: Only .acg files are supported for loading." << std::endl;
+        std::cerr << "Please convert your scene to ACG format first using the GUI conversion tool." << std::endl;
+        std::cerr << "Attempted to load: " << filename << std::endl;
+        return false;
     }
+    
+    std::cout << "Loading binary ACG file: " << filename << std::endl;
+    std::string loadPath = filename;
     
     try {
         // Load scene from binary file

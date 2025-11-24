@@ -241,8 +241,8 @@ int32_t VirtualTextureSystem::AddVirtualTexture(const std::shared_ptr<Texture>& 
     return static_cast<int32_t>(m_virtualTextures.size() - 1);
 }
 
-bool VirtualTextureSystem::UploadAllTiles(ID3D12GraphicsCommandList* cmdList, ID3D12CommandQueue* commandQueue) {
-    std::cout << "[Virtual Texture] Uploading all tiles to GPU..." << std::endl;
+bool VirtualTextureSystem::UploadAllTiles(ID3D12GraphicsCommandList* cmdList, ID3D12CommandQueue* commandQueue, size_t tileBatchSize) {
+    std::cout << "[Virtual Texture] Uploading all tiles to GPU (batch size: " << tileBatchSize << ")..." << std::endl;
     
     // Clear any previous upload buffers
     m_uploadBuffers.clear();
@@ -270,23 +270,71 @@ bool VirtualTextureSystem::UploadAllTiles(ID3D12GraphicsCommandList* cmdList, ID
     m_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
     
     size_t totalTilesUploaded = 0;
-    const size_t MAX_TILES_PER_BATCH = 50;  // Execute GPU commands every 50 tiles to avoid memory buildup
+    const size_t MAX_TILES_PER_BATCH = tileBatchSize;  // Execute GPU commands based on user setting
     std::vector<size_t> texturesInCurrentBatch;  // Track textures that need state transition back
     
+    // Create a shared upload buffer for batched tile uploads (reduces memory pressure)
+    const size_t TILE_DATA_SIZE = m_config.tileSize * m_config.tileSize * 4;  // 256x256x4 = 256KB per tile
+    const size_t BATCH_UPLOAD_BUFFER_SIZE = TILE_DATA_SIZE * MAX_TILES_PER_BATCH;  // e.g., 50 tiles = 12.5MB
+    Microsoft::WRL::ComPtr<ID3D12Resource> sharedUploadBuffer;
+    size_t currentTileInBatch = 0;  // Track offset within current batch upload buffer
+    
+    // Create the shared upload buffer
+    D3D12_HEAP_PROPERTIES uploadHeapProps = {};
+    uploadHeapProps.Type = D3D12_HEAP_TYPE_UPLOAD;
+    uploadHeapProps.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+    uploadHeapProps.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+    
+    D3D12_RESOURCE_DESC uploadBufferDesc = {};
+    uploadBufferDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    uploadBufferDesc.Alignment = 0;
+    uploadBufferDesc.Width = BATCH_UPLOAD_BUFFER_SIZE;
+    uploadBufferDesc.Height = 1;
+    uploadBufferDesc.DepthOrArraySize = 1;
+    uploadBufferDesc.MipLevels = 1;
+    uploadBufferDesc.Format = DXGI_FORMAT_UNKNOWN;
+    uploadBufferDesc.SampleDesc.Count = 1;
+    uploadBufferDesc.SampleDesc.Quality = 0;
+    uploadBufferDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    uploadBufferDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+    
+    hr = m_device->CreateCommittedResource(
+        &uploadHeapProps,
+        D3D12_HEAP_FLAG_NONE,
+        &uploadBufferDesc,
+        D3D12_RESOURCE_STATE_GENERIC_READ,
+        nullptr,
+        IID_PPV_ARGS(&sharedUploadBuffer));
+    
+    if (FAILED(hr)) {
+        std::cerr << "  ✗ Failed to create shared upload buffer (" << (BATCH_UPLOAD_BUFFER_SIZE / 1024.0 / 1024.0) << " MB)" << std::endl;
+        return false;
+    }
+    
+    std::cout << "  Created shared upload buffer: " << (BATCH_UPLOAD_BUFFER_SIZE / 1024.0 / 1024.0) << " MB for " << MAX_TILES_PER_BATCH << " tiles" << std::endl;
+    
+    // Persistent map the upload buffer once - keep it mapped throughout all uploads
+    BYTE* pSharedBufferData = nullptr;
+    D3D12_RANGE readRangeNone = { 0, 0 };  // We won't read from this resource on the CPU
+    hr = sharedUploadBuffer->Map(0, &readRangeNone, reinterpret_cast<void**>(&pSharedBufferData));
+    if (FAILED(hr)) {
+        std::cerr << "  ✗ Failed to map shared upload buffer" << std::endl;
+        CloseHandle(fenceEvent);
+        return false;
+    }
+    
     // Transition physical cache to COPY_DEST state once at the beginning
-    D3D12_RESOURCE_BARRIER cacheBarrier = {};
-    cacheBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    cacheBarrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
-    cacheBarrier.Transition.pResource = m_physicalCacheTexture.Get();
-    cacheBarrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
-    cacheBarrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-    cacheBarrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    batchCmdList->ResourceBarrier(1, &cacheBarrier);
+    // NOTE: Physical cache was created in COPY_DEST state, so we start from there
+    // No barrier needed here since it's already in the correct state
     
-    // NOTE: We don't clear the physical cache to avoid state tracking issues with CommandList reset.
-    // Uninitialized cache positions will contain undefined data, but all tiles we upload will have valid data.
-    // The indirection texture marks which tiles are resident (not 0xFFFFFFFF), so shader won't sample uninitialized areas.
+    // NOTE: We don't clear the physical cache to avoid state tracking issues.
+    // The physical cache texture is created in COPY_DEST state and stays in that state.
+    // Uninitialized cache positions will contain undefined data (black/zero from DEFAULT heap),
+    // but all tiles we upload will have valid data.
+    // The indirection texture marks which tiles are resident (not 0xFFFFFFFF),
+    // so shader won't sample uninitialized areas.
     
+    std::cout << "  Beginning tile uploads..." << std::endl;
     for (size_t texIdx = 0; texIdx < m_virtualTextureMetadata.size(); ++texIdx) {
         auto& metadata = m_virtualTextureMetadata[texIdx];
         auto& sourceTexture = metadata.sourceTexture;
@@ -327,6 +375,10 @@ bool VirtualTextureSystem::UploadAllTiles(ID3D12GraphicsCommandList* cmdList, ID
             uint32_t physicalPageIndex = AllocatePhysicalPage();
             if (physicalPageIndex == UINT32_MAX) {
                 std::cerr << "    ✗ Out of physical memory for tile " << tile.tileX << "," << tile.tileY << std::endl;
+                if (sharedUploadBuffer) {
+                    sharedUploadBuffer->Unmap(0, nullptr);
+                }
+                CloseHandle(fenceEvent);
                 return false;
             }
             
@@ -380,54 +432,20 @@ bool VirtualTextureSystem::UploadAllTiles(ID3D12GraphicsCommandList* cmdList, ID
                           << " non-black pixels, first pixel=(" << (int)tileData[0] << "," << (int)tileData[1] << "," << (int)tileData[2] << ")" << std::endl;
             }
             
-            // Upload tile data using UpdateSubresources
-            D3D12_SUBRESOURCE_DATA subresourceData = {};
-            subresourceData.pData = tileData.data();
-            subresourceData.RowPitch = m_config.tileSize * 4;
-            subresourceData.SlicePitch = subresourceData.RowPitch * m_config.tileSize;
+            // Calculate offset in current shared upload buffer
+            size_t tileOffsetInBuffer = currentTileInBatch * TILE_DATA_SIZE;
             
-            // Create temporary upload buffer
-            CD3DX12_HEAP_PROPERTIES uploadHeapProps(D3D12_HEAP_TYPE_UPLOAD);
-            auto uploadBufferDesc = CD3DX12_RESOURCE_DESC::Buffer(tileData.size());
-            
-            Microsoft::WRL::ComPtr<ID3D12Resource> uploadBuffer;
-            HRESULT hr = m_device->CreateCommittedResource(
-                &uploadHeapProps,
-                D3D12_HEAP_FLAG_NONE,
-                &uploadBufferDesc,
-                D3D12_RESOURCE_STATE_GENERIC_READ,
-                nullptr,
-                IID_PPV_ARGS(&uploadBuffer)
-            );
-            
-            if (FAILED(hr)) {
-                std::cerr << "    ✗ Failed to create upload buffer for tile " << tile.tileX << "," << tile.tileY << std::endl;
-                FreePhysicalPage(physicalPageIndex);
-                continue;
-            }
-            
-            // Keep upload buffer alive until GPU finishes reading it
-            m_uploadBuffers.push_back(uploadBuffer);
-            
-            // Copy data to upload buffer
-            BYTE* pMappedData = nullptr;
-            CD3DX12_RANGE readRange(0, 0); // We're not reading from this buffer
-            hr = uploadBuffer->Map(0, &readRange, reinterpret_cast<void**>(&pMappedData));
-            if (FAILED(hr)) {
-                std::cerr << "    ✗ Failed to map upload buffer for tile " << tile.tileX << "," << tile.tileY << std::endl;
-                FreePhysicalPage(physicalPageIndex);
-                continue;
-            }
-            
-            memcpy(pMappedData, tileData.data(), tileData.size());
-            uploadBuffer->Unmap(0, nullptr);
+            // Copy tile data to persistently mapped buffer (no need to Map/Unmap each time)
+            memcpy(pSharedBufferData + tileOffsetInBuffer, tileData.data(), tileData.size());
             
             // Use CopyTextureRegion for tiled resources
             D3D12_TEXTURE_COPY_LOCATION srcLocation = {};
-            srcLocation.pResource = uploadBuffer.Get();
+            srcLocation.pResource = sharedUploadBuffer.Get();
             srcLocation.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-            srcLocation.PlacedFootprint.Offset = 0;
+            srcLocation.PlacedFootprint.Offset = tileOffsetInBuffer;
             srcLocation.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            // CRITICAL: Set footprint dimensions to match the ACTUAL tile size in the buffer
+            // The buffer contains a full 256x256 tile (padded), so footprint must be 256x256
             srcLocation.PlacedFootprint.Footprint.Width = m_config.tileSize;
             srcLocation.PlacedFootprint.Footprint.Height = m_config.tileSize;
             srcLocation.PlacedFootprint.Footprint.Depth = 1;
@@ -438,11 +456,13 @@ bool VirtualTextureSystem::UploadAllTiles(ID3D12GraphicsCommandList* cmdList, ID
             dstLocation.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
             dstLocation.SubresourceIndex = 0;  // Physical cache is a single 2D texture
             
+            // CRITICAL: Copy the entire 256x256 tile (including padding), not just actual content
+            // This ensures the data layout matches between source and destination
             D3D12_BOX srcBox = {};
             srcBox.left = 0;
             srcBox.top = 0;
-            srcBox.right = tileActualWidth;
-            srcBox.bottom = tileActualHeight;
+            srcBox.right = m_config.tileSize;  // Copy full tile, not just tileActualWidth
+            srcBox.bottom = m_config.tileSize;  // Copy full tile, not just tileActualHeight
             srcBox.front = 0;
             srcBox.back = 1;
             
@@ -452,6 +472,16 @@ bool VirtualTextureSystem::UploadAllTiles(ID3D12GraphicsCommandList* cmdList, ID
             uint32_t pageY = physicalPageIndex / CACHE_TILES_PER_ROW;
             uint32_t dstX = pageX * m_config.tileSize;
             uint32_t dstY = pageY * m_config.tileSize;
+            
+            // DEBUG: Log first few tiles
+            if (totalTilesUploaded < 5) {
+                std::cout << "    DEBUG Upload Tile #" << totalTilesUploaded 
+                          << ": tex=" << texIdx 
+                          << " tile[" << tile.tileX << "," << tile.tileY << "]"
+                          << " -> physPage=" << physicalPageIndex
+                          << " cachePos[" << dstX << "," << dstY << "]"
+                          << " size=" << tileActualWidth << "x" << tileActualHeight << std::endl;
+            }
             
             batchCmdList->CopyTextureRegion(&dstLocation, dstX, dstY, 0, &srcLocation, &srcBox);
             
@@ -466,9 +496,10 @@ bool VirtualTextureSystem::UploadAllTiles(ID3D12GraphicsCommandList* cmdList, ID
             m_physicalPages[physicalPageIndex].tileY = tile.tileY;
             
             totalTilesUploaded++;
+            currentTileInBatch++;
             
             // Execute batch and wait for GPU to finish before releasing upload buffers
-            if (totalTilesUploaded % MAX_TILES_PER_BATCH == 0) {
+            if (currentTileInBatch >= MAX_TILES_PER_BATCH) {
                 std::cout << "  Progress: " << totalTilesUploaded << " tiles uploaded, executing batch..." << std::endl;
                 
                 // Close and execute command list
@@ -483,13 +514,17 @@ bool VirtualTextureSystem::UploadAllTiles(ID3D12GraphicsCommandList* cmdList, ID
                     WaitForSingleObject(fenceEvent, INFINITE);
                 }
                 
-                // Now safe to release upload buffers
+                // Now safe to release old upload resources
                 m_uploadBuffers.clear();
+                // Keep sharedUploadBuffer alive - we'll reuse it for next batch
                 texturesInCurrentBatch.clear();
+                currentTileInBatch = 0;  // Reset tile counter for next batch
                 
                 // Reset for next batch
                 batchAllocator->Reset();
                 batchCmdList->Reset(batchAllocator.Get(), nullptr);
+                
+                // NOTE: sharedUploadBuffer is persistent across batches - no need to recreate
                 
                 // Physical cache stays in COPY_DEST state, no need to transition again
             }
@@ -517,6 +552,29 @@ bool VirtualTextureSystem::UploadAllTiles(ID3D12GraphicsCommandList* cmdList, ID
     cacheBarrierFinal.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     batchCmdList->ResourceBarrier(1, &cacheBarrierFinal);
     
+    // Unmap shared upload buffer BEFORE creating indirection buffer to free memory
+    if (sharedUploadBuffer) {
+        sharedUploadBuffer->Unmap(0, nullptr);
+        std::cout << "  Unmapped shared tile upload buffer" << std::endl;
+    }
+    
+    // Check device status before proceeding
+    HRESULT deviceStatus = m_device->GetDeviceRemovedReason();
+    if (FAILED(deviceStatus)) {
+        std::cerr << "  ✗ Device lost before indirection upload (HRESULT: 0x" 
+                  << std::hex << deviceStatus << std::dec << ")" << std::endl;
+        CloseHandle(fenceEvent);
+        return false;
+    }
+    
+    // Now upload indirection texture using the same command list and allocator
+    // This avoids creating new command resources and prevents resource exhaustion
+    std::cout << "  Uploading indirection texture..." << std::endl;
+    if (!UploadIndirectionTextureInternal(batchCmdList.Get())) {
+        CloseHandle(fenceEvent);
+        return false;
+    }
+    
     batchCmdList->Close();
     ID3D12CommandList* cmdLists[] = { batchCmdList.Get() };
     commandQueue->ExecuteCommandLists(1, cmdLists);
@@ -527,7 +585,14 @@ bool VirtualTextureSystem::UploadAllTiles(ID3D12GraphicsCommandList* cmdList, ID
         WaitForSingleObject(fenceEvent, INFINITE);
     }
     
+    // sharedUploadBuffer already unmapped before indirection upload
+    
     m_uploadBuffers.clear();
+    
+    // Force GPU to finish all work before releasing command resources
+    commandQueue->Signal(fence.Get(), ++fenceValue);
+    fence->SetEventOnCompletion(fenceValue, fenceEvent);
+    WaitForSingleObject(fenceEvent, INFINITE);
     
     CloseHandle(fenceEvent);
     
@@ -535,7 +600,7 @@ bool VirtualTextureSystem::UploadAllTiles(ID3D12GraphicsCommandList* cmdList, ID
     return true;
 }
 
-bool VirtualTextureSystem::CreateIndirectionTexture(ID3D12GraphicsCommandList* cmdList, ID3D12CommandQueue* commandQueue) {
+bool VirtualTextureSystem::UploadIndirectionTextureInternal(ID3D12GraphicsCommandList* cmdList) {
     // Indirection texture: stores physical page index for each virtual tile
     // Size: max texture tiles across all textures
     uint32_t maxTilesX = 0;
@@ -551,20 +616,18 @@ bool VirtualTextureSystem::CreateIndirectionTexture(ID3D12GraphicsCommandList* c
     }
     
     std::cout << "[Virtual Texture] Creating indirection texture: " << maxTilesX << "x" << maxTilesY << std::endl;
+    std::cout << "  Array slices (textures): " << m_virtualTextureMetadata.size() << std::endl;
+    std::cout << "  Format: R32_UINT, Dimensions: " << maxTilesX << "x" << maxTilesY << "x" << m_virtualTextureMetadata.size() << std::endl;
     
-    // Create our own command allocator and list for upload
-    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> uploadAllocator;
-    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> uploadCmdList;
-    
-    HRESULT hr = m_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&uploadAllocator));
-    if (FAILED(hr)) {
-        std::cerr << "[Virtual Texture] ✗ Failed to create command allocator for indirection upload" << std::endl;
-        return false;
+    // Release any existing indirection texture first
+    if (m_indirectionTexture) {
+        std::cout << "  Releasing existing indirection texture..." << std::endl;
+        m_indirectionTexture.Reset();
     }
     
-    hr = m_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, uploadAllocator.Get(), nullptr, IID_PPV_ARGS(&uploadCmdList));
-    if (FAILED(hr)) {
-        std::cerr << "[Virtual Texture] ✗ Failed to create command list for indirection upload" << std::endl;
+    // Check if array size is within D3D12 limits (max 2048 for Texture2DArray)
+    if (m_virtualTextureMetadata.size() > 2048) {
+        std::cerr << "[Virtual Texture] ✗ Too many textures for Texture2DArray: " << m_virtualTextureMetadata.size() << " (max 2048)" << std::endl;
         return false;
     }
     
@@ -582,7 +645,7 @@ bool VirtualTextureSystem::CreateIndirectionTexture(ID3D12GraphicsCommandList* c
     indirectionDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
     
     CD3DX12_HEAP_PROPERTIES defaultHeapProps(D3D12_HEAP_TYPE_DEFAULT);
-    hr = m_device->CreateCommittedResource(
+    HRESULT hr = m_device->CreateCommittedResource(
         &defaultHeapProps,
         D3D12_HEAP_FLAG_NONE,
         &indirectionDesc,
@@ -592,7 +655,18 @@ bool VirtualTextureSystem::CreateIndirectionTexture(ID3D12GraphicsCommandList* c
     );
     
     if (FAILED(hr)) {
-        std::cerr << "[Virtual Texture] ✗ Failed to create indirection texture" << std::endl;
+        std::cerr << "[Virtual Texture] ✗ Failed to create indirection texture (HRESULT: 0x" 
+                  << std::hex << hr << std::dec << ")" << std::endl;
+        std::cerr << "  Requested: " << maxTilesX << "x" << maxTilesY << "x" << m_virtualTextureMetadata.size() 
+                  << " (R32_UINT)" << std::endl;
+        size_t estimatedSize = static_cast<size_t>(maxTilesX) * maxTilesY * m_virtualTextureMetadata.size() * 4;
+        std::cerr << "  Estimated size: " << (estimatedSize / 1024.0 / 1024.0) << " MB" << std::endl;
+        
+        // Try to diagnose the issue
+        if (hr == E_OUTOFMEMORY || hr == 0x887A0005) {  // DXGI_ERROR_DEVICE_REMOVED
+            std::cerr << "  Likely cause: GPU memory exhausted or device lost" << std::endl;
+            std::cerr << "  Try: Reduce VT tile batch size or restart application" << std::endl;
+        }
         return false;
     }
     
@@ -602,15 +676,22 @@ bool VirtualTextureSystem::CreateIndirectionTexture(ID3D12GraphicsCommandList* c
     UINT alignedRowPitch = (rowPitchBytes + 255) & ~255;
     UINT alignedRowPitchInUints = alignedRowPitch / sizeof(uint32_t);
     
-    std::vector<uint32_t> indirectionData(alignedRowPitchInUints * maxTilesY * m_virtualTextureMetadata.size(), UINT32_MAX);
+    // Allocate buffer for all slices (each slice is independent)
+    // IMPORTANT: Use aligned pitch for buffer allocation (CPU side)
+    size_t bytesPerSlice = alignedRowPitch * maxTilesY;
+    size_t totalBytes = bytesPerSlice * m_virtualTextureMetadata.size();
+    std::vector<uint32_t> indirectionData(totalBytes / sizeof(uint32_t), UINT32_MAX);
     
+    // Fill data for each texture (each texture is a separate slice)
     for (size_t texIdx = 0; texIdx < m_virtualTextureMetadata.size(); ++texIdx) {
         const auto& metadata = m_virtualTextureMetadata[texIdx];
-        size_t layerOffset = texIdx * alignedRowPitchInUints * maxTilesY;  // Use aligned pitch
+        size_t sliceOffsetInUints = texIdx * (bytesPerSlice / sizeof(uint32_t));
         
         for (const auto& tile : metadata.tiles) {
             if (tile.isResident) {
-                size_t idx = layerOffset + tile.tileY * alignedRowPitchInUints + tile.tileX;  // Use aligned pitch
+                // Calculate index within this slice using ALIGNED row pitch for upload buffer
+                // This matches the PlacedFootprint.RowPitch we'll use in CopyTextureRegion
+                size_t idx = sliceOffsetInUints + tile.tileY * alignedRowPitchInUints + tile.tileX;
                 indirectionData[idx] = tile.physicalPageIndex;
             }
         }
@@ -618,10 +699,13 @@ bool VirtualTextureSystem::CreateIndirectionTexture(ID3D12GraphicsCommandList* c
         // DEBUG: Print first texture's indirection data
         if (texIdx == 0) {
             std::cout << "[Virtual Texture] Indirection data for texture 0:" << std::endl;
+            std::cout << "  Texture dimensions: " << metadata.width << "x" << metadata.height << std::endl;
+            std::cout << "  Tile grid: " << metadata.numTilesX << "x" << metadata.numTilesY << std::endl;
+            std::cout << "  Aligned row pitch (uints): " << alignedRowPitchInUints << std::endl;
             for (uint32_t y = 0; y < std::min(3u, metadata.numTilesY); ++y) {
                 for (uint32_t x = 0; x < std::min(3u, metadata.numTilesX); ++x) {
-                    size_t idx = layerOffset + y * alignedRowPitchInUints + x;
-                    std::cout << "  Tile[" << x << "," << y << "] = page " << indirectionData[idx];
+                    size_t idx = sliceOffsetInUints + y * alignedRowPitchInUints + x;
+                    std::cout << "  Tile[" << x << "," << y << "] idx=" << idx << " page=" << indirectionData[idx];
                     if (indirectionData[idx] == UINT32_MAX) {
                         std::cout << " (NOT RESIDENT)";
                     }
@@ -645,6 +729,15 @@ bool VirtualTextureSystem::CreateIndirectionTexture(ID3D12GraphicsCommandList* c
         IID_PPV_ARGS(&uploadBuffer)
     );
     
+    if (FAILED(hr)) {
+        std::cerr << "[Virtual Texture] ✗ Failed to create indirection upload buffer (HRESULT: 0x" 
+                  << std::hex << hr << std::dec << ")" << std::endl;
+        return false;
+    }
+    
+    // Keep upload buffer alive until GPU finishes - add to member vector
+    m_uploadBuffers.push_back(uploadBuffer);
+    
     if (SUCCEEDED(hr)) {
         // Map upload buffer and copy data
         BYTE* pMappedData = nullptr;
@@ -659,11 +752,12 @@ bool VirtualTextureSystem::CreateIndirectionTexture(ID3D12GraphicsCommandList* c
                 // Calculate aligned row pitch (must be 256-byte aligned for DX12)
                 UINT rowPitchBytes = maxTilesX * sizeof(uint32_t);
                 UINT alignedRowPitch = (rowPitchBytes + 255) & ~255;  // Round up to 256-byte alignment
+                UINT bytesPerSlice = alignedRowPitch * maxTilesY;
                 
                 D3D12_TEXTURE_COPY_LOCATION srcLocation = {};
                 srcLocation.pResource = uploadBuffer.Get();
                 srcLocation.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-                srcLocation.PlacedFootprint.Offset = slice * alignedRowPitch * maxTilesY;  // Use aligned pitch
+                srcLocation.PlacedFootprint.Offset = slice * bytesPerSlice;  // Byte offset for each slice
                 srcLocation.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R32_UINT;
                 srcLocation.PlacedFootprint.Footprint.Width = maxTilesX;
                 srcLocation.PlacedFootprint.Footprint.Height = maxTilesY;
@@ -675,7 +769,7 @@ bool VirtualTextureSystem::CreateIndirectionTexture(ID3D12GraphicsCommandList* c
                 dstLocation.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
                 dstLocation.SubresourceIndex = slice;
                 
-                uploadCmdList->CopyTextureRegion(&dstLocation, 0, 0, 0, &srcLocation, nullptr);
+                cmdList->CopyTextureRegion(&dstLocation, 0, 0, 0, &srcLocation, nullptr);
             }
             
             // Transition to NON_PIXEL_SHADER_RESOURCE for DXR compute pipeline
@@ -684,28 +778,23 @@ bool VirtualTextureSystem::CreateIndirectionTexture(ID3D12GraphicsCommandList* c
                 D3D12_RESOURCE_STATE_COPY_DEST,
                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
             );
-            uploadCmdList->ResourceBarrier(1, &barrier);
+            cmdList->ResourceBarrier(1, &barrier);
             
-            // Execute and wait for GPU
-            uploadCmdList->Close();
-            ID3D12CommandList* cmdLists[] = { uploadCmdList.Get() };
-            commandQueue->ExecuteCommandLists(1, cmdLists);
-            
-            // Create fence and wait
-            Microsoft::WRL::ComPtr<ID3D12Fence> fence;
-            HANDLE fenceEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
-            m_device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
-            
-            commandQueue->Signal(fence.Get(), 1);
-            fence->SetEventOnCompletion(1, fenceEvent);
-            WaitForSingleObject(fenceEvent, INFINITE);
-            CloseHandle(fenceEvent);
+            // Command list will be closed and executed by UploadAllTiles
+            // No need for independent fence wait
             
             // Now safe to let upload buffer go out of scope
         }
     }
     
     std::cout << "[Virtual Texture] ✓ Indirection texture created" << std::endl;
+    return true;
+}
+
+bool VirtualTextureSystem::CreateIndirectionTexture(ID3D12GraphicsCommandList* cmdList, ID3D12CommandQueue* commandQueue) {
+    // Indirection texture is now created and uploaded in UploadAllTiles to avoid creating new command resources
+    // This function now just returns success for backward compatibility
+    std::cout << "[Virtual Texture] Indirection texture already created in UploadAllTiles" << std::endl;
     return true;
 }
 

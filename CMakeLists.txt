@@ -33,9 +33,6 @@ file(GLOB_RECURSE SRC_FILES
     "src/*.cpp"
 )
 
-# Ensure VirtualTextureSystem.cpp is included
-list(APPEND SRC_FILES "${CMAKE_SOURCE_DIR}/src/VirtualTextureSystem.cpp")
-
 # 收集所有头文件
 file(GLOB_RECURSE HEADER_FILES 
     "include/*.h"

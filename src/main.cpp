@@ -200,6 +200,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         GUI::InitializeGUIState(g_guiState, g_exeDirectory);
         g_guiState.pLogMessages = &g_logMessages;
         
+        // Load persistent configuration
+        {
+            std::string configPath = g_exeDirectory + "\\config.txt";
+            GUI::LoadConfig(g_guiState, &renderer, configPath);
+            std::cout << "Configuration loaded from " << configPath << std::endl;
+        }
+        
         ShowWindow(hwnd, nCmdShow);
         std::cout << "Window shown, entering main loop..." << std::endl;
         
@@ -235,6 +242,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         }
         
         std::cout << "Exiting main loop, cleaning up..." << std::endl;
+        
+        // Save persistent configuration
+        {
+            std::string configPath = g_exeDirectory + "\\config.txt";
+            GUI::SaveConfig(g_guiState, &renderer, configPath);
+            std::cout << "Configuration saved to " << configPath << std::endl;
+        }
         
         // Shutdown GUI (this will wait for render thread if running)
         GUI::ShutdownGUI();

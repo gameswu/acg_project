@@ -40,13 +40,18 @@ class WavefrontLoader(BaseLoader):
     
     def load(self) -> SceneData:
         """Load OBJ file with PyWavefront"""
-        logger.info(f"Parsing OBJ file with PyWavefront: {self.filepath}")
+        # Parsing OBJ file (silent)
         
         # Preprocess MTL files to remove inline comments
         self._preprocess_mtl_files()
         
         # Extract Tf values before PyWavefront parsing (PyWavefront doesn't support it)
         tf_values = self._extract_tf_values()
+        
+        # Extract material usage order from OBJ file BEFORE PyWavefront parsing
+        # PyWavefront creates materials dict in MTL definition order,
+        # but we need OBJ usage order to match mesh material indices
+        material_usage_order = self._get_material_usage_order()
         
         # Parse with PyWavefront
         wavefront_scene = Wavefront(
@@ -57,12 +62,12 @@ class WavefrontLoader(BaseLoader):
         )
         
         # Extract materials and collect textures
-        materials, texture_paths = self._extract_materials(wavefront_scene, tf_values)
+        materials, texture_paths = self._extract_materials(wavefront_scene, tf_values, material_usage_order)
         self.scene.materials = materials
         
         # Build texture list
         self.scene.textures = [Texture(path=path) for path in texture_paths]
-        logger.info(f"Collected {len(self.scene.textures)} unique textures")
+        # Textures collected (silent)
         
         # Extract geometry
         meshes = self._extract_meshes(wavefront_scene, materials)
@@ -91,7 +96,7 @@ class WavefrontLoader(BaseLoader):
                         if mtl_path.exists():
                             mtl_files.append(mtl_path)
         except Exception as e:
-            logger.warning(f"Failed to read OBJ file for MTL references: {e}")
+            pass  # Failed to read MTL references (silent)
             return
         
         # Clean each MTL file
@@ -121,9 +126,9 @@ class WavefrontLoader(BaseLoader):
                 with open(mtl_path, 'w', encoding='utf-8') as f:
                     f.writelines(cleaned_lines)
                 
-                logger.info(f"Cleaned MTL file: {mtl_path.name}")
+                pass  # MTL file cleaned (silent)
             except Exception as e:
-                logger.warning(f"Failed to clean MTL file {mtl_path}: {e}")
+                pass  # Failed to clean MTL (silent)
     
     def _extract_tf_values(self) -> dict:
         """Extract Tf (transmission filter) values from MTL files before PyWavefront parsing"""
@@ -140,9 +145,38 @@ class WavefrontLoader(BaseLoader):
                         if mtl_path.exists():
                             self._parse_tf_from_mtl(mtl_path, tf_dict)
         except Exception as e:
-            logger.warning(f"Failed to extract Tf values: {e}")
+            pass  # Failed to extract Tf (silent)
         
         return tf_dict
+    
+    def _get_material_usage_order(self) -> List[str]:
+        """Extract material names in OBJ file usage order (first usemtl appearance)
+        
+        CRITICAL: This determines the material index order. Materials must be sorted
+        by first appearance in OBJ file, NOT by MTL file definition order.
+        PyWavefront's materials dict uses MTL order, which doesn't match usage order.
+        """
+        material_order = []
+        seen = set()
+        
+        try:
+            with open(self.filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith('usemtl '):
+                        mat_name = line[7:].strip()
+                        if mat_name and mat_name not in seen:
+                            material_order.append(mat_name)
+                            seen.add(mat_name)
+        except Exception as e:
+            logger.error(f"Failed to extract material usage order: {e}")
+            return []
+        
+        logger.info(f"Extracted {len(material_order)} materials in OBJ usage order")
+        if material_order:
+            logger.debug(f"First 5 materials in usage order: {material_order[:5]}")
+        
+        return material_order
     
     def _parse_tf_from_mtl(self, mtl_path: Path, tf_dict: dict):
         """Parse Tf values from a single MTL file"""
@@ -166,10 +200,22 @@ class WavefrontLoader(BaseLoader):
                             except ValueError:
                                 pass
         except Exception as e:
-            logger.warning(f"Failed to parse Tf from {mtl_path}: {e}")
+            pass  # Failed to parse Tf (silent)
     
-    def _extract_materials(self, wavefront_scene: Wavefront, tf_values: dict) -> tuple[List[Material], List[str]]:
-        """Extract materials from PyWavefront scene, return materials and unique texture paths"""
+    def _extract_materials(self, wavefront_scene: Wavefront, tf_values: dict, material_usage_order: List[str]) -> tuple[List[Material], List[str]]:
+        """Extract materials from PyWavefront scene, return materials and unique texture paths
+        
+        CRITICAL: Materials must be ordered by OBJ usage order (first usemtl appearance),
+        NOT by MTL file definition order, to match mesh material indices.
+        
+        Args:
+            wavefront_scene: Parsed PyWavefront scene
+            tf_values: Transmission filter values extracted from MTL
+            material_usage_order: Material names in OBJ file usage order
+        
+        Returns:
+            (materials_list, texture_paths_list) both ordered by usage order
+        """
         materials = []
         texture_paths = []  # Unique texture paths
         texture_map = {}    # Path -> index mapping
@@ -183,7 +229,20 @@ class WavefrontLoader(BaseLoader):
                 texture_paths.append(tex_path)
             return texture_map[tex_path]
         
-        for mat_name, mat in wavefront_scene.materials.items():
+        # Iterate materials in OBJ usage order, NOT PyWavefront dict order
+        if not material_usage_order:
+            logger.warning("No material usage order provided, falling back to PyWavefront dict order (may cause texture mapping issues!)")
+            material_usage_order = list(wavefront_scene.materials.keys())
+        
+        for mat_name in material_usage_order:
+            # Get material from PyWavefront scene
+            if mat_name not in wavefront_scene.materials:
+                logger.warning(f"Material '{mat_name}' used in OBJ but not defined in MTL, skipping")
+                # Add a default material to maintain index alignment
+                materials.append(Material(name=mat_name))
+                continue
+            
+            mat = wavefront_scene.materials[mat_name]
             logger.debug(f"Processing material: {mat_name}")
             
             material = Material(name=mat_name)
@@ -191,7 +250,9 @@ class WavefrontLoader(BaseLoader):
             # Check illumination model for special handling
             illum = getattr(mat, 'illumination_model', 2)
             is_mirror = (illum == 5)  # Perfect mirror
-            is_glass = (illum == 7)   # Glass (refraction + reflection)
+            # Only treat as glass if illum 7 OR if illum 4/6 AND material is actually transparent
+            # Many exporters use illum 4 for all materials, so check actual transparency
+            is_glass = (illum == 7)  # Glass (refraction + reflection)
             
             logger.debug(f"  illum mode: {illum} (mirror={is_mirror}, glass={is_glass})")
             
@@ -210,6 +271,15 @@ class WavefrontLoader(BaseLoader):
                     float(mat.diffuse[1]),
                     float(mat.diffuse[2])
                 ]
+                
+                # CRITICAL FIX: If Kd is black (0,0,0) but material has texture,
+                # use white (1,1,1) as base color so texture is visible
+                # This is common in Blender exports where texture fully replaces color
+                if hasattr(mat, 'texture') and mat.texture:
+                    kd_sum = sum(material.base_color)
+                    if kd_sum < 0.01:  # Essentially black
+                        material.base_color = [1.0, 1.0, 1.0]
+                        pass  # Using white base_color for textured material (silent)
             
             # Specular -> metallic (heuristic conversion)
             # High specular intensity suggests metallic surface
@@ -259,8 +329,21 @@ class WavefrontLoader(BaseLoader):
             # Get Tf (transmission filter) color if available
             tf_color = tf_values.get(mat_name, [1.0, 1.0, 1.0])
             
-            # For glass materials (illum 7), we should enable transmission
-            if is_glass:
+            # Check if material is actually transparent (not just illum mode)
+            # Only treat as transparent if:
+            # 1. Has explicit transparency value (d < 0.99)
+            # 2. OR Tf (transmission filter) is NOT white (colored transmission)
+            kd_avg = sum(material.base_color) / 3.0 if material.base_color else 1.0
+            tf_avg = sum(tf_color) / 3.0
+            has_explicit_transparency = hasattr(mat, 'transparency') and mat.transparency < 0.99
+            has_colored_transmission = tf_avg < 0.99  # Tf != white means colored glass
+            is_actually_transparent = has_explicit_transparency or has_colored_transmission
+            
+            if mat_name in ['breakfast_room:Artwork', 'breakfast_room:Floor_Tiles']:
+                pass  # Transparency check (silent)
+            
+            # For glass materials (illum 7) OR illum 4/6 with actual transparency, enable transmission
+            if is_glass or (illum in [4, 6] and is_actually_transparent):
                 # Glass material - high transmission
                 material.opacity = 0.1  # Very transparent
                 transmission_strength = 0.9
@@ -271,7 +354,7 @@ class WavefrontLoader(BaseLoader):
                     color=tf_color,  # Use Tf color for transmission filter
                     texture_index=-1
                 )
-                logger.debug(f"  Glass material: transmission={transmission_strength:.2f}, opacity={material.opacity:.2f}, Tf={tf_color}")
+                pass  # Added transmission layer (silent)
             elif hasattr(mat, 'transparency'):
                 material.opacity = float(mat.transparency)
                 
@@ -297,7 +380,9 @@ class WavefrontLoader(BaseLoader):
                 tex_path = self._resolve_texture_path(mat.texture)
                 if tex_path:
                     material.base_color_texture = add_texture(tex_path)
-                    logger.debug(f"  Base color texture[{material.base_color_texture}]: {tex_path}")
+                    logger.info(f"  ✓ Base color texture[{material.base_color_texture}]: {tex_path}")
+                else:
+                    logger.warning(f"  ✗ Base color texture path could not be resolved: {mat.texture}")
             
             # Check for other texture maps
             if hasattr(mat, 'texture_normal') and mat.texture_normal:
@@ -331,7 +416,18 @@ class WavefrontLoader(BaseLoader):
         else:
             tex_filename = str(texture)
         
-        # Resolve relative to OBJ directory
+        # Convert to Path object
+        tex_path = Path(tex_filename)
+        
+        # If the path is already absolute and exists, use it directly
+        if tex_path.is_absolute() and tex_path.exists():
+            return str(tex_path.resolve())
+        
+        # Check if the path exists as-is (PyWavefront may already resolve it)
+        if tex_path.exists():
+            return str(tex_path.resolve())
+        
+        # Otherwise, resolve relative to OBJ directory
         obj_dir = self.filepath.parent
         tex_path = obj_dir / tex_filename
         

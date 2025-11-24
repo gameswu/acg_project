@@ -6,6 +6,7 @@
 #include <vector>
 #include <unordered_map>
 #include <queue>
+#include <glm/glm.hpp>
 
 namespace ACG {
 
@@ -58,9 +59,9 @@ public:
     int32_t AddVirtualTexture(const std::shared_ptr<Texture>& texture);
     
     // Upload all tiles for all textures (after all textures added)
-    bool UploadAllTiles(ID3D12GraphicsCommandList* cmdList, ID3D12CommandQueue* commandQueue);
+    bool UploadAllTiles(ID3D12GraphicsCommandList* cmdList, ID3D12CommandQueue* commandQueue, size_t tileBatchSize = 50);
     
-    // Create indirection texture for shader access
+    // Create indirection texture for shader access (now just returns success - upload done in UploadAllTiles)
     bool CreateIndirectionTexture(ID3D12GraphicsCommandList* cmdList, ID3D12CommandQueue* commandQueue);
     
     // Upload texture data for a specific tile
@@ -122,6 +123,15 @@ public:
     // Feedback-based streaming (for future optimization)
     void ProcessFeedback(const void* feedbackData, size_t dataSize);
     
+    // Get texture dimensions for a given texture index
+    glm::uvec2 GetTextureDimensions(int32_t textureIndex) const {
+        if (textureIndex >= 0 && textureIndex < static_cast<int32_t>(m_virtualTextureMetadata.size())) {
+            const auto& meta = m_virtualTextureMetadata[textureIndex];
+            return glm::uvec2(meta.width, meta.height);
+        }
+        return glm::uvec2(2048, 2048);  // Fallback
+    }
+    
 private:
     // DX12 Resources
     Microsoft::WRL::ComPtr<ID3D12Device> m_device;
@@ -165,6 +175,9 @@ private:
     void FreePhysicalPage(uint32_t pageIndex);
     uint32_t CalculateNumTiles(uint32_t dimension, uint32_t tileSize) const;
     void CreateTiledResource(uint32_t width, uint32_t height, uint32_t mipLevels);
+    
+    // Internal helper: upload indirection texture using existing command list
+    bool UploadIndirectionTextureInternal(ID3D12GraphicsCommandList* cmdList);
     
     // Upload buffer management (kept alive until GPU finishes)
     std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> m_uploadBuffers;

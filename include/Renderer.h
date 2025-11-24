@@ -44,6 +44,8 @@ namespace ACG {
         void RenderToFile(const std::string& outputPath, int samplesPerPixel, int maxBounces);
         void SetEnvironmentMap(const std::string& path);  // Load HDR/EXR environment map
         void ClearEnvironmentMap();  // Clear/unload environment map
+        void SetVirtualTextureTileBatchSize(size_t batchSize) { m_vtTileBatchSize = batchSize; }  // Set VT upload batch size
+        void SetRenderBatchSize(int batchSize) { m_renderBatchSize = batchSize; }  // Set samples per GPU execution batch
         
         // GUI控制方法
         void SetSamplesPerPixel(int spp) { m_samplesPerPixel = spp; }
@@ -56,6 +58,7 @@ namespace ACG {
         int GetAccumulatedSamples() const { return m_accumulatedSamples; }
         int GetSamplesPerPixel() const { return m_samplesPerPixel; }
         int GetMaxBounces() const { return m_maxBounces; }
+        int GetRenderBatchSize() const { return m_renderBatchSize; }
         Scene* GetScene() { return m_scene.get(); }
         Camera* GetCamera() { return &m_camera; }
         void StopRender() { m_stopRenderRequested = true; }
@@ -71,7 +74,7 @@ namespace ACG {
             uint32_t frameIndex;
             uint32_t maxBounces;
             float environmentLightIntensity;
-            float padding;
+            uint32_t useVirtualTextures;  // 0 = use texture array, 1 = use virtual textures
             // cameraParams: x = FOV (degrees), y = aspectRatio, z = aperture, w = focusDistance
             glm::vec4 cameraParams;
             // Sun parameters packed as vec4 for safe alignment
@@ -173,6 +176,8 @@ namespace ACG {
         Microsoft::WRL::ComPtr<ID3D12Resource> m_textureAtlas;
         Microsoft::WRL::ComPtr<ID3D12Resource> m_textureScalesBuffer;  // UV scale factors (float2 per texture)
         Microsoft::WRL::ComPtr<ID3D12Resource> m_textureScalesUpload;  // Upload heap for texture scales
+        Microsoft::WRL::ComPtr<ID3D12Resource> m_textureSizesBuffer;  // Actual texture dimensions (uint2 per texture)
+        Microsoft::WRL::ComPtr<ID3D12Resource> m_textureSizesUpload;  // Upload heap for texture sizes
         Microsoft::WRL::ComPtr<ID3D12Resource> m_environmentMap;  // HDR environment map
 
         // Descriptor indices in the shader-visible heap
@@ -213,6 +218,7 @@ namespace ACG {
         int m_samplesPerPixel = 1;
         int m_maxBounces = 5;
         int m_accumulatedSamples = 0;
+        int m_renderBatchSize = 5;  // Samples per GPU execution batch (affects TDR timeout)
         float m_environmentLightIntensity = 0.5f;
         // Sun parameters (CPU-side, controlled via intensity)
         glm::vec3 m_sunDirection = glm::vec3(0.0f, 1.0f, 0.0f);
@@ -222,5 +228,8 @@ namespace ACG {
         
         // OIDN降噪器
         std::unique_ptr<Denoiser> m_denoiser;
+        
+        // Virtual Texture System settings
+        size_t m_vtTileBatchSize = 50;  // Tiles per GPU batch (configurable from GUI)
     };
 }

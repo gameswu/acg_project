@@ -57,6 +57,7 @@ Details of each requirement can be found in the [project description document](/
 acg_project/
 ├── include/             # Header directory
 │   ├── Camera.h         # Camera system
+│   ├── Config.h         # Configuration settings
 │   ├── Denoiser.h       # Denoising using OIDN
 │   ├── DX12Helper.h     # DirectX 12 helper functions
 │   ├── GUI.h            # GUI system using ImGui
@@ -75,6 +76,7 @@ acg_project/
 │
 ├── src/                 # Source files directory
 │   ├── Camera.cpp
+│   ├── Config.cpp
 │   ├── Denoiser.cpp
 │   ├── GUI.cpp
 │   ├── Light.cpp
@@ -94,12 +96,21 @@ acg_project/
 │   ├── Random.hlsli     # HLSL shader for random number generation
 │   └── Structures.hlsli # HLSL shader structures
 │
+├── loader/              # Python scene loader
+│   ├── base_loader.py   # Base loader for scene files
+│   ├── binary_exporter.py # Binary scene exporter
+│   ├── data_structures.py # Data structures for scene representation
+│   ├── wavefront_loader.py # Wavefront OBJ file loader
+│   ├── bpy_loader.py    # Blender file loader
+│   └── main.py          # Main script to load and export scenes  
+│
 ├── lib/                 # Third-party libraries
 │   ├── oidn/            # Open Image Denoise library
 │   └── WinPixEventRuntime/ # PIX for Windows library
 │
 ├── docs/                # Documentation directory
 ├── tests/               # Test scenes and scripts
+├── .github/             # GitHub configuration files
 ├── ACG_Project.rc       # Resource script for application icon
 ├── CMakeLists.txt       # CMake build configuration
 ├── vcpkg.json           # vcpkg dependency configuration
@@ -125,7 +136,7 @@ We provide a GUI for users to configure rendering settings and load scenes. The 
 
 - **Render Settings:** Adjust output resolution, sampling parameters, lighting intensity, and scene model paths.
 - **Camera Settings:** Configure camera position, target, up vector, and field of view.
-- **Render Statistics:** Monitor rendering progress, samples, and performance metrics.
+- **Render Results:** Show the rendered image.
 - **Controls:** Start or stop rendering processes.
 - **Log Details:** View log messages and debug information.
 
@@ -157,12 +168,20 @@ This project requires the following dependencies:
 
 For debugging and performance analysis, we use [PIX for Windows](https://devblogs.microsoft.com/pix/).
 
-We know support Wavefront OBJ files and Blender files as scene inputs. As python loader is used to parse these files, we use uv as following:
+Python loader is used to parse files into `acg` file, we use uv as following:
 ```bash
 uv venv --python 3.11 # bpy requires python 3.11
 .venv\Scripts\activate # On Windows
 uv pip install -r requirements.txt
 ```
+
+We know supports
+| File Format | Loader | Status |
+|-------------|--------|--------|
+| Wavefront OBJ (.obj) | wavefront_loader.py | :white_check_mark: |
+| Blender (.blend) | bpy_loader.py | :construction: |
+| glTF (.gltf, .glb) | gltf_loader.py | :x: |
+| FBX (.fbx) | fbx_loader.py | :x: |
 
 ### Building the Project
 

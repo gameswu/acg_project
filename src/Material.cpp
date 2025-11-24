@@ -199,28 +199,34 @@ void Material::SetIllum(int illum) {
     // 1: Color on, ambient on
     // 2: Highlight on (default)
     // 3: Reflection on, ray trace on
-    // 4-10: Various glass/reflection modes
+    // 4: Transparency: Glass on, Reflection: Ray trace on
+    // 5: Reflection: Fresnel on and Ray trace on
+    // 6: Transparency: Refraction on, Reflection: Fresnel off and Ray trace on
+    // 7: Transparency: Refraction on, Reflection: Fresnel on and Ray trace on
+    // 8: Reflection on and Ray trace off
+    // 9: Transparency: Glass on, Reflection: Ray trace off
+    // 10: Casts shadows onto invisible surfaces
     
     switch (illum) {
         case 0:
         case 1:
         case 2:
-            // Standard diffuse/specular
-            break;
         case 3:
+        case 8:
+            // Standard diffuse/specular/reflective - no transmission
+            break;
+        case 5:
+            // Fresnel reflection (mirror-like)
+            m_metallic = 1.0f;
+            m_roughness = 0.0f;
+            break;
         case 4:
         case 6:
         case 7:
-            // Glass/transmission
-            if (!HasLayer(LAYER_TRANSMISSION)) {
-                TransmissionLayer layer;
-                layer.strength = 0.9f;
-                layer.color = glm::vec3(1.0f);
-                layer.roughness = m_roughness;
-                layer.depth = 1.0f;
-                layer.textureIdx = -1;
-                SetTransmissionLayer(layer);
-            }
+        case 9:
+            // Potentially glass/transmission - but only add layer if actually needed
+            // This will be determined by opacity and base color in the loader
+            // We don't automatically add transmission here anymore
             break;
         default:
             break;

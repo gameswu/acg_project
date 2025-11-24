@@ -54,12 +54,16 @@ class BinarySceneExporter:
                     return -1
                 return int(val) if isinstance(val, (int, float)) else -1
             
-            f.write(struct.pack('4i', 
-                to_texture_index(mat.base_color_texture),
-                to_texture_index(mat.normal_texture),
-                to_texture_index(mat.metallic_roughness_texture),
-                to_texture_index(mat.emission_texture)
-            ))
+            base_tex_idx = to_texture_index(mat.base_color_texture)
+            normal_tex_idx = to_texture_index(mat.normal_texture)
+            mr_tex_idx = to_texture_index(mat.metallic_roughness_texture)
+            emission_tex_idx = to_texture_index(mat.emission_texture)
+            
+            # Debug: print texture indices for materials with textures (disabled for silent mode)
+            # if base_tex_idx >= 0 or normal_tex_idx >= 0 or mr_tex_idx >= 0 or emission_tex_idx >= 0:
+            #     print(f"  Writing material '{mat.name}': texIndices=[{base_tex_idx}, {normal_tex_idx}, {mr_tex_idx}, {emission_tex_idx}]")
+            
+            f.write(struct.pack('4i', base_tex_idx, normal_tex_idx, mr_tex_idx, emission_tex_idx))
             
             # 材质层标志
             flags = 0

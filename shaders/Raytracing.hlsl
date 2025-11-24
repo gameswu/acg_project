@@ -24,20 +24,24 @@ struct RadiancePayload
 //     "SRV(t3)," /* Textures */ \
 //     "CBV(b0)"  /* Scene constants */
 
-// Scene constants
-cbuffer SceneConstantBuffer : register(b0)
+// Scene constants structure
+struct CameraConstants
 {
-    float4x4 cameraToWorld;
-    float4x4 projectionToCamera;
+    float4x4 viewInverse;
+    float4x4 projInverse;
     uint frameIndex;
     uint maxBounces;
     float environmentLightIntensity;
-    float _padding;
-    // cameraParams: x = FOV (degrees), y = aspectRatio, z = aperture, w = focusDistance
-    float4 cameraParams;
-    // Sun (directional) parameters
-    float4 sunDirIntensity; // xyz = direction (toward light), w = intensity
-    float4 sunColorEnabled; // rgb = color, a = enabled (0 or 1)
+    uint useVirtualTextures;  // 0 = texture array, 1 = virtual textures
+    float4 cameraParams;      // x = FOV, y = aspectRatio, z = aperture, w = focusDistance
+    float4 sunDirIntensity;   // xyz = sun direction, w = intensity
+    float4 sunColorEnabled;   // rgb = sun color, a = enabled
+};
+
+// Scene constants (using new structure)
+cbuffer SceneConstantBuffer : register(b0)
+{
+    CameraConstants g_constants;
 }
 
 // Raytracing output
@@ -57,6 +61,7 @@ Texture2D<float4> g_virtualTextureCache : register(t5);  // Virtual Texture phys
 Texture2DArray<uint> g_indirectionTexture : register(t6);  // Virtual Texture indirection lookup
 StructuredBuffer<MaterialExtendedData> g_materialLayers : register(t7);  // Extended material layers
 StructuredBuffer<float2> g_textureScales : register(t8);  // UV scale factors for resampled textures
+StructuredBuffer<uint2> g_textureSizes : register(t9);  // Actual texture dimensions (width, height) per texture
 SamplerState g_sampler : register(s0);
 
 // Convert ray direction to equirectangular UV coordinates
@@ -89,28 +94,69 @@ void CreateOrthonormalBasis(float3 normal, out float3 tangent, out float3 bitang
 
 // Virtual Texture sampling helper
 // Returns texture color using indirection-based lookup for virtual textures
-float4 SampleVirtualTexture(int texIndex, float2 uv, float2 textureSize)
+float4 SampleVirtualTexture(int texIndex, float2 uv)
 {
     // Virtual Texture system: 256x256 tile size
     const float TILE_SIZE = 256.0;
+    
+    // Validate texture index
+    if (texIndex < 0 || texIndex >= 219) {
+        // Invalid texture index - return error color (yellow)
+        return float4(1.0, 1.0, 0.0, 1.0);
+    }
+    
+    // Get actual texture dimensions from the buffer
+    uint2 textureSizeUint = g_textureSizes[texIndex];
+    float2 textureSize = float2(textureSizeUint.x, textureSizeUint.y);
+    
+    // CRITICAL: Wrap UV coordinates to [0, 1) to match sampler WRAP mode
+    // This ensures we access valid tiles even when UV is tiled
+    uv = frac(uv);
+    
+    // Clamp UV to prevent floating-point edge case where uv == 1.0 after frac
+    // (can happen due to precision issues)
+    uv = clamp(uv, 0.0, 0.999999);
     
     // Calculate which virtual tile this UV falls into
     float2 pixelCoords = uv * textureSize;
     float2 tileCoords = pixelCoords / TILE_SIZE;
     uint2 tileXY = uint2(floor(tileCoords));
     
+    // Safety check: clamp tile coordinates to valid range
+    uint numTilesX = (textureSizeUint.x + 255) / 256;  // Ceiling division
+    uint numTilesY = (textureSizeUint.y + 255) / 256;
+    tileXY.x = min(tileXY.x, numTilesX - 1);
+    tileXY.y = min(tileXY.y, numTilesY - 1);
+    
     // Lookup physical page index from indirection texture
+    // Load uses pixel coordinates directly: (x, y, arrayIndex, mipLevel)
     uint physicalPageIndex = g_indirectionTexture.Load(int4(tileXY.x, tileXY.y, texIndex, 0));
     
     // Check if tile is resident (0xFFFFFFFF = not loaded)
     if (physicalPageIndex == 0xFFFFFFFF)
     {
-        // Tile not resident, return magenta for debugging
-        return float4(1.0, 0.0, 1.0, 1.0);
+        // Tile not resident - return white to indicate missing texture
+        // (This allows us to see geometry shape even if texture is missing)
+        return float4(0.8, 0.8, 0.8, 1.0);
     }
     
-    // Calculate in-tile UV coordinates
-    float2 inTileUV = frac(tileCoords);
+    // Validate physical page index to detect indexing errors
+    const uint MAX_PHYSICAL_PAGES = 2304;  // Must match VirtualTextureSystem configuration
+    if (physicalPageIndex >= MAX_PHYSICAL_PAGES)
+    {
+        // Invalid page index - return light gray for error
+        return float4(0.5, 0.5, 0.5, 1.0);
+    }
+    
+    // Calculate in-tile UV coordinates based on pixel position within the tile
+    // This is more accurate than using frac(tileCoords) which can have precision issues
+    float2 tileStartPixel = float2(tileXY) * TILE_SIZE;
+    float2 pixelInTile = pixelCoords - tileStartPixel;
+    float2 inTileUV = pixelInTile / TILE_SIZE;
+    
+    // CRITICAL: Clamp inTileUV to [0, 1) to avoid sampling outside tile bounds
+    // This prevents bleeding between tiles in the physical cache
+    inTileUV = clamp(inTileUV, 0.0, 0.999999);
     
     // Physical page cache layout: tiles arranged in a grid
     // Each page is 256x256, cache is arranged as sqrt(numPages) x sqrt(numPages)
@@ -120,12 +166,15 @@ float4 SampleVirtualTexture(int texIndex, float2 uv, float2 textureSize)
     uint pageY = physicalPageIndex / CACHE_TILES_PER_ROW;
     
     // Calculate final UV in physical cache texture
-    // Convert page coordinates to pixel coordinates, add in-tile offset, then normalize
-    float2 cachePixelCoords = float2(pageX, pageY) * TILE_SIZE + inTileUV * TILE_SIZE;
-    float2 cacheUV = cachePixelCoords / (CACHE_TILES_PER_ROW * TILE_SIZE);
+    // Each tile occupies (1 / CACHE_TILES_PER_ROW) of the UV space in each direction
+    float tileUVSize = 1.0 / float(CACHE_TILES_PER_ROW);
+    float2 tileBaseUV = float2(pageX, pageY) * tileUVSize;
+    float2 finalCacheUV = tileBaseUV + inTileUV * tileUVSize;
     
     // Sample from physical cache
-    return g_virtualTextureCache.SampleLevel(g_sampler, cacheUV, 0);
+    float4 sampledColor = g_virtualTextureCache.SampleLevel(g_sampler, finalCacheUV, 0);
+    
+    return sampledColor;
 }
 
 [shader("raygeneration")]
@@ -136,7 +185,7 @@ void RayGen()
 
     // Initialize RNG for this pixel with per-sample variation
     // CRITICAL: Each sample must have different seed to generate different random sequences
-    uint rngState = InitRNG(dispatchIdx, frameIndex, frameIndex * 17);
+    uint rngState = InitRNG(dispatchIdx, g_constants.frameIndex, g_constants.frameIndex * 17);
     
     // Subpixel jitter for anti-aliasing: sample uniformly inside pixel
     // Use per-pixel RNG to produce two independent jitter offsets in [0,1)
@@ -147,9 +196,9 @@ void RayGen()
     float2 uv = pixelCenter / (float2)renderTargetSize; // [0,1]
     
     // Simple pinhole camera model
-    // FOV is provided by CPU via cameraParams.x (degrees). Use cameraParams.y for aspect ratio.
-    float aspectRatio = cameraParams.y;
-    float fov = cameraParams.x * 3.14159265 / 180.0; // convert degrees -> radians
+    // FOV is provided by CPU via g_constants.cameraParams.x (degrees). Use g_constants.cameraParams.y for aspect ratio.
+    float aspectRatio = g_constants.cameraParams.y;
+    float fov = g_constants.cameraParams.x * 3.14159265 / 180.0; // convert degrees -> radians
     float tanHalfFov = tan(fov * 0.5);
     
     // NDC coordinates ([-1,1] range)
@@ -157,13 +206,13 @@ void RayGen()
     ndc.x *= aspectRatio * tanHalfFov;
     ndc.y *= -tanHalfFov; // Flip Y
     
-    // Get camera basis from cameraToWorld matrix (ROW-MAJOR in HLSL)
+    // Get camera basis from g_constants.viewInverse matrix (ROW-MAJOR in HLSL)
     // Matrix is transposed on CPU, so in HLSL:
     // Row 0 = Right axis, Row 1 = Up axis, Row 2 = -Forward axis, Row 3 = Position
-    float3 cameraRight = cameraToWorld[0].xyz;     // First row
-    float3 cameraUp = cameraToWorld[1].xyz;        // Second row
-    float3 cameraForward = -cameraToWorld[2].xyz;  // Third row, camera looks along -Z
-    float3 origin = cameraToWorld[3].xyz;          // Fourth row - position
+    float3 cameraRight = g_constants.viewInverse[0].xyz;     // First row
+    float3 cameraUp = g_constants.viewInverse[1].xyz;        // Second row
+    float3 cameraForward = -g_constants.viewInverse[2].xyz;  // Third row, camera looks along -Z
+    float3 origin = g_constants.viewInverse[3].xyz;          // Fourth row - position
     
     // Build ray direction: forward + horizontal offset + vertical offset
     float3 direction = normalize(cameraForward + ndc.x * cameraRight + ndc.y * cameraUp);
@@ -191,7 +240,7 @@ void RayGen()
     payload.iorStackTop = 0;
     
     // Iterative path tracing (multiple bounces)
-    for (uint bounce = 0; bounce < maxBounces && !payload.terminated; bounce++) {
+    for (uint bounce = 0; bounce < g_constants.maxBounces && !payload.terminated; bounce++) {
         // Trace ray
         TraceRay(g_scene, RAY_FLAG_NONE, 0xFF, 0, 0, 0, ray, payload);
         
@@ -226,16 +275,16 @@ void Miss(inout RadiancePayload payload)
     float4 envColor = g_environmentMap.SampleLevel(g_sampler, envUV, 0);
     
     // Apply environment light intensity and add to radiance
-    payload.radiance += payload.throughput * envColor.rgb * environmentLightIntensity;
+    payload.radiance += payload.throughput * envColor.rgb * g_constants.environmentLightIntensity;
 
     // Add directional sun contribution for rays that reach infinity.
     // We evaluate sun radiance along the ray direction; if the ray direction
     // aligns with the sun direction, add sun contribution. Using intensity>0
-    // as the enable check (sunDirIntensity.w).
-    if (sunDirIntensity.w > 0.0) {
-        float3 sunDir = normalize(sunDirIntensity.xyz);
-        float sunIntensity = sunDirIntensity.w;
-        float3 sunColor = sunColorEnabled.rgb;
+    // as the enable check (g_constants.sunDirIntensity.w).
+    if (g_constants.sunDirIntensity.w > 0.0) {
+        float3 sunDir = normalize(g_constants.sunDirIntensity.xyz);
+        float sunIntensity = g_constants.sunDirIntensity.w;
+        float3 sunColor = g_constants.sunColorEnabled.rgb;
 
         // Alignment between ray direction and sun direction (1 when exactly aligned)
         float align = max(0.0, dot(rayDir, sunDir));
@@ -254,6 +303,14 @@ void ClosestHit(inout RadiancePayload payload, in BuiltInTriangleIntersectionAtt
     // Get primitive and material
     uint primitiveIndex = PrimitiveIndex();
     uint materialIndex = g_triangleMaterialIndices[primitiveIndex];
+    
+    // Bounds check for material index (287 materials for San Miguel)
+    // If out of bounds, use material 0 as fallback
+    const uint MAX_MATERIALS = 512;  // Conservative upper bound
+    if (materialIndex >= MAX_MATERIALS) {
+        materialIndex = 0;
+    }
+    
     Material mat = g_materials[materialIndex];
     
     // Compute hit point
@@ -310,10 +367,10 @@ void ClosestHit(inout RadiancePayload payload, in BuiltInTriangleIntersectionAtt
     normal = normalize(normal);
     
     // Add emission from this surface
-    payload.radiance += payload.throughput * mat.emission.rgb;
+    payload.radiance += payload.throughput * mat.emission();
     
     // If this is an emissive surface, terminate the path
-    float emissionMagnitude = dot(mat.emission.rgb, float3(1, 1, 1));
+    float emissionMagnitude = dot(mat.emission(), float3(1, 1, 1));
     if (emissionMagnitude > 0.01) {
         payload.terminated = true;
         return;
@@ -326,12 +383,25 @@ void ClosestHit(inout RadiancePayload payload, in BuiltInTriangleIntersectionAtt
     // ========== MATERIAL TYPE CLASSIFICATION ==========
     // New PBR material system: use layer flags and properties
     // Check for transmission layer (glass/transparent materials)
-    bool hasTransmission = (mat.layerFlags & LAYER_TRANSMISSION) != 0;
+    bool hasTransmission = (mat.layerFlags() & LAYER_TRANSMISSION) != 0;
     
     // Handle refractive/transmissive materials
     if (hasTransmission) {
+        // Get base color (with texture support for colored glass)
+        float3 baseColor = mat.baseColor();
+        int baseColorIdx = mat.baseColorTexIdx();
+        if (baseColorIdx >= 0) {
+            float4 texColor;
+            if (g_constants.useVirtualTextures == 1) {
+                texColor = SampleVirtualTexture(baseColorIdx, texCoord);
+            } else {
+                texColor = g_textures.SampleLevel(g_sampler, float3(texCoord, baseColorIdx), 0);
+            }
+            baseColor = texColor.rgb;
+        }
+        
         // Glass material with reflection and refraction
-        float ior = mat.ior;
+        float ior = mat.ior();
         float3 N = normal;
         float cosI = -dot(rayDir, N);
         float etaI = 1.0; // Air
@@ -360,10 +430,11 @@ void ClosestHit(inout RadiancePayload payload, in BuiltInTriangleIntersectionAtt
 
         // Use opacity for transmission: opacity=1 is opaque, opacity=0 is fully transmissive
         // For transmission, we want the inverse: trans = 1 - opacity
-        float trans = 1.0 - mat.opacity;
+        float trans = 1.0 - mat.opacity();
         if (trans <= 0.001f) {
             // Derive a conservative fallback from base color
-            float avgColor = (mat.baseColor.r + mat.baseColor.g + mat.baseColor.b) * (1.0 / 3.0);
+            float3 baseColorVal = mat.baseColor();
+            float avgColor = (baseColorVal.r + baseColorVal.g + baseColorVal.b) * (1.0 / 3.0);
             trans = max(avgColor, 0.01f);
         }
 
@@ -383,7 +454,7 @@ void ClosestHit(inout RadiancePayload payload, in BuiltInTriangleIntersectionAtt
             // Determine current and target IOR from payload stack
             float iorCurrent = payload.iorStack[payload.iorStackTop];
             bool entering = dot(rayDir, normal) < 0.0; // entering if ray goes against normal
-            float iorTarget = entering ? mat.ior : (payload.iorStackTop > 0 ? payload.iorStack[payload.iorStackTop - 1] : 1.0f);
+            float iorTarget = entering ? mat.ior() : (payload.iorStackTop > 0 ? payload.iorStack[payload.iorStackTop - 1] : 1.0f);
 
             float etaLocal = iorCurrent / iorTarget;
             float kLocal = 1.0 - etaLocal * etaLocal * (1.0 - cosI * cosI);
@@ -401,24 +472,34 @@ void ClosestHit(inout RadiancePayload payload, in BuiltInTriangleIntersectionAtt
                 if (entering) {
                     uint newTop = min(payload.iorStackTop + 1, 3);
                     payload.iorStackTop = newTop;
-                    payload.iorStack[payload.iorStackTop] = mat.ior;
+                    payload.iorStack[payload.iorStackTop] = mat.ior();
                 } else {
                     if (payload.iorStackTop > 0) payload.iorStackTop--;
                 }
 
-                // Apply color filtering (base color) and transmission amount
-                payload.throughput *= mat.baseColor * trans;
+                // Apply color filtering (use texture-modified base color) and transmission amount
+                payload.throughput *= baseColor * trans;
             }
         }
         return;
     }
     // Handle mirror/reflective materials (high metallic, low roughness)
-    else if (mat.metallic > 0.9 && mat.roughness < 0.1) {
+    else if (mat.metallic() > 0.9 && mat.roughness() < 0.1) {
         // Perfect mirror reflection
         float3 reflectDir = reflect(rayDir, normal);
         
-        // Use base color as reflectance for metallic surfaces
-        float3 reflectance = mat.baseColor;
+        // Use base color as reflectance for metallic surfaces (with texture support)
+        float3 reflectance = mat.baseColor();
+        int baseColorIdx = mat.baseColorTexIdx();
+        if (baseColorIdx >= 0) {
+            float4 texColor;
+            if (g_constants.useVirtualTextures == 1) {
+                texColor = SampleVirtualTexture(baseColorIdx, texCoord);
+            } else {
+                texColor = g_textures.SampleLevel(g_sampler, float3(texCoord, baseColorIdx), 0);
+            }
+            reflectance = texColor.rgb;
+        }
         // Do not force an artificial high reflectance fallback here; respect Ks provided by material.
         // If Ks is zero, reflection will contribute nothing (correct physical behavior).
         payload.throughput *= reflectance;
@@ -432,12 +513,17 @@ void ClosestHit(inout RadiancePayload payload, in BuiltInTriangleIntersectionAtt
         // MTL spec: illum 0 = flat color, illum 1 = diffuse, illum 2 = diffuse+specular
         
         // Get base albedo (color or texture)
-        float3 albedo = mat.baseColor;
+        float3 albedo = mat.baseColor();
         
         // Sample texture if available (texture overrides base albedo)
-        if (mat.baseColorTexIdx >= 0) {
-            int texIndex = mat.baseColorTexIdx;
-            float4 texColor = g_textures.SampleLevel(g_sampler, float3(texCoord, texIndex), 0);
+        int baseColorIdx = mat.baseColorTexIdx();
+        if (baseColorIdx >= 0) {
+            float4 texColor;
+            if (g_constants.useVirtualTextures == 1) {
+                texColor = SampleVirtualTexture(baseColorIdx, texCoord);
+            } else {
+                texColor = g_textures.SampleLevel(g_sampler, float3(texCoord, baseColorIdx), 0);
+            }
             albedo = texColor.rgb;
         }
         

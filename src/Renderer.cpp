@@ -59,7 +59,7 @@ namespace ACG {
         m_stopRenderRequested(false),
         m_useVirtualTextures(false)
     {
-        // 初始化OIDN降噪器
+        // 初始化OIDN降噪�?
         m_denoiser = std::make_unique<Denoiser>();
         if (!m_denoiser->Initialize()) {
             std::cerr << "Warning: Failed to initialize denoiser: " << m_denoiser->GetError() << std::endl;
@@ -296,7 +296,7 @@ namespace ACG {
             triMatHandle.ptr += 3 * m_srvUavDescriptorSize;
             renderCommandList->SetComputeRootDescriptorTable(4, triMatHandle);
             
-            // Root parameter 5: Materials SRV (direct root descriptor)
+            // Root parameter 5: Materials SRV (root descriptor)
             D3D12_GPU_VIRTUAL_ADDRESS materialsAddress = m_materialBuffer->GetGPUVirtualAddress();
             renderCommandList->SetComputeRootShaderResourceView(5, materialsAddress);
             
@@ -316,21 +316,25 @@ namespace ACG {
             renderCommandList->SetComputeRootDescriptorTable(7, envMapHandle);
             
             // Root parameter 8: Virtual Texture Cache SRV table (bind to descriptor slot 7, t5)
-            if (m_useVirtualTextures) {
-                D3D12_GPU_DESCRIPTOR_HANDLE vtCacheHandle = m_srvUavHeap->GetGPUDescriptorHandleForHeapStart();
-                vtCacheHandle.ptr += 7 * m_srvUavDescriptorSize; // slot 7 for virtual texture cache
-                renderCommandList->SetComputeRootDescriptorTable(8, vtCacheHandle);
-                
-                // Also bind indirection texture immediately
-                D3D12_GPU_DESCRIPTOR_HANDLE indirectionHandle = m_srvUavHeap->GetGPUDescriptorHandleForHeapStart();
-                indirectionHandle.ptr += 8 * m_srvUavDescriptorSize; // slot 8 for indirection texture
-                renderCommandList->SetComputeRootDescriptorTable(9, indirectionHandle);
-            }
+            // Root parameter 9: Indirection Texture SRV table (bind to descriptor slot 8, t6)
+            // CRITICAL: Always bind these slots even if not using virtual textures (dummy resources)
+            D3D12_GPU_DESCRIPTOR_HANDLE vtCacheHandle = m_srvUavHeap->GetGPUDescriptorHandleForHeapStart();
+            vtCacheHandle.ptr += 7 * m_srvUavDescriptorSize; // slot 7 for virtual texture cache
+            renderCommandList->SetComputeRootDescriptorTable(8, vtCacheHandle);
+            
+            D3D12_GPU_DESCRIPTOR_HANDLE indirectionHandle = m_srvUavHeap->GetGPUDescriptorHandleForHeapStart();
+            indirectionHandle.ptr += 8 * m_srvUavDescriptorSize; // slot 8 for indirection texture
+            renderCommandList->SetComputeRootDescriptorTable(9, indirectionHandle);
             
             // Root parameter 11: Texture Scales SRV table (t8, bind to descriptor slot 9)
             D3D12_GPU_DESCRIPTOR_HANDLE scalesHandle = m_srvUavHeap->GetGPUDescriptorHandleForHeapStart();
             scalesHandle.ptr += 9 * m_srvUavDescriptorSize; // slot 9 for texture scales
             renderCommandList->SetComputeRootDescriptorTable(11, scalesHandle);
+            
+            // Root parameter 13: Texture Sizes SRV table (t9, bind to descriptor slot 10)
+            D3D12_GPU_DESCRIPTOR_HANDLE sizesHandle = m_srvUavHeap->GetGPUDescriptorHandleForHeapStart();
+            sizesHandle.ptr += 10 * m_srvUavDescriptorSize; // slot 10 for texture sizes
+            renderCommandList->SetComputeRootDescriptorTable(13, sizesHandle);
 
             // Root parameter 12: Camera constants (32-bit constants)
             // Compute camera matrices
@@ -360,7 +364,7 @@ namespace ACG {
             cameraConstants.frameIndex = static_cast<uint32_t>(m_accumulatedSamples);
             cameraConstants.maxBounces = static_cast<uint32_t>(m_maxBounces);
             cameraConstants.environmentLightIntensity = m_environmentLightIntensity;
-            cameraConstants.padding = 0.0f;
+            cameraConstants.useVirtualTextures = m_useVirtualTextures ? 1u : 0u;
             cameraConstants.cameraParams = glm::vec4(
                 m_camera.GetFOV(),
                 static_cast<float>(m_width) / static_cast<float>(m_height),
@@ -413,7 +417,9 @@ namespace ACG {
             m_accumulatedSamples = 0;
 
             // Render in batches to allow progress updates
-            const int batchSize = 10; // Execute GPU work every 10 samples
+            // CRITICAL: Balance between GPU TDR timeout and command list overhead
+            // Batch size affects GPU execution frequency - larger = fewer executions but higher TDR risk
+            const int batchSize = m_renderBatchSize; // Samples per GPU execution
             
             for (int sampleIdx = 0; sampleIdx < samplesPerPixel; ++sampleIdx) {
                 // Check if stop was requested
@@ -437,7 +443,7 @@ namespace ACG {
                 cameraConstants.frameIndex = static_cast<uint32_t>(sampleIdx); // Current sample index for accumulation
                 cameraConstants.maxBounces = static_cast<uint32_t>(maxBounces);
                 cameraConstants.environmentLightIntensity = m_environmentLightIntensity;
-                cameraConstants.padding = 0.0f;
+                cameraConstants.useVirtualTextures = m_useVirtualTextures ? 1u : 0u;
                 cameraConstants.cameraParams = glm::vec4(
                     m_camera.GetFOV(),
                     static_cast<float>(m_width) / static_cast<float>(m_height),
@@ -479,7 +485,23 @@ namespace ACG {
                     
                     if (m_offlineFence->GetCompletedValue() < currentFence) {
                         ThrowIfFailed(m_offlineFence->SetEventOnCompletion(currentFence, m_offlineFenceEvent));
-                        WaitForSingleObject(m_offlineFenceEvent, INFINITE);
+                        
+                        // Wait with timeout to detect GPU hangs
+                        DWORD waitResult = WaitForSingleObject(m_offlineFenceEvent, 5000); // 5 second timeout
+                        if (waitResult == WAIT_TIMEOUT) {
+                            std::cerr << "WARNING: GPU execution timeout at sample " << (sampleIdx + 1) 
+                                      << " (fence " << currentFence << ")" << std::endl;
+                            // Check device status
+                            HRESULT deviceStatus = m_device->GetDeviceRemovedReason();
+                            if (FAILED(deviceStatus)) {
+                                char errorMsg[256];
+                                sprintf_s(errorMsg, "Device lost during rendering at sample %d (HRESULT: 0x%08X)", 
+                                         sampleIdx + 1, deviceStatus);
+                                throw std::runtime_error(errorMsg);
+                            }
+                            // Continue waiting if device is still alive
+                            WaitForSingleObject(m_offlineFenceEvent, INFINITE);
+                        }
                     }
                     
                     // Update progress counter AFTER GPU completes
@@ -522,7 +544,7 @@ namespace ACG {
                         triMatHandle.ptr += 3 * m_srvUavDescriptorSize;
                         renderCommandList->SetComputeRootDescriptorTable(4, triMatHandle);
                         
-                        // Root parameter 5: Materials SRV
+                        // Root parameter 5: Materials SRV (root descriptor)
                         D3D12_GPU_VIRTUAL_ADDRESS materialsAddress = m_materialBuffer->GetGPUVirtualAddress();
                         renderCommandList->SetComputeRootShaderResourceView(5, materialsAddress);
                         
@@ -541,24 +563,25 @@ namespace ACG {
                         envMapHandle.ptr += 6 * m_srvUavDescriptorSize; // slot 6 for environment map
                         renderCommandList->SetComputeRootDescriptorTable(7, envMapHandle);
                         
-                        // Root parameter 8: Virtual Texture Cache SRV table (t5, bind to descriptor slot 7)
-                        if (m_useVirtualTextures) {
-                            D3D12_GPU_DESCRIPTOR_HANDLE vtCacheHandle = m_srvUavHeap->GetGPUDescriptorHandleForHeapStart();
-                            vtCacheHandle.ptr += 7 * m_srvUavDescriptorSize; // slot 7 for virtual texture cache
-                            renderCommandList->SetComputeRootDescriptorTable(8, vtCacheHandle);
-                        }
+                        // Root parameter 8 & 9: Virtual Texture Cache and Indirection (t5, t6)
+                        // CRITICAL: Always bind these even if not using virtual textures (dummy resources)
+                        D3D12_GPU_DESCRIPTOR_HANDLE vtCacheHandle = m_srvUavHeap->GetGPUDescriptorHandleForHeapStart();
+                        vtCacheHandle.ptr += 7 * m_srvUavDescriptorSize;
+                        renderCommandList->SetComputeRootDescriptorTable(8, vtCacheHandle);
                         
-                        // Root parameter 9: Indirection Texture SRV table (t6, bind to descriptor slot 8)
-                        if (m_useVirtualTextures) {
-                            D3D12_GPU_DESCRIPTOR_HANDLE indirectionHandle = m_srvUavHeap->GetGPUDescriptorHandleForHeapStart();
-                            indirectionHandle.ptr += 8 * m_srvUavDescriptorSize; // slot 8 for indirection texture
-                            renderCommandList->SetComputeRootDescriptorTable(9, indirectionHandle);
-                        }
+                        D3D12_GPU_DESCRIPTOR_HANDLE indirectionHandle = m_srvUavHeap->GetGPUDescriptorHandleForHeapStart();
+                        indirectionHandle.ptr += 8 * m_srvUavDescriptorSize;
+                        renderCommandList->SetComputeRootDescriptorTable(9, indirectionHandle);
                         
                         // Root parameter 11: Texture Scales SRV table (t8, bind to descriptor slot 9)
                         D3D12_GPU_DESCRIPTOR_HANDLE scalesHandle = m_srvUavHeap->GetGPUDescriptorHandleForHeapStart();
                         scalesHandle.ptr += 9 * m_srvUavDescriptorSize; // slot 9 for texture scales
                         renderCommandList->SetComputeRootDescriptorTable(11, scalesHandle);
+                        
+                        // Root parameter 13: Texture Sizes SRV table (t9, bind to descriptor slot 10)
+                        D3D12_GPU_DESCRIPTOR_HANDLE sizesHandle = m_srvUavHeap->GetGPUDescriptorHandleForHeapStart();
+                        sizesHandle.ptr += 10 * m_srvUavDescriptorSize; // slot 10 for texture sizes
+                        renderCommandList->SetComputeRootDescriptorTable(13, sizesHandle);
                         
                         // Root parameter 12: Camera constants (need to update frameIndex for next batch)
                         // Note: Next batch starts at sampleIdx + 1
@@ -568,7 +591,7 @@ namespace ACG {
                         nextCameraConstants.frameIndex = static_cast<uint32_t>(sampleIdx + 1); // Next sample index
                         nextCameraConstants.maxBounces = static_cast<uint32_t>(maxBounces);
                         nextCameraConstants.environmentLightIntensity = m_environmentLightIntensity;
-                        nextCameraConstants.padding = 0.0f;
+                        nextCameraConstants.useVirtualTextures = m_useVirtualTextures ? 1u : 0u;
                         nextCameraConstants.cameraParams = glm::vec4(
                             m_camera.GetFOV(),
                             static_cast<float>(m_width) / static_cast<float>(m_height),
@@ -589,20 +612,73 @@ namespace ACG {
             
             std::cout << "All samples dispatched successfully" << std::endl;
             std::cout.flush();
+            
+            // CRITICAL: Wait for the last batch to complete on GPU before proceeding
+            // The last batch was closed and executed in the loop above, but we must wait for GPU
+            std::cout << "Waiting for final GPU batch to complete..." << std::endl;
+            const UINT64 finalFence = m_offlineFenceValue - 1; // Last fence value signaled in loop
+            if (m_offlineFence->GetCompletedValue() < finalFence) {
+                ThrowIfFailed(m_offlineFence->SetEventOnCompletion(finalFence, m_offlineFenceEvent));
+                WaitForSingleObject(m_offlineFenceEvent, INFINITE);
+            }
+            std::cout << "Final GPU batch completed" << std::endl;
+            
+            // Check device status after all rendering
+            HRESULT deviceStatusAfterRender = m_device->GetDeviceRemovedReason();
+            if (FAILED(deviceStatusAfterRender)) {
+                char errorMsg[256];
+                sprintf_s(errorMsg, "Device lost after rendering (HRESULT: 0x%08X). GPU may have hung during path tracing.", deviceStatusAfterRender);
+                throw std::runtime_error(errorMsg);
+            }
+
+            // CRITICAL: Transition output texture to COPY_SOURCE before readback
+            // This must be done in a separate command list and executed
+            std::cout << "Transitioning output texture to copy source..." << std::endl;
+            ThrowIfFailed(m_offlineCommandAllocator->Reset());
+            ThrowIfFailed(renderCommandList->Reset(m_offlineCommandAllocator.Get(), nullptr));
+            
+            D3D12_RESOURCE_BARRIER transitionBarrier = CD3DX12_RESOURCE_BARRIER::Transition(
+                m_outputTexture.Get(),
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COPY_SOURCE
+            );
+            renderCommandList->ResourceBarrier(1, &transitionBarrier);
+            
+            // Execute the transition
+            ThrowIfFailed(renderCommandList->Close());
+            ID3D12CommandList* transitionLists[] = { renderCommandList.Get() };
+            m_commandQueue->ExecuteCommandLists(1, transitionLists);
+            
+            // Wait for transition to complete
+            const UINT64 transitionFence = m_offlineFenceValue;
+            ThrowIfFailed(m_commandQueue->Signal(m_offlineFence.Get(), transitionFence));
+            m_offlineFenceValue++;
+            if (m_offlineFence->GetCompletedValue() < transitionFence) {
+                ThrowIfFailed(m_offlineFence->SetEventOnCompletion(transitionFence, m_offlineFenceEvent));
+                WaitForSingleObject(m_offlineFenceEvent, INFINITE);
+            }
+            std::cout << "Transition completed" << std::endl;
+            
+            // CRITICAL: Check device status after transition
+            HRESULT deviceStatusAfterTransition = m_device->GetDeviceRemovedReason();
+            if (FAILED(deviceStatusAfterTransition)) {
+                char errorMsg[256];
+                sprintf_s(errorMsg, "Device lost after transition (HRESULT: 0x%08X). GPU may have timed out during rendering.", deviceStatusAfterTransition);
+                throw std::runtime_error(errorMsg);
+            }
 
             // Create new command list for readback operations
             ThrowIfFailed(m_offlineCommandAllocator->Reset());
             ThrowIfFailed(renderCommandList->Reset(m_offlineCommandAllocator.Get(), nullptr));
 
-            // Transition output texture to copy source
-            std::cout << "Transitioning output texture..." << std::endl;
-            D3D12_RESOURCE_BARRIER barrier = CD3DX12_RESOURCE_BARRIER::Transition(
-                m_outputTexture.Get(),
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                D3D12_RESOURCE_STATE_COPY_SOURCE
-            );
-            renderCommandList->ResourceBarrier(1, &barrier);
-
+            // Check device status before creating readback buffer
+            HRESULT deviceStatus = m_device->GetDeviceRemovedReason();
+            if (FAILED(deviceStatus)) {
+                char errorMsg[256];
+                sprintf_s(errorMsg, "Device lost before readback (HRESULT: 0x%08X). Check previous operations.", deviceStatus);
+                throw std::runtime_error(errorMsg);
+            }
+            
             // Create readback buffer
             std::cout << "Creating readback buffer..." << std::endl;
             D3D12_RESOURCE_DESC textureDesc = m_outputTexture->GetDesc();
@@ -648,12 +724,12 @@ namespace ACG {
 
             // Transition back to UAV
             std::cout << "Transitioning back to UAV..." << std::endl;
-            barrier = CD3DX12_RESOURCE_BARRIER::Transition(
+            D3D12_RESOURCE_BARRIER barrierBack = CD3DX12_RESOURCE_BARRIER::Transition(
                 m_outputTexture.Get(),
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS
             );
-            renderCommandList->ResourceBarrier(1, &barrier);
+            renderCommandList->ResourceBarrier(1, &barrierBack);
 
             // Execute readback command list
             std::cout << "Closing command list..." << std::endl;
@@ -739,7 +815,7 @@ namespace ACG {
             std::vector<float> denoisedImage(m_width * m_height * 3);
             float invSamples = 1.0f / static_cast<float>(samplesPerPixel);
 
-            // 从GPU数据复制到输入图像（RGBA -> RGB，并平均采样）
+            // 从GPU数据复制到输入图像（RGBA -> RGB，并平均采样�?
             std::cout << "Preparing image for denoising..." << std::endl;
             for (UINT y = 0; y < m_height; ++y) {
                 const float* row = reinterpret_cast<const float*>(
@@ -772,7 +848,7 @@ namespace ACG {
                 std::cout << "Denoiser not available, saving original image" << std::endl;
             }
 
-            // 使用降噪后的图像（如果降噪成功）或原始图像
+            // 使用降噪后的图像（如果降噪成功）或原始图�?
             const float* finalImage = denoised ? denoisedImage.data() : inputImage.data();
 
             // Write PPM file
@@ -785,7 +861,7 @@ namespace ACG {
 
             file << "P6\n" << m_width << " " << m_height << "\n255\n";
 
-            // 将float图像转换为8位并写入
+            // 将float图像转换�?位并写入
             for (UINT y = 0; y < m_height; ++y) {
                 for (UINT x = 0; x < m_width; ++x) {
                     size_t idx = (y * m_width + x) * 3;
@@ -1122,7 +1198,7 @@ namespace ACG {
 
     void Renderer::CreateRaytracingRootSignature() {
         // Create a root signature with global resources
-        CD3DX12_DESCRIPTOR_RANGE1 ranges[12];  // Extended for Texture Scales
+        CD3DX12_DESCRIPTOR_RANGE1 ranges[13];
         ranges[0].Init(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0); // u0: output texture
         ranges[1].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0); // t0: acceleration structure
         ranges[2].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1, 0); // t1 space0: vertices
@@ -1135,6 +1211,7 @@ namespace ACG {
         ranges[9].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 6); // t6: indirection texture
         ranges[10].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 7); // t7: material layers
         ranges[11].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 8); // t8: texture scales
+        ranges[12].Init(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 9); // t9: texture sizes
 
         // Static sampler for texture sampling (with WRAP address mode for tiling)
         CD3DX12_STATIC_SAMPLER_DESC samplerDesc(
@@ -1144,7 +1221,7 @@ namespace ACG {
             D3D12_TEXTURE_ADDRESS_MODE_WRAP,       // addressV
             D3D12_TEXTURE_ADDRESS_MODE_WRAP);      // addressW
 
-        CD3DX12_ROOT_PARAMETER1 rootParameters[13];  // Extended for Texture Scales
+        CD3DX12_ROOT_PARAMETER1 rootParameters[14];
         rootParameters[0].InitAsDescriptorTable(1, &ranges[0]); // Output UAV
         rootParameters[1].InitAsShaderResourceView(0); // Acceleration structure (SRV)
         rootParameters[2].InitAsDescriptorTable(1, &ranges[2]); // Vertices (t1, space0)
@@ -1157,8 +1234,10 @@ namespace ACG {
         rootParameters[9].InitAsDescriptorTable(1, &ranges[9]); // Indirection texture (t6)
         rootParameters[10].InitAsDescriptorTable(1, &ranges[10]); // Material layers (t7)
         rootParameters[11].InitAsDescriptorTable(1, &ranges[11]); // Texture scales (t8)
-        // Scene constants (b0): view and projection matrices
+        // Root parameter 12: Camera constants (b0)
         rootParameters[12].InitAsConstants(sizeof(CameraConstants) / 4, 0);
+        // Root parameter 13: Texture sizes (t9)
+        rootParameters[13].InitAsDescriptorTable(1, &ranges[12]); // Texture sizes (t9)
 
         CD3DX12_VERSIONED_ROOT_SIGNATURE_DESC rootSignatureDesc;
         rootSignatureDesc.Init_1_1(_countof(rootParameters), rootParameters, 1, &samplerDesc,
@@ -1425,12 +1504,26 @@ void ACG::Renderer::SetSunIntensity(float intensity) {
         std::vector<GPUVertex> vertices;
         std::vector<uint32_t> indices;
         std::vector<uint32_t> triangleMaterialIndices; // Material index per triangle
+        
+        uint32_t totalMaterials = static_cast<uint32_t>(m_scene->GetMaterials().size());
+        uint32_t invalidMaterialCount = 0;
 
         for (const auto& mesh : m_scene->GetMeshes()) {
             const auto& meshVerts = mesh->GetVertices();
             const auto& meshIdx = mesh->GetIndices();
             uint32_t baseVertex = static_cast<uint32_t>(vertices.size());
             int meshMaterialIdx = mesh->GetMaterialIndex();
+            
+            // Validate and clamp material index
+            if (meshMaterialIdx < 0 || meshMaterialIdx >= static_cast<int>(totalMaterials)) {
+                if (invalidMaterialCount < 10) {
+                    std::cerr << "  Warning: Mesh has invalid materialIndex=" << meshMaterialIdx 
+                              << " (valid range: 0-" << (totalMaterials-1) << "), clamping to 0" << std::endl;
+                }
+                invalidMaterialCount++;
+                meshMaterialIdx = 0;
+            }
+            
             std::cout << "Mesh: " << meshVerts.size() << " vertices, " << meshIdx.size()/3 << " triangles, materialIndex=" << meshMaterialIdx << std::endl;
             
             // append vertices
@@ -1450,9 +1543,16 @@ void ACG::Renderer::SetSunIntensity(float intensity) {
             // Store material index for each triangle in this mesh
             uint32_t numTriangles = static_cast<uint32_t>(meshIdx.size() / 3);
             for (uint32_t i = 0; i < numTriangles; i++) {
-                triangleMaterialIndices.push_back(meshMaterialIdx);
+                triangleMaterialIndices.push_back(static_cast<uint32_t>(meshMaterialIdx));
             }
         }
+        
+        if (invalidMaterialCount > 0) {
+            std::cout << "  Total meshes with invalid material indices: " << invalidMaterialCount << std::endl;
+        }
+        
+        std::cout << "Total geometry: " << vertices.size() << " vertices, " << indices.size()/3 
+                  << " triangles, " << triangleMaterialIndices.size() << " material mappings" << std::endl;
 
         // Create GPU buffers using helper CreateDefaultBuffer
         // CRITICAL: Upload buffers MUST be kept alive until GPU executes the copy!
@@ -1576,8 +1676,9 @@ void ACG::Renderer::SetSunIntensity(float intensity) {
             
             bool useVirtualTextures = false;
             
-            if (arrayMemoryMB > MAX_TEXTURE_ARRAY_VRAM_MB) {
-                std::cout << "  ⚠ Texture array would require " << arrayMemoryMB << " MB (exceeds " 
+            // 只在纹理数量足够多且内存占用大时才考虑虚拟纹理
+            if (totalTextures > 0 && arrayMemoryMB > MAX_TEXTURE_ARRAY_VRAM_MB) {
+                std::cout << "  Texture array would require " << arrayMemoryMB << " MB (exceeds " 
                           << MAX_TEXTURE_ARRAY_VRAM_MB << " MB limit)" << std::endl;
                 std::cout << "  Attempting to use Virtual Texture System..." << std::endl;
                 
@@ -1588,23 +1689,30 @@ void ACG::Renderer::SetSunIntensity(float intensity) {
                 vtConfig.maxVirtualTextures = 1024;
                 
                 if (m_virtualTextureSystem.Initialize(m_device.Get(), vtConfig)) {
-                    std::cout << "  ✓ Virtual Texture System initialized successfully" << std::endl;
+                    std::cout << "  �?Virtual Texture System initialized successfully" << std::endl;
                     
                     // Add each texture to virtual texture system
                     bool allTexturesAdded = true;
                     for (int i = 0; i < totalTextures; ++i) {
                         int32_t vtIndex = m_virtualTextureSystem.AddVirtualTexture(textures[i]);
                         if (vtIndex < 0) {
-                            std::cerr << "  ✗ ERROR: Failed to add texture " << i << " to virtual texture system" << std::endl;
+                            std::cerr << "  ERROR: Failed to add texture " << i << " to virtual texture system" << std::endl;
+                            allTexturesAdded = false;
+                            break;
+                        }
+                        // CRITICAL: Verify texture index matches expected order
+                        if (vtIndex != i) {
+                            std::cerr << "  ERROR: Texture index mismatch! Expected " << i << ", got " << vtIndex << std::endl;
                             allTexturesAdded = false;
                             break;
                         }
                     }
                     
                     if (allTexturesAdded) {
-                        // Upload all tiles
-                        if (m_virtualTextureSystem.UploadAllTiles(cmdList, m_commandQueue.Get())) {
-                            // Create indirection texture
+                        // Upload all tiles with user-configured batch size
+                        // Indirection texture is now automatically uploaded within UploadAllTiles
+                        if (m_virtualTextureSystem.UploadAllTiles(cmdList, m_commandQueue.Get(), m_vtTileBatchSize)) {
+                            // Create indirection texture (placeholder - work done in UploadAllTiles)
                             if (m_virtualTextureSystem.CreateIndirectionTexture(cmdList, m_commandQueue.Get())) {
                                 // Set flag BEFORE creating SRVs so the function doesn't early-return
                                 useVirtualTextures = true;
@@ -1613,24 +1721,56 @@ void ACG::Renderer::SetSunIntensity(float intensity) {
                                 // Create SRVs for Virtual Textures
                                 CreateVirtualTextureSRVs();
                                 
-                                std::cout << "  ✓ Virtual Texture System ready" << std::endl;
+                                // Create texture sizes buffer for shader access
+                                std::vector<glm::uvec2> textureSizes;
+                                textureSizes.reserve(totalTextures);
+                                for (int i = 0; i < totalTextures; ++i) {
+                                    glm::uvec2 size = m_virtualTextureSystem.GetTextureDimensions(i);
+                                    textureSizes.push_back(size);
+                                }
+                                
+                                size_t sizesBufferSize = sizeof(glm::uvec2) * textureSizes.size();
+                                std::cout << "  Creating texture sizes buffer: " << textureSizes.size() << " textures (" << sizesBufferSize << " bytes)" << std::endl;
+                                m_textureSizesBuffer = CreateDefaultBuffer(m_device.Get(), cmdList, textureSizes.data(), sizesBufferSize, m_textureSizesUpload);
+                                
+                                // Create SRV for sizes buffer (slot 10 for t9)
+                                D3D12_CPU_DESCRIPTOR_HANDLE srvHandle = m_srvUavHeap->GetCPUDescriptorHandleForHeapStart();
+                                UINT descriptorSize = m_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+                                D3D12_SHADER_RESOURCE_VIEW_DESC sizesSrvDesc = {};
+                                sizesSrvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                                sizesSrvDesc.Format = DXGI_FORMAT_UNKNOWN;
+                                sizesSrvDesc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+                                sizesSrvDesc.Buffer.FirstElement = 0;
+                                sizesSrvDesc.Buffer.NumElements = static_cast<UINT>(textureSizes.size());
+                                sizesSrvDesc.Buffer.StructureByteStride = sizeof(glm::uvec2);
+                                sizesSrvDesc.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
+                                
+                                D3D12_CPU_DESCRIPTOR_HANDLE sizesSrvHandle = { srvHandle.ptr + descriptorSize * 10 };
+                                m_device->CreateShaderResourceView(m_textureSizesBuffer.Get(), &sizesSrvDesc, sizesSrvHandle);
+                                
+                                std::cout << "  ✓Texture sizes buffer created at slot 10 (t9)" << std::endl;
+                                
+                                std::cout << "  ✓Virtual Texture System ready" << std::endl;
                             } else {
-                                std::cerr << "  ✗ Failed to create indirection texture" << std::endl;
+                                std::cerr << "  �?Failed to create indirection texture" << std::endl;
                             }
                         } else {
-                            std::cerr << "  ✗ Failed to upload tiles" << std::endl;
+                            std::cerr << "  �?Failed to upload tiles" << std::endl;
                         }
                     }
                 }
                 
                 if (!useVirtualTextures) {
-                    std::cerr << "  ✗ Virtual Texture initialization failed, falling back to downsampling" << std::endl;
+                    std::cerr << "  �?Virtual Texture initialization failed, falling back to downsampling" << std::endl;
                 }
             }
             
             // **FALLBACK: Use conventional texture array with downsampling**
             if (!useVirtualTextures) {
                 m_useVirtualTextures = false;
+                
+                // CRITICAL: Create dummy virtual texture SRVs to satisfy root signature
+                CreateVirtualTextureSRVs();
                 
                 // Apply aggressive downsampling if needed
                 bool needsDownsampling = false;
@@ -1690,7 +1830,7 @@ void ACG::Renderer::SetSunIntensity(float intensity) {
                     IID_PPV_ARGS(&m_textureAtlas)
                 ));
                 m_textureAtlas->SetName(L"Texture Array");
-                std::cout << "  ✓ Texture array created: " << maxWidth << "x" << maxHeight 
+                std::cout << "  �?Texture array created: " << maxWidth << "x" << maxHeight 
                           << " x " << totalTextures << " slices" << std::endl;
             }
             
@@ -1751,9 +1891,9 @@ void ACG::Renderer::SetSunIntensity(float intensity) {
                         m_commandQueue->ExecuteCommandLists(1, lists);
                         WaitForGpu();
                         
-                        std::cout << "    ✓ Batch " << (batchIdx + 1) << " completed" << std::endl;
+                        std::cout << "    �?Batch " << (batchIdx + 1) << " completed" << std::endl;
                     } catch (const std::exception& e) {
-                        std::cerr << "    ✗ Batch " << (batchIdx + 1) << " failed: " << e.what() << std::endl;
+                        std::cerr << "    �?Batch " << (batchIdx + 1) << " failed: " << e.what() << std::endl;
                         throw;
                     }
                 }
@@ -1786,7 +1926,7 @@ void ACG::Renderer::SetSunIntensity(float intensity) {
             
             m_device->CreateShaderResourceView(m_textureAtlas.Get(), &srvDesc, textureSrvHandle);
             
-            std::cout << "  ✓ All textures uploaded and SRV created" << std::endl;
+            std::cout << "  �?All textures uploaded and SRV created" << std::endl;
             
             // **STEP 6: Upload UV scale factors to GPU**
             // CRITICAL: Root signature requires this buffer, so create even if empty
@@ -1814,21 +1954,63 @@ void ACG::Renderer::SetSunIntensity(float intensity) {
             D3D12_CPU_DESCRIPTOR_HANDLE scalesSrvHandle = { srvHandle.ptr + descriptorSize * 9 };
             m_device->CreateShaderResourceView(m_textureScalesBuffer.Get(), &scalesSrvDesc, scalesSrvHandle);
             
-            std::cout << "  ✓ Texture scales buffer created at slot 9 (t8)" << std::endl;
+            std::cout << "  ✓Texture scales buffer created at slot 9 (t8)" << std::endl;
+            
+            // **STEP 7: Create texture sizes buffer (for virtual texture fallback compatibility)**
+            // In non-VT mode, this buffer contains downsampled texture sizes
+            std::vector<glm::uvec2> textureSizes;
+            for (const auto& tex : textures) {
+                textureSizes.push_back(glm::uvec2(tex->GetWidth(), tex->GetHeight()));
+            }
+            
+            if (textureSizes.empty()) {
+                textureSizes.push_back(glm::uvec2(1, 1));  // Dummy
+            }
+            
+            size_t sizesBufferSize = sizeof(glm::uvec2) * textureSizes.size();
+            std::cout << "  Creating texture sizes buffer: " << textureSizes.size() << " textures (" << sizesBufferSize << " bytes)" << std::endl;
+            m_textureSizesBuffer = CreateDefaultBuffer(m_device.Get(), cmdList, textureSizes.data(), sizesBufferSize, m_textureSizesUpload);
+            
+            // Create SRV for sizes buffer (slot 10 for t9)
+            D3D12_SHADER_RESOURCE_VIEW_DESC sizesSrvDesc = {};
+            sizesSrvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            sizesSrvDesc.Format = DXGI_FORMAT_UNKNOWN;
+            sizesSrvDesc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+            sizesSrvDesc.Buffer.FirstElement = 0;
+            sizesSrvDesc.Buffer.NumElements = static_cast<UINT>(textureSizes.size());
+            sizesSrvDesc.Buffer.StructureByteStride = sizeof(glm::uvec2);
+            sizesSrvDesc.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
+            
+            D3D12_CPU_DESCRIPTOR_HANDLE sizesSrvHandle = { srvHandle.ptr + descriptorSize * 10 };
+            m_device->CreateShaderResourceView(m_textureSizesBuffer.Get(), &sizesSrvDesc, sizesSrvHandle);
+            
+            std::cout << "  ✓Texture sizes buffer created at slot 10 (t9)" << std::endl;
             
             } // end if (!useVirtualTextures)
         } // end if (!textures.empty())
 
         // Note: Old params3 removed - virtual texture flag now handled via MaterialData.flags
         
-        // **收集材质层数据**
+        // **收集材质层数�?*
         m_scene->CollectAllMaterialLayers();
         const auto& materialLayers = m_scene->GetMaterialLayers();
         
         // **CREATE MATERIAL BUFFER**
-        size_t materialBufferSize = sizeof(GPUMaterial) * materialsCPU.size();
+        size_t materialBufferSize = sizeof(MaterialData) * materialsCPU.size();
         std::cout << "Creating material buffer: " << materialsCPU.size() << " materials, " 
-                  << materialBufferSize << " bytes total, " << sizeof(GPUMaterial) << " bytes per material." << std::endl;
+                  << materialBufferSize << " bytes total, " << sizeof(MaterialData) << " bytes per material." << std::endl;
+        
+        // Count materials with textures
+        int materialsWithTextures = 0;
+        for (const auto& mat : materialsCPU) {
+            int32_t texIdx;
+            std::memcpy(&texIdx, &mat.texIndices.x, sizeof(int32_t));
+            if (texIdx >= 0) {
+                materialsWithTextures++;
+            }
+        }
+        std::cout << "  Materials with base color textures: " << materialsWithTextures << "/" << materialsCPU.size() << std::endl;
+        
         if (materialBufferSize > 0) {
             m_materialBuffer = CreateDefaultBuffer(m_device.Get(), cmdList, materialsCPU.data(), materialBufferSize, m_materialUpload);
             std::cout << "  Material buffer created: GPU address = " << m_materialBuffer->GetGPUVirtualAddress() << std::endl;
@@ -1935,15 +2117,15 @@ void ACG::Renderer::SetSunIntensity(float intensity) {
             srvMatDesc.Buffer.FirstElement = 0;
             srvMatDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
             srvMatDesc.Buffer.NumElements = static_cast<UINT>(materialsCPU.size());  // Number of materials
-            srvMatDesc.Buffer.StructureByteStride = sizeof(GPUMaterial);  // 96 bytes per material
+            srvMatDesc.Buffer.StructureByteStride = sizeof(MaterialData);  // 64 bytes per material
             D3D12_CPU_DESCRIPTOR_HANDLE srvMatHandle = { srvHandle.ptr + m_srvUavDescriptorSize * m_srvIndex_Materials };
             m_device->CreateShaderResourceView(m_materialBuffer.Get(), &srvMatDesc, srvMatHandle);
-            std::cout << "  Material SRV created as StructuredBuffer: " << materialsCPU.size() << " materials, stride=" << sizeof(GPUMaterial) << " bytes" << std::endl;
+            std::cout << "  Material SRV created as StructuredBuffer: " << materialsCPU.size() << " materials, stride=" << sizeof(MaterialData) << " bytes" << std::endl;
         }
         
         // Create SRV for material layers (structured buffer)
         // CRITICAL: Root signature requires this, buffer always exists now (dummy if empty)
-        m_srvIndex_MaterialLayers = 5;  // Slot 5
+        m_srvIndex_MaterialLayers = 10;  // Slot 10 (avoid conflict with texture at slot 5)
         UINT numLayers = materialLayers.empty() ? 1 : static_cast<UINT>(materialLayers.size());  // At least 1 (dummy)
         
         D3D12_SHADER_RESOURCE_VIEW_DESC srvLayerDesc = {};
@@ -2088,7 +2270,7 @@ void ACG::Renderer::SetSunIntensity(float intensity) {
         ), "Failed to create texture array");
         
         m_textureAtlas->SetName(L"Texture Array");
-        std::cout << "  ✓ Texture array resource created" << std::endl;
+        std::cout << "  �?Texture array resource created" << std::endl;
     }
     
     /**
@@ -2256,7 +2438,7 @@ void ACG::Renderer::SetSunIntensity(float intensity) {
         // Keep upload buffer alive (stored as member to prevent premature destruction)
         m_textureUpload = batchUploadBuffer;
         
-        std::cout << "  ✓ Batch data uploaded to GPU" << std::endl;
+        std::cout << "  �?Batch data uploaded to GPU" << std::endl;
     }
     
     /**
@@ -2294,7 +2476,7 @@ void ACG::Renderer::SetSunIntensity(float intensity) {
         
         m_device->CreateShaderResourceView(m_textureAtlas.Get(), &srvDesc, textureSrvHandle);
         
-        std::cout << "  ✓ Texture array finalized: " << totalTextures << " textures ready for rendering" << std::endl;
+        std::cout << "  �?Texture array finalized: " << totalTextures << " textures ready for rendering" << std::endl;
     }
     
     /**
@@ -2302,25 +2484,67 @@ void ACG::Renderer::SetSunIntensity(float intensity) {
      * Creates SRVs for physical page cache (t5) and indirection texture (t6)
      */
     void Renderer::CreateVirtualTextureSRVs() {
-        if (!m_useVirtualTextures) {
-            return;
-        }
-        
         std::cout << "  Creating Virtual Texture SRVs..." << std::endl;
         
         D3D12_CPU_DESCRIPTOR_HANDLE srvHandle = m_srvUavHeap->GetCPUDescriptorHandleForHeapStart();
         UINT descriptorSize = m_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         
-        // Slot 7: Virtual Texture Cache (t5) - physical page cache
+        // Slot 7: Virtual Texture Cache (t5)
         D3D12_CPU_DESCRIPTOR_HANDLE virtualTextureCacheSrv = { srvHandle.ptr + descriptorSize * 7 };
         
-        // Slot 8: Indirection Texture (t6) - lookup table
+        // Slot 8: Indirection Texture (t6)
         D3D12_CPU_DESCRIPTOR_HANDLE indirectionTextureSrv = { srvHandle.ptr + descriptorSize * 8 };
         
-        // Call Virtual Texture System to create its SRVs
-        m_virtualTextureSystem.CreateShaderResourceView(m_device.Get(), virtualTextureCacheSrv, indirectionTextureSrv);
-        
-        std::cout << "  ✓ Virtual Texture SRVs created (slots 7 and 8)" << std::endl;
+        if (m_useVirtualTextures) {
+            // Use real virtual texture system
+            m_virtualTextureSystem.CreateShaderResourceView(m_device.Get(), virtualTextureCacheSrv, indirectionTextureSrv);
+            std::cout << "  Virtual Texture SRVs created (active system, slots 7 & 8)" << std::endl;
+        } else {
+            // Create dummy 1x1 textures to satisfy root signature requirements
+            // Dummy cache (t5) - Texture2D
+            D3D12_RESOURCE_DESC dummyCacheDesc = {};
+            dummyCacheDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            dummyCacheDesc.Width = 1;
+            dummyCacheDesc.Height = 1;
+            dummyCacheDesc.DepthOrArraySize = 1;
+            dummyCacheDesc.MipLevels = 1;
+            dummyCacheDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            dummyCacheDesc.SampleDesc.Count = 1;
+            dummyCacheDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+            dummyCacheDesc.Flags = D3D12_RESOURCE_FLAG_NONE;
+            
+            Microsoft::WRL::ComPtr<ID3D12Resource> dummyCache;
+            CD3DX12_HEAP_PROPERTIES defaultHeap(D3D12_HEAP_TYPE_DEFAULT);
+            ThrowIfFailed(m_device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE,
+                &dummyCacheDesc, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
+                IID_PPV_ARGS(&dummyCache)), "Failed to create dummy VT cache");
+            
+            D3D12_SHADER_RESOURCE_VIEW_DESC cacheSrvDesc = {};
+            cacheSrvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            cacheSrvDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            cacheSrvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            cacheSrvDesc.Texture2D.MipLevels = 1;
+            m_device->CreateShaderResourceView(dummyCache.Get(), &cacheSrvDesc, virtualTextureCacheSrv);
+            
+            // Dummy indirection (t6) - Texture2DArray with uint format
+            D3D12_RESOURCE_DESC dummyIndirectionDesc = dummyCacheDesc;
+            dummyIndirectionDesc.Format = DXGI_FORMAT_R32_UINT;
+            
+            Microsoft::WRL::ComPtr<ID3D12Resource> dummyIndirection;
+            ThrowIfFailed(m_device->CreateCommittedResource(&defaultHeap, D3D12_HEAP_FLAG_NONE,
+                &dummyIndirectionDesc, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
+                IID_PPV_ARGS(&dummyIndirection)), "Failed to create dummy VT indirection");
+            
+            D3D12_SHADER_RESOURCE_VIEW_DESC indirectionSrvDesc = {};
+            indirectionSrvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            indirectionSrvDesc.Format = DXGI_FORMAT_R32_UINT;
+            indirectionSrvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+            indirectionSrvDesc.Texture2DArray.MipLevels = 1;
+            indirectionSrvDesc.Texture2DArray.ArraySize = 1;
+            m_device->CreateShaderResourceView(dummyIndirection.Get(), &indirectionSrvDesc, indirectionTextureSrv);
+            
+            std::cout << "  Virtual Texture SRVs created (dummy fallback, slots 7 & 8)" << std::endl;
+        }
     }
 
     // ==================== ENVIRONMENT MAP ====================
@@ -2429,7 +2653,7 @@ void ACG::Renderer::SetSunIntensity(float intensity) {
         
         m_device->CreateShaderResourceView(m_environmentMap.Get(), &srvDesc, envMapSrvHandle);
         
-        std::cout << "  ✓ Environment map uploaded: " << width << "x" << height << std::endl;
+        std::cout << "  �?Environment map uploaded: " << width << "x" << height << std::endl;
         
         // Return upload buffer to keep it alive until GPU finishes using it
         return envMapUpload;

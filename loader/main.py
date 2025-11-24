@@ -31,15 +31,13 @@ try:
     HAS_BPY_LOADER = True
 except ImportError as e:
     HAS_BPY_LOADER = False
-    logger = logging.getLogger(__name__)
-    logger.warning(f"Blender loader not available (bpy not installed). Only OBJ files supported.")
-    logger.debug(f"Import error: {e}")
+    # Blender loader optional, silently skip if not available
 
 
-# Configure logging
+# Configure logging (ERROR level only - suppress INFO/WARNING)
 logging.basicConfig(
-    level=logging.INFO,
-    format='[%(levelname)s] %(message)s'
+    level=logging.ERROR,
+    format='%(message)s'
 )
 logger = logging.getLogger(__name__)
 
@@ -49,18 +47,14 @@ def load_scene(input_file: str, output_file: str) -> bool:
     Main loading function using factory pattern.
     
     Args:
-        input_file: 输入模型文件路径
-        output_file: 输出ACG二进制文件路径
+        input_file: Input model file path
+        output_file: Output ACG binary file path
     
     Returns:
         bool: True if successful, False otherwise
     """
     input_path = Path(input_file)
     output_path = Path(output_file)
-    
-    # 强制使用二进制格式
-    if not output_path.suffix == '.acg':
-        logger.warning(f"Output file should have .acg extension, got: {output_path.suffix}")
     
     # Validate input file
     if not input_path.exists():
@@ -76,19 +70,14 @@ def load_scene(input_file: str, output_file: str) -> bool:
         return False
     
     try:
-        # Load scene
-        logger.info(f"Loading scene from: {input_file}")
-        logger.info(f"Using loader: {loader.get_format_name()}")
-        
+        # Load scene (silent mode)
         scene = loader.load()
         
         # Save to binary format
-        logger.info(f"Saving scene to binary format: {output_file}")
         from binary_exporter import BinarySceneExporter
         exporter = BinarySceneExporter()
         exporter.export(scene, str(output_path))
         
-        logger.info("✓ Scene loading completed successfully")
         return True
         
     except Exception as e:

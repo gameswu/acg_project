@@ -26,25 +26,38 @@ struct Vertex {
 // Material Structure (64 bytes, matches MaterialData in Material.h)
 // ============================================================================
 struct Material {
-    // Base PBR properties (32 bytes)
-    float3 baseColor;           // 0-11: RGB diffuse/albedo
-    float metallic;             // 12-15: Metallic factor [0,1]
+    // CRITICAL: Must match C++ glm::vec4 layout (each vec4 = 16 bytes)
+    // C++ side uses vec4, so we must use float4 here to match padding
     
-    float3 emission;            // 16-27: Emissive color (HDR)
-    float roughness;            // 28-31: Surface roughness [0,1]
+    // vec4 #1: baseColor_metallic (16 bytes)
+    float4 baseColor_metallic;  // 0-15: RGB diffuse/albedo + metallic
     
-    float ior;                  // 32-35: Index of refraction
-    float opacity;              // 36-39: Opacity [0,1]
-    uint layerFlags;            // 40-43: Bit flags for enabled layers
-    uint extendedDataIndex;     // 44-47: Index into layer buffer
+    // vec4 #2: emission_roughness (16 bytes)
+    float4 emission_roughness;  // 16-31: RGB emission (HDR) + roughness
     
-    // Texture indices (16 bytes)
-    int baseColorTexIdx;        // 48-51: Base color texture (-1 = none)
-    int normalTexIdx;           // 52-55: Normal map (-1 = none)
-    int metallicRoughnessTexIdx;// 56-59: Packed texture (-1 = none)
-    int emissionTexIdx;         // 60-63: Emission texture (-1 = none)
+    // vec4 #3: ior_opacity_flags_idx (16 bytes)
+    float4 ior_opacity_flags_idx; // 32-47: X=IOR, Y=opacity, Z=layerFlags(as float), W=extendedDataIndex(as float)
     
-    // Total: 64 bytes
+    // vec4 #4: texIndices (16 bytes)
+    float4 texIndices;          // 48-63: X=baseColorTex, Y=normalTex, Z=metallicRoughnessTex, W=emissionTex (all as floats, cast to int)
+    
+    // Total: 64 bytes (4 x 16-byte vec4s)
+    
+    // Helper accessors to extract individual fields
+    float3 baseColor() { return baseColor_metallic.xyz; }
+    float metallic() { return baseColor_metallic.w; }
+    float3 emission() { return emission_roughness.xyz; }
+    float roughness() { return emission_roughness.w; }
+    float ior() { return ior_opacity_flags_idx.x; }
+    float opacity() { return ior_opacity_flags_idx.y; }
+    uint layerFlags() { return asuint(ior_opacity_flags_idx.z); }
+    uint extendedDataIndex() { return asuint(ior_opacity_flags_idx.w); }
+    
+    // Texture index helpers (reinterpret float as int)
+    int baseColorTexIdx() { return asint(texIndices.x); }
+    int normalTexIdx() { return asint(texIndices.y); }
+    int metallicRoughnessTexIdx() { return asint(texIndices.z); }
+    int emissionTexIdx() { return asint(texIndices.w); }
 };
 
 // ============================================================================

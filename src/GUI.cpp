@@ -3,6 +3,7 @@
 #include "Renderer.h"
 #include "Camera.h"
 #include "Scene.h"
+#include "Config.h"
 #include "imgui.h"
 #include <commdlg.h>
 #include <thread>
@@ -11,8 +12,10 @@
 #include <iostream>
 #include <fstream>
 #include <sstream>
+#include <filesystem>
 #include <cmath>
 #include <chrono>
+#include <algorithm>
 #include <glm/glm.hpp>
 #include <glm/gtc/constants.hpp>
 #include <glm/gtx/rotate_vector.hpp>
@@ -39,6 +42,94 @@ void InitializeGUIState(GUIState& state, const std::string& exeDirectory) {
         strncpy_s(state.outputPath, defaultOutput.c_str(), sizeof(state.outputPath) - 1);
         state.outputPathInitialized = true;
     }
+}
+
+void LoadConfig(GUIState& state, ACG::Renderer* renderer, const std::string& configPath) {
+    ACG::PersistentConfig config;
+    if (!config.Load(configPath)) {
+        return;  // Use defaults if load fails
+    }
+    
+    // Apply paths
+    if (!config.lastModelPath.empty()) {
+        strncpy_s(state.modelPath, config.lastModelPath.c_str(), sizeof(state.modelPath) - 1);
+    }
+    if (!config.lastEnvMapPath.empty()) {
+        strncpy_s(state.envMapPath, config.lastEnvMapPath.c_str(), sizeof(state.envMapPath) - 1);
+    }
+    if (!config.lastOutputPath.empty()) {
+        strncpy_s(state.outputPath, config.lastOutputPath.c_str(), sizeof(state.outputPath) - 1);
+    }
+    
+    // Apply camera settings
+    renderer->GetCamera()->SetPosition(config.cameraPosition);
+    glm::vec3 target = config.cameraPosition + config.cameraDirection;
+    renderer->GetCamera()->SetTarget(target);
+    renderer->GetCamera()->SetFOV(config.cameraFOV);
+    
+    // Apply render settings
+    state.samplesPerPixel = config.samplesPerPixel;
+    state.maxBounces = config.maxBounces;
+    renderer->SetMaxBounces(config.maxBounces);
+    
+    state.envLightIntensity = config.envLightIntensity;
+    renderer->SetEnvironmentLightIntensity(config.envLightIntensity);
+    
+    state.vtTileBatchSize = config.vtTileBatchSize;  // Load VT batch size
+    state.renderBatchSize = config.renderBatchSize;  // Load render batch size
+    renderer->SetRenderBatchSize(config.renderBatchSize);
+    
+    // Apply sun settings
+    state.sunIntensity = config.sunIntensity;
+    state.sunAzimuth = config.sunAzimuth;
+    state.sunElevation = config.sunElevation;
+    state.sunColor[0] = config.sunColor.r;
+    state.sunColor[1] = config.sunColor.g;
+    state.sunColor[2] = config.sunColor.b;
+    
+    renderer->SetSunIntensity(config.sunIntensity);
+    float az = glm::radians(config.sunAzimuth);
+    float el = glm::radians(config.sunElevation);
+    glm::vec3 dir = glm::vec3(cos(el) * cos(az), sin(el), cos(el) * sin(az));
+    renderer->SetSunDirection(dir);
+    renderer->SetSunColor(config.sunColor);
+    
+    // Apply output settings
+    state.width = config.outputWidth;
+    state.height = config.outputHeight;
+}
+
+void SaveConfig(const GUIState& state, ACG::Renderer* renderer, const std::string& configPath) {
+    ACG::PersistentConfig config;
+    
+    // Save paths
+    config.lastModelPath = state.modelPath;
+    config.lastEnvMapPath = state.envMapPath;
+    config.lastOutputPath = state.outputPath;
+    
+    // Save camera settings
+    config.cameraPosition = renderer->GetCamera()->GetPosition();
+    config.cameraDirection = renderer->GetCamera()->GetDirection();
+    config.cameraFOV = renderer->GetCamera()->GetFOV();
+    
+    // Save render settings
+    config.samplesPerPixel = state.samplesPerPixel;
+    config.maxBounces = state.maxBounces;
+    config.envLightIntensity = state.envLightIntensity;
+    config.vtTileBatchSize = state.vtTileBatchSize;  // Save VT batch size
+    config.renderBatchSize = state.renderBatchSize;  // Save render batch size
+    
+    // Save sun settings
+    config.sunIntensity = state.sunIntensity;
+    config.sunAzimuth = state.sunAzimuth;
+    config.sunElevation = state.sunElevation;
+    config.sunColor = glm::vec3(state.sunColor[0], state.sunColor[1], state.sunColor[2]);
+    
+    // Save output settings
+    config.outputWidth = state.width;
+    config.outputHeight = state.height;
+    
+    config.Save(configPath);
 }
 
 void ShutdownGUI() {
@@ -334,46 +425,191 @@ void RenderSettingsWindow(ACG::Renderer* renderer, GUIState& state, HWND hwnd) {
     }
     
     ImGui::Separator();
-    ImGui::Text("Scene");
-    ImGui::InputText("Model Path", state.modelPath, sizeof(state.modelPath));
+    
+    // ==================== Scene Conversion Section ====================
+    ImGui::Text("Scene Conversion (to ACG format)");
+    ImGui::InputText("Source Scene", state.sourceScenePath, sizeof(state.sourceScenePath));
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("OBJ, FBX, GLTF, or Blender file to convert");
+    }
     ImGui::SameLine();
-    if (ImGui::Button("Browse")) {
+    if (ImGui::Button("Browse##Source")) {
         std::string path = OpenFileDialog(hwnd, 
-            "3D Models\0*.obj;*.fbx;*.gltf\0All Files\0*.*\0\0",
-            "Select 3D Model");
+            "3D Models\0*.obj;*.fbx;*.gltf;*.blend\0OBJ Files\0*.obj\0FBX Files\0*.fbx\0GLTF Files\0*.gltf\0Blender Files\0*.blend\0All Files\0*.*\0\0",
+            "Select Scene to Convert");
+        if (!path.empty()) {
+            strncpy_s(state.sourceScenePath, path.c_str(), sizeof(state.sourceScenePath) - 1);
+            
+            // Auto-generate output ACG path
+            std::string srcPath = path;
+            size_t lastDot = srcPath.find_last_of('.');
+            if (lastDot != std::string::npos) {
+                std::string acgPath = srcPath.substr(0, lastDot) + ".acg";
+                strncpy_s(state.outputAcgPath, acgPath.c_str(), sizeof(state.outputAcgPath) - 1);
+            }
+        }
+    }
+    
+    ImGui::InputText("Output ACG", state.outputAcgPath, sizeof(state.outputAcgPath));
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("ACG binary file path for output");
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Browse##ACG")) {
+        std::string path = SaveFileDialog(hwnd,
+            "ACG Binary\0*.acg\0All Files\0*.*\0\0",
+            "Save ACG File");
+        if (!path.empty()) {
+            strncpy_s(state.outputAcgPath, path.c_str(), sizeof(state.outputAcgPath) - 1);
+        }
+    }
+    
+    if (ImGui::Button("Convert to ACG", ImVec2(150, 0))) {
+        if (strlen(state.sourceScenePath) > 0 && strlen(state.outputAcgPath) > 0) {
+            state.conversionStatus = "Converting scene...";
+            state.showConversionStatus = true;
+            
+            std::string sourcePathStr = state.sourceScenePath;
+            std::string outputAcgStr = state.outputAcgPath;
+            std::vector<std::string>* pLogMessages = state.pLogMessages;
+            
+            // Launch conversion in background thread
+            std::thread([sourcePathStr, outputAcgStr, &state, pLogMessages]() {
+                try {
+                    // Get executable directory path (not current working directory)
+                    wchar_t exePathBuffer[MAX_PATH];
+                    GetModuleFileNameW(NULL, exePathBuffer, MAX_PATH);
+                    std::filesystem::path exePath(exePathBuffer);
+                    std::filesystem::path exeDir = exePath.parent_path();
+                    
+                    // Build paths relative to executable directory
+                    std::filesystem::path pythonExe = exeDir / "loader" / ".venv" / "Scripts" / "python.exe";
+                    std::filesystem::path loaderScript = exeDir / "loader" / "main.py";
+                    
+                    // Check if venv Python exists, otherwise use system Python
+                    std::string pythonCmd;
+                    if (std::filesystem::exists(pythonExe)) {
+                        pythonCmd = "\"" + pythonExe.string() + "\"";
+                    } else {
+                        pythonCmd = "python";
+                    }
+                    
+                    // Build command with UTF-8 encoding environment variable
+                    std::string command = "cmd /c \"set PYTHONIOENCODING=utf-8 && " + pythonCmd + " \"" + loaderScript.string() + "\" \"" + sourcePathStr + "\" \"" + outputAcgStr + "\" 2>&1\"";
+                    
+                    FILE* pipe = _popen(command.c_str(), "r");
+                    if (!pipe) {
+                        std::lock_guard<std::mutex> lock(g_renderMutex);
+                        state.conversionStatus = "✗ Failed to start conversion process";
+                        if (pLogMessages) {
+                            pLogMessages->push_back("[ERROR] Failed to start Python converter");
+                        }
+                        return;
+                    }
+                    
+                    // Read output line by line
+                    char buffer[256];
+                    std::string errorOutput;
+                    while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+                        std::string line(buffer);
+                        // Remove trailing newline
+                        if (!line.empty() && line.back() == '\n') {
+                            line.pop_back();
+                        }
+                        // Only capture non-empty lines (Python ERROR logs)
+                        if (!line.empty()) {
+                            errorOutput += line + "\n";
+                            if (pLogMessages) {
+                                std::lock_guard<std::mutex> lock(g_renderMutex);
+                                pLogMessages->push_back("[Python] " + line);
+                            }
+                        }
+                    }
+                    
+                    int result = _pclose(pipe);
+                    
+                    std::lock_guard<std::mutex> lock(g_renderMutex);
+                    if (result == 0) {
+                        state.conversionStatus = "Conversion successful!\n\nOutput file:\n" + outputAcgStr;
+                        state.showConversionStatus = true;
+                        if (pLogMessages && errorOutput.empty()) {
+                            pLogMessages->push_back("[Info] Scene conversion completed: " + outputAcgStr);
+                        }
+                    } else {
+                        state.conversionStatus = "Conversion failed!\n\nError code: " + std::to_string(result) + "\n\nCheck log window for details.";
+                        state.showConversionStatus = true;
+                        if (pLogMessages) {
+                            pLogMessages->push_back("[ERROR] Conversion failed with exit code " + std::to_string(result));
+                        }
+                    }
+                } catch (const std::exception& e) {
+                    std::lock_guard<std::mutex> lock(g_renderMutex);
+                    state.conversionStatus = std::string("Conversion error!\n\n") + e.what();
+                    state.showConversionStatus = true;
+                    if (pLogMessages) {
+                        pLogMessages->push_back(std::string("[ERROR] Conversion exception: ") + e.what());
+                    }
+                }
+            }).detach();
+        } else {
+            state.conversionStatus = "Please specify both source and output paths";
+            state.showConversionStatus = true;
+        }
+    }
+    
+    ImGui::Separator();
+    
+    // ==================== Scene Loading Section ====================
+    ImGui::Text("Scene Loading (ACG files only)");
+    ImGui::InputText("ACG Scene Path", state.modelPath, sizeof(state.modelPath));
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Pre-converted ACG binary file for rendering");
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Browse##Load")) {
+        std::string path = OpenFileDialog(hwnd, 
+            "ACG Binary\0*.acg\0All Files\0*.*\0\0",
+            "Select ACG Scene");
         if (!path.empty()) {
             strncpy_s(state.modelPath, path.c_str(), sizeof(state.modelPath) - 1);
         }
     }
     
-    // Python loader now handles all formats automatically
-    
-    // Batch loading configuration (deprecated - kept for UI state)
+    // Virtual Texture System settings
     ImGui::Separator();
-    ImGui::Text("Scene Loading");
-    ImGui::Checkbox("Enable Batch Loading", &state.enableBatchLoading);
+    ImGui::Text("Virtual Texture System");
+    ImGui::PushItemWidth(150);
+    ImGui::SliderInt("VT Tile Batch Size", &state.vtTileBatchSize, 10, 200);
     if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Load large scenes in batches to avoid memory overflow.\nRecommended for scenes with >500 meshes or >1M triangles.");
+        ImGui::SetTooltip("Number of tiles uploaded per GPU batch.\n"
+                          "Lower = less memory usage (slower)\n"
+                          "Higher = faster upload (more memory)\n"
+                          "Default: 50 tiles (~12.5MB per batch)\n"
+                          "Current: ~%.1f MB per batch", 
+                          state.vtTileBatchSize * 256.0f * 256.0f * 4.0f / (1024.0f * 1024.0f));
     }
+    ImGui::PopItemWidth();
     
-    if (state.enableBatchLoading) {
-        ImGui::PushItemWidth(150);
-        ImGui::SliderInt("Meshes/Batch", &state.maxMeshesPerBatch, 100, 2000);
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Number of meshes to process in each batch.\nLower = less memory, slower loading");
+    // Rendering Performance settings
+    ImGui::Separator();
+    ImGui::Text("Rendering Performance");
+    ImGui::PushItemWidth(150);
+    if (ImGui::SliderInt("Render Batch Size", &state.renderBatchSize, 1, 20)) {
+        // Clamp value to valid range
+        if (state.renderBatchSize < 1) state.renderBatchSize = 1;
+        if (state.renderBatchSize > 20) state.renderBatchSize = 20;
+        if (renderer) {
+            renderer->SetRenderBatchSize(state.renderBatchSize);
         }
-        
-        ImGui::SliderInt("Textures/Batch", &state.maxTexturesPerBatch, 16, 128);
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Maximum textures to load per batch");
-        }
-        
-        ImGui::SliderInt("Memory Limit (MB)", &state.maxMemoryMB, 1024, 8192);
-        if (ImGui::IsItemHovered()) {
-            ImGui::SetTooltip("Estimated memory usage limit (warning only)");
-        }
-        ImGui::PopItemWidth();
     }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Samples per GPU execution batch.\n"
+                          "Lower (1-3) = safer for complex scenes, avoids TDR timeout\n"
+                          "Higher (10-20) = faster for simple scenes, risk of GPU hang\n"
+                          "Default: 5 (balanced)\n"
+                          "Windows GPU timeout: ~2 seconds");
+    }
+    ImGui::PopItemWidth();
     ImGui::Separator();
     
     ImGui::InputText("Output Path", state.outputPath, sizeof(state.outputPath));
@@ -457,14 +693,28 @@ void RenderControlsWindow(ACG::Renderer* renderer, GUIState& state) {
                         g_totalSamples.store(samples);
                         g_currentSample.store(0);
                         
+                        // Set VT batch size before loading scene
+                        renderer->SetVirtualTextureTileBatchSize(state.vtTileBatchSize);
+                        
+                        // Validate that modelPath is an ACG file
+                        std::string modelExtension = modelPathStr.substr(modelPathStr.find_last_of('.') + 1);
+                        std::transform(modelExtension.begin(), modelExtension.end(), modelExtension.begin(), ::tolower);
+                        
+                        if (modelExtension != "acg") {
+                            std::lock_guard<std::mutex> lock(g_renderMutex);
+                            g_renderResultMessage = "✗ Error: Only ACG files are supported for rendering.\nPlease convert your scene first using 'Convert to ACG' button.";
+                            g_renderComplete.store(true);
+                            return;
+                        }
+                        
                         // Only load scene if it hasn't been loaded yet or path changed
                         if (needsSceneLoad) {
-                            std::cout << "[Async] Loading scene: " << modelPathStr << std::endl;
+                            std::cout << "[Async] Loading ACG scene: " << modelPathStr << std::endl;
                             std::cout.flush();
                             
                             auto sceneLoadStart = std::chrono::steady_clock::now();
                             
-                            // Use Python loader (automatically handles all formats)
+                            // Load ACG file directly (no conversion needed)
                             renderer->LoadSceneAsync(modelPathStr);
                             
                             auto sceneLoadEnd = std::chrono::steady_clock::now();
@@ -776,7 +1026,7 @@ void RenderResultWindow(ACG::Renderer* renderer, GUIState& state) {
     ImGui::End();
 }
 
-void RenderLogWindow(const std::vector<std::string>& logMessages) {
+void RenderLogWindow(GUIState& state) {
     ImGui::Begin("Log Details");
     
     static bool autoScroll = true;
@@ -784,15 +1034,20 @@ void RenderLogWindow(const std::vector<std::string>& logMessages) {
     ImGui::Checkbox("Auto-scroll", &autoScroll);
     ImGui::SameLine();
     if (ImGui::Button("Clear")) {
-        // Cannot clear const vector, just skip
+        // Clear via state pointer
+        if (state.pLogMessages) {
+            state.pLogMessages->clear();
+        }
     }
     
     ImGui::Separator();
     ImGui::BeginChild("LogScrolling", ImVec2(0, 0), false, ImGuiWindowFlags_HorizontalScrollbar);
     
     // 显示实际的日志内容
-    for (const auto& msg : logMessages) {
-        ImGui::TextUnformatted(msg.c_str());
+    if (state.pLogMessages) {
+        for (const auto& msg : *state.pLogMessages) {
+            ImGui::TextUnformatted(msg.c_str());
+        }
     }
     
     if (autoScroll && ImGui::GetScrollY() >= ImGui::GetScrollMaxY()) {
@@ -824,13 +1079,27 @@ void RenderGUI(ACG::Renderer* renderer, GUIState& state, HWND hwnd) {
         ImGui::EndPopup();
     }
     
+    // Show conversion status popup
+    if (state.showConversionStatus) {
+        ImGui::OpenPopup("Conversion Status");
+        state.showConversionStatus = false;
+    }
+    if (ImGui::BeginPopupModal("Conversion Status", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextWrapped("%s", state.conversionStatus.c_str());
+        ImGui::Spacing();
+        if (ImGui::Button("OK", ImVec2(120, 0))) {
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+    
     RenderSettingsWindow(renderer, state, hwnd);
     RenderControlsWindow(renderer, state);
     RenderCameraWindow(renderer, state);
     RenderResultWindow(renderer, state);
     
     if (state.pLogMessages) {
-        RenderLogWindow(*state.pLogMessages);
+        RenderLogWindow(state);
     }
 }
 

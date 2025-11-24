@@ -8,6 +8,7 @@
 // Forward declarations
 namespace ACG {
     class Renderer;
+    struct PersistentConfig;
 }
 
 namespace GUI {
@@ -19,7 +20,9 @@ struct GUIState {
     int height = 720;
     int samplesPerPixel = 100;
     int maxBounces = 5;
-    char modelPath[512] = "";
+    char modelPath[512] = "";           // ACG file path for rendering
+    char sourceScenePath[512] = "";     // Source scene path for conversion
+    char outputAcgPath[512] = "";       // Output ACG path for conversion
     char outputPath[512] = "";
     char envMapPath[512] = "";
     bool autoRenderOnLoad = false;
@@ -30,6 +33,12 @@ struct GUIState {
     int maxMeshesPerBatch = 500;
     int maxTexturesPerBatch = 64;
     int maxMemoryMB = 4096;  // 4GB default
+    
+    // Virtual Texture settings
+    int vtTileBatchSize = 50;  // Tiles per GPU batch (affects memory usage)
+    
+    // Rendering performance settings
+    int renderBatchSize = 5;  // Samples per GPU execution (affects TDR timeout, range 1-20)
     
     // Lighting settings
     float envLightIntensity = 0.5f;
@@ -47,6 +56,8 @@ struct GUIState {
     // Internal state
     std::string renderStatus = "";
     bool showRenderStatus = false;
+    std::string conversionStatus = "";  // Status message for scene conversion
+    bool showConversionStatus = false;  // Whether to show conversion status
     bool envLightInitialized = false;
     bool outputPathInitialized = false;
     float lastRenderTime = 0.0f;
@@ -62,6 +73,12 @@ struct GUIState {
 
 // Initialize GUI state with default values
 void InitializeGUIState(GUIState& state, const std::string& exeDirectory);
+
+// Load persistent configuration
+void LoadConfig(GUIState& state, ACG::Renderer* renderer, const std::string& configPath);
+
+// Save persistent configuration  
+void SaveConfig(const GUIState& state, ACG::Renderer* renderer, const std::string& configPath);
 
 // Clean up GUI resources (e.g. render threads)
 void ShutdownGUI();
