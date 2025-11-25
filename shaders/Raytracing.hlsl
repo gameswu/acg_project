@@ -177,6 +177,201 @@ float4 SampleVirtualTexture(int texIndex, float2 uv)
     return sampledColor;
 }
 
+    // ===================== Principled / Microfacet BSDF Helpers =====================
+    // Interfaces (prototypes)
+    static const float PI = 3.14159265359;
+
+    float3 FresnelSchlick(float3 F0, float cosTheta);
+    float D_GGX(float NdotH, float alpha);
+    float G_Smith(float NdotV, float NdotL, float alpha);
+    float3 Specular_GGX(float3 N, float3 V, float3 L, float roughness, float3 F0);
+    float3 Diffuse_Burley(float3 albedo, float3 N, float3 V, float3 L);
+    float SampleGGX_Direction(float3 N, float3 V, float roughness, inout uint rngState, out float3 sampledDir, out float pdf);
+    void EvaluatePrincipledBSDF(float3 N, float3 V, float3 L, float3 albedo, float metallic, float roughness, float3 F0, out float3 f, out float pdf);
+
+    // Implementations
+    float3 FresnelSchlick(float3 F0, float cosTheta)
+    {
+        cosTheta = saturate(cosTheta);
+        return F0 + (1.0 - F0) * pow(1.0 - cosTheta, 5.0);
+    }
+
+    // GGX / Trowbridge-Reitz normal distribution function
+    float D_GGX(float NdotH, float alpha)
+    {
+        float a2 = alpha * alpha;
+        float denom = NdotH * NdotH * (a2 - 1.0) + 1.0;
+        denom = PI * denom * denom;
+        return a2 / max(1e-7, denom);
+    }
+
+    // Schlick-GGX geometry term (Smith masking-shadowing)
+    float G_Smith(float NdotV, float NdotL, float alpha)
+    {
+        // Schlick-GGX G1
+        float k = (alpha + 1.0);
+        k = (k * k) * 0.125; // (alpha+1)^2 / 8
+        float G1V = NdotV / (NdotV * (1.0 - k) + k);
+        float G1L = NdotL / (NdotL * (1.0 - k) + k);
+        return G1V * G1L;
+    }
+
+    // Evaluate GGX specular term (returns RGB specular contribution)
+    float3 Specular_GGX(float3 N, float3 V, float3 L, float roughness, float3 F0)
+    {
+        float3 H = normalize(V + L);
+        float NdotV = max(dot(N, V), 0.0);
+        float NdotL = max(dot(N, L), 0.0);
+        float NdotH = max(dot(N, H), 0.0);
+        float VdotH = max(dot(V, H), 0.0);
+
+        if (NdotL <= 0.0 || NdotV <= 0.0) return float3(0,0,0);
+
+        float alpha = max(0.001, roughness * roughness);
+        float D = D_GGX(NdotH, alpha);
+        float G = G_Smith(NdotV, NdotL, alpha);
+        float3 F = FresnelSchlick(F0, VdotH);
+
+        float denom = 4.0 * NdotV * NdotL + 1e-7;
+        float3 spec = (D * G) / denom * F;
+        return spec;
+    }
+
+    // Simple Burley diffuse (Disney diffuse approximation)
+    float3 Diffuse_Burley(float3 albedo, float3 N, float3 V, float3 L)
+    {
+        float NdotL = max(dot(N, L), 0.0);
+        float NdotV = max(dot(N, V), 0.0);
+        // For simplicity use Lambertian modulated by energy compensation
+        // fd = albedo / PI * (1 + (1 - albedo) * 0.5 * (1 - NdotL) * (1 - NdotV)) -- simplified
+        float3 base = albedo * (1.0 / PI);
+        float fdmod = 1.0; // placeholder for more advanced Burley factor
+        return base * fdmod;
+    }
+
+    // Sample GGX microfacet normal and return sampled outgoing direction (reflect V about H)
+    float SampleGGX_Direction(float3 N, float3 V, float roughness, inout uint rngState, out float3 sampledDir, out float pdf)
+    {
+        // Sample H in N's tangent space using GGX sampling (approximate)
+        float u1 = Random(rngState);
+        float u2 = Random(rngState);
+
+        float alpha = max(0.001, roughness * roughness);
+        float phi = 2.0 * PI * u1;
+        float tan2 = alpha * alpha * u2 / max(1e-7, (1.0 - u2));
+        float cosTheta = 1.0 / sqrt(1.0 + tan2);
+        float sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
+
+        float3 Hlocal = float3(sinTheta * cos(phi), sinTheta * sin(phi), cosTheta);
+
+        // Build basis around N
+        float3 T, B;
+        CreateOrthonormalBasis(N, T, B);
+        float3 H = normalize(T * Hlocal.x + B * Hlocal.y + N * Hlocal.z);
+
+        // Reflect view around H to get outgoing direction
+        sampledDir = normalize(reflect(-V, H));
+
+        float NdotH = max(dot(N, H), 0.0);
+        float VdotH = max(dot(V, H), 0.0);
+
+        // PDF for sampling H
+        float alpha2 = alpha * alpha;
+        float D = D_GGX(NdotH, alpha);
+        float pdfH = D * NdotH;
+        // convert pdf_H to pdf_L: pdf_L = pdf_H / (4 * VdotH)
+        pdf = pdfH / max(1e-7, 4.0 * VdotH);
+
+        // Return some metric (we won't use the return value directly)
+        return pdf;
+    }
+
+    // Evaluate combined Principled BRDF (returns f and pdf for given directions)
+    void EvaluatePrincipledBSDF(float3 N, float3 V, float3 L, float3 albedo, float metallic, float roughness, float3 F0, out float3 f, out float pdf)
+    {
+        float NdotL = max(dot(N, L), 0.0);
+        float NdotV = max(dot(N, V), 0.0);
+        if (NdotL <= 0.0 || NdotV <= 0.0) {
+            f = float3(0,0,0);
+            pdf = 0.0;
+            return;
+        }
+
+        // Fresnel base reflectance for dielectrics
+        float3 Fdielectric = F0; // caller should provide 0.04 for dielectric
+
+        // Compute specular F0 for metals: use albedo as F0 for conductors
+        float3 F0_metal = albedo;
+        float3 F0_final = lerp(Fdielectric, F0_metal, metallic);
+
+        // Specular term
+        float3 spec = Specular_GGX(N, V, L, roughness, F0_final);
+
+        // Diffuse term (zero for metals)
+        float3 diff = (1.0 - metallic) * Diffuse_Burley(albedo, N, V, L);
+
+        f = spec + diff;
+
+        // Rough heuristic pdf: mix between specular and diffuse pdfs by metallic
+        // Specular pdf from GGX sampling (approximated via half-vector)
+        float3 H = normalize(V + L);
+        float NdotH = max(dot(N, H), 0.0);
+        float VdotH = max(dot(V, H), 0.0);
+        float alpha = max(0.001, roughness * roughness);
+        float D = D_GGX(NdotH, alpha);
+        float pdfSpec = (D * NdotH) / max(1e-7, 4.0 * VdotH);
+
+        // Diffuse pdf (cosine hemisphere)
+        float pdfDiff = NdotL / PI;
+
+        // Mix pdf by probability of choosing specular vs diffuse (use metallic as proxy)
+        float specProb = saturate(metallic);
+        pdf = specProb * pdfSpec + (1.0 - specProb) * pdfDiff;
+    }
+
+    // Compute dielectric F0 from IOR using Fresnel at normal incidence
+    float3 DielectricF0FromIOR(float ior)
+    {
+        float f = (ior - 1.0) / (ior + 1.0);
+        float f0 = f * f;
+        return float3(f0, f0, f0);
+    }
+
+    // Fetch material parameters: albedo, metallic, roughness, and compute F0
+    // Uses virtual textures when enabled via g_constants.useVirtualTextures
+    void GetMaterialParameters(in Material mat, in float2 uv, out float3 albedo, out float metallic, out float roughness, out float3 F0)
+    {
+        // Base values from material struct
+        albedo = mat.baseColor();
+        metallic = mat.metallic();
+        roughness = mat.roughness();
+
+        // Sample base color texture if present
+        int baseIdx = mat.baseColorTexIdx();
+        if (baseIdx >= 0) {
+            float4 texColor;
+            if (g_constants.useVirtualTextures == 1) texColor = SampleVirtualTexture(baseIdx, uv);
+            else texColor = g_textures.SampleLevel(g_sampler, float3(uv, baseIdx), 0);
+            albedo = texColor.rgb;
+        }
+
+        // Sample metallic-roughness texture if present (GLTF convention: G=roughness, B=metallic)
+        int mrIdx = mat.metallicRoughnessTexIdx();
+        if (mrIdx >= 0) {
+            float4 mr;
+            if (g_constants.useVirtualTextures == 1) mr = SampleVirtualTexture(mrIdx, uv);
+            else mr = g_textures.SampleLevel(g_sampler, float3(uv, mrIdx), 0);
+            // Interpret channels: G = roughness, B = metallic
+            roughness = mr.g;
+            metallic = mr.b;
+        }
+
+        // Compute F0: mix dielectric F0 (from IOR) and metallic F0 (use albedo)
+        float3 Fdie = DielectricF0FromIOR(mat.ior());
+        F0 = lerp(Fdie, albedo, saturate(metallic));
+    }
+
+
 [shader("raygeneration")]
 void RayGen()
 {
@@ -483,79 +678,67 @@ void ClosestHit(inout RadiancePayload payload, in BuiltInTriangleIntersectionAtt
         }
         return;
     }
-    // Handle mirror/reflective materials (high metallic, low roughness)
-    else if (mat.metallic() > 0.9 && mat.roughness() < 0.1) {
-        // Perfect mirror reflection
-        float3 reflectDir = reflect(rayDir, normal);
-        
-        // Use base color as reflectance for metallic surfaces (with texture support)
-        float3 reflectance = mat.baseColor();
-        int baseColorIdx = mat.baseColorTexIdx();
-        if (baseColorIdx >= 0) {
-            float4 texColor;
-            if (g_constants.useVirtualTextures == 1) {
-                texColor = SampleVirtualTexture(baseColorIdx, texCoord);
-            } else {
-                texColor = g_textures.SampleLevel(g_sampler, float3(texCoord, baseColorIdx), 0);
-            }
-            reflectance = texColor.rgb;
-        }
-        // Do not force an artificial high reflectance fallback here; respect Ks provided by material.
-        // If Ks is zero, reflection will contribute nothing (correct physical behavior).
-        payload.throughput *= reflectance;
-        payload.nextOrigin = hitPos + geometricNormal * 0.001;
-        payload.nextDirection = reflectDir;
-        return;
-    }
-    // Handle standard diffuse materials (illum 0, 1, 2, default)
+    // Use Principled BSDF sampling/evaluation for non-transmission materials
     else {
-        // Lambertian diffuse BRDF
-        // MTL spec: illum 0 = flat color, illum 1 = diffuse, illum 2 = diffuse+specular
-        
-        // Get base albedo (color or texture)
-        float3 albedo = mat.baseColor();
-        
-        // Sample texture if available (texture overrides base albedo)
-        int baseColorIdx = mat.baseColorTexIdx();
-        if (baseColorIdx >= 0) {
-            float4 texColor;
-            if (g_constants.useVirtualTextures == 1) {
-                texColor = SampleVirtualTexture(baseColorIdx, texCoord);
-            } else {
-                texColor = g_textures.SampleLevel(g_sampler, float3(texCoord, baseColorIdx), 0);
-            }
-            albedo = texColor.rgb;
+        // Fetch material parameters (albedo, metallic, roughness, F0)
+        float3 albedo;
+        float metallic;
+        float roughness;
+        float3 F0;
+        GetMaterialParameters(mat, texCoord, albedo, metallic, roughness, F0);
+
+        // View vector (pointing from surface toward camera)
+        float3 V = -rayDir;
+
+        // Decide between specular (GGX) and diffuse sampling
+        // Weight specular more when metallic is high or roughness is low
+        float specProb = saturate(metallic + (1.0 - roughness) * (1.0 - metallic));
+        float r = Random(payload.rngState);
+
+        float3 sampledDir;
+        float samplePdf = 0.0;
+
+        if (r < specProb) {
+            // Sample GGX specular lobe
+            SampleGGX_Direction(normal, V, roughness, payload.rngState, sampledDir, samplePdf);
+        } else {
+            // Cosine-weighted hemisphere (diffuse)
+            float r1 = Random(payload.rngState);
+            float r2 = Random(payload.rngState);
+            float sinTheta = sqrt(r1);
+            float cosTheta = sqrt(1.0 - r1);
+            float phi = 2.0 * PI * r2;
+
+            float3 tangent, bitangent;
+            CreateOrthonormalBasis(normal, tangent, bitangent);
+            float3 localDir = float3(sinTheta * cos(phi), sinTheta * sin(phi), cosTheta);
+            sampledDir = normalize(tangent * localDir.x + bitangent * localDir.y + normal * localDir.z);
+            samplePdf = max(dot(normal, sampledDir), 0.0) / PI;
         }
-        
-        // For path tracing with cosine-weighted sampling:
-        // BRDF = albedo / PI
-        // PDF = cosTheta / PI
-        // Combined factor: (albedo / PI) * cosTheta / (cosTheta / PI) = albedo
-        payload.throughput *= albedo;
-        
-        // Russian roulette path termination
+
+        float NdotL = max(dot(normal, sampledDir), 0.0);
+        if (NdotL <= 0.0 || samplePdf <= 0.0) {
+            payload.terminated = true;
+            return;
+        }
+
+        // Evaluate BRDF value for chosen direction
+        float3 f;
+        float dummyPdf;
+        EvaluatePrincipledBSDF(normal, V, sampledDir, albedo, metallic, roughness, F0, f, dummyPdf);
+
+        // Update throughput: multiply by contribution = f * cosTheta / pdf
+        payload.throughput *= f * NdotL / samplePdf;
+
+        // Russian roulette termination (if throughput very small)
         float maxThroughput = max(max(payload.throughput.r, payload.throughput.g), payload.throughput.b);
         if (maxThroughput < 0.001) {
             payload.terminated = true;
             return;
         }
-        
-        // Sample next direction using cosine-weighted hemisphere sampling
-        float3 tangent, bitangent;
-        CreateOrthonormalBasis(normal, tangent, bitangent);
-        
-        float r1 = Random(payload.rngState);
-        float r2 = Random(payload.rngState);
-        
-        float sinTheta = sqrt(r1);
-        float cosTheta = sqrt(1.0 - r1);
-        float phi = 2.0 * 3.14159265359 * r2;
-        
-        float3 localDir = float3(sinTheta * cos(phi), sinTheta * sin(phi), cosTheta);
-        float3 worldDir = normalize(tangent * localDir.x + bitangent * localDir.y + normal * localDir.z);
-        
+
         payload.nextOrigin = hitPos + geometricNormal * 0.001;
-        payload.nextDirection = worldDir;
+        payload.nextDirection = sampledDir;
         return;
     }
 }
