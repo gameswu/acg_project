@@ -128,12 +128,17 @@ private:
             file.read(reinterpret_cast<char*>(texIndices.data()), sizeof(int32_t) * 4);
             materialTexIndices.push_back(texIndices);  // 暂存,稍后关联
             
-            // 材质层标志
+            // 材质层标志 (必须与 MaterialLayers.h 一致)
             uint32_t flags;
             file.read(reinterpret_cast<char*>(&flags), sizeof(flags));
 
-            // Transmission层
+            // Clearcoat层 (LAYER_CLEARCOAT = 0x01)
             if (flags & 0x01) {
+                // 暂不支持 - Python端目前也不导出数据
+            }
+            
+            // Transmission层 (LAYER_TRANSMISSION = 0x02)
+            if (flags & 0x02) {
                 float strength, transmissionIOR;
                 file.read(reinterpret_cast<char*>(&strength), sizeof(strength));
                 file.read(reinterpret_cast<char*>(&transmissionIOR), sizeof(transmissionIOR));
@@ -148,16 +153,35 @@ private:
                 mat->SetTransmissionLayer(transLayer);
             }
             
-            // Clearcoat层
-            if (flags & 0x02) {
-                // 跳过clearcoat数据（如果导出器写入了）
-                // 暂不支持
+            // Sheen层 (LAYER_SHEEN = 0x04)
+            if (flags & 0x04) {
+                // 暂不支持 - Python端目前也不导出数据
             }
             
-            // Sheen层
-            if (flags & 0x04) {
-                // 跳过sheen数据（如果导出器写入了）
-                // 暂不支持
+            // Subsurface层 (LAYER_SUBSURFACE = 0x08)
+            if (flags & 0x08) {
+                // 暂不支持 - Python端目前也不导出数据
+            }
+            
+            // Anisotropy层 (LAYER_ANISOTROPY = 0x10)
+            if (flags & 0x10) {
+                // 暂不支持 - Python端目前也不导出数据
+            }
+            
+            // Iridescence层 (LAYER_IRIDESCENCE = 0x20)
+            if (flags & 0x20) {
+                // 暂不支持 - Python端目前也不导出数据
+            }
+            
+            // Volume层 (LAYER_VOLUME = 0x40) - 32 bytes
+            if (flags & 0x40) {
+                VolumeLayer volumeLayer;
+                file.read(reinterpret_cast<char*>(&volumeLayer.scatterColor), sizeof(glm::vec3));      // 0-11
+                file.read(reinterpret_cast<char*>(&volumeLayer.scatterDistance), sizeof(float));       // 12-15
+                file.read(reinterpret_cast<char*>(&volumeLayer.absorptionColor), sizeof(glm::vec3));   // 16-27
+                file.read(reinterpret_cast<char*>(&volumeLayer.density), sizeof(float));               // 28-31
+                
+                mat->SetVolumeLayer(volumeLayer);
             }
 
             scene->AddMaterial(mat);

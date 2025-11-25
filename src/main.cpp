@@ -199,6 +199,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         // Initialize GUI state
         GUI::InitializeGUIState(g_guiState, g_exeDirectory);
         g_guiState.pLogMessages = &g_logMessages;
+        g_guiState.logCallback = AddLogMessage;
         
         // Load persistent configuration
         {

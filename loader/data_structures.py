@@ -92,13 +92,11 @@ class IridescenceLayer:
 
 @dataclass
 class VolumeLayer:
-    """Volume absorption layer"""
-    density: float = 0.0
-    anisotropy: float = 0.0
-    padding0: float = 0.0
-    padding1: float = 0.0
-    absorption_color: List[float] = field(default_factory=lambda: [1.0, 1.0, 1.0])
-    padding2: float = 0.0
+    """Volume scattering and absorption layer (32 bytes)"""
+    scatter_color: List[float] = field(default_factory=lambda: [1.0, 1.0, 1.0])  # 0-11: RGB scattering color
+    scatter_distance: float = 1.0                                                 # 12-15: Mean free path
+    absorption_color: List[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])  # 16-27: RGB absorption color
+    density: float = 1.0                                                          # 28-31: Density multiplier
 
 
 @dataclass

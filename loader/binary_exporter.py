@@ -65,20 +65,36 @@ class BinarySceneExporter:
             
             f.write(struct.pack('4i', base_tex_idx, normal_tex_idx, mr_tex_idx, emission_tex_idx))
             
-            # 材质层标志
+            # 材质层标志 (必须与 C++ MaterialLayers.h 一致)
             flags = 0
-            if mat.transmission:
-                flags |= 0x01
             if mat.clearcoat:
-                flags |= 0x02
+                flags |= 0x01  # LAYER_CLEARCOAT
+            if mat.transmission:
+                flags |= 0x02  # LAYER_TRANSMISSION
             if mat.sheen:
-                flags |= 0x04
+                flags |= 0x04  # LAYER_SHEEN
+            if mat.subsurface:
+                flags |= 0x08  # LAYER_SUBSURFACE
+            if mat.anisotropy:
+                flags |= 0x10  # LAYER_ANISOTROPY
+            if mat.iridescence:
+                flags |= 0x20  # LAYER_IRIDESCENCE
+            if mat.volume:
+                flags |= 0x40  # LAYER_VOLUME
             f.write(struct.pack('I', flags))
             
             # 扩展层数据（如果有）
             if mat.transmission:
                 t = mat.transmission
                 f.write(struct.pack('2f', t.strength, mat.ior))
+            
+            if mat.volume:
+                v = mat.volume
+                # VolumeLayer: 32 bytes (scatter_color[12] + scatter_distance[4] + absorption_color[12] + density[4])
+                f.write(struct.pack('3f', *v.scatter_color))        # 0-11: scatter color
+                f.write(struct.pack('f', v.scatter_distance))       # 12-15: scatter distance
+                f.write(struct.pack('3f', *v.absorption_color))     # 16-27: absorption color
+                f.write(struct.pack('f', v.density))                # 28-31: density
     
     def _write_textures(self, f: BinaryIO, textures: list):
         """写入纹理路径"""

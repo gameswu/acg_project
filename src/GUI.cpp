@@ -501,7 +501,9 @@ void RenderSettingsWindow(ACG::Renderer* renderer, GUIState& state, HWND hwnd) {
                     if (!pipe) {
                         std::lock_guard<std::mutex> lock(g_renderMutex);
                         state.conversionStatus = "✗ Failed to start conversion process";
-                        if (pLogMessages) {
+                        if (state.logCallback) {
+                            state.logCallback("[ERROR] Failed to start Python converter");
+                        } else if (pLogMessages) {
                             pLogMessages->push_back("[ERROR] Failed to start Python converter");
                         }
                         return;
@@ -519,7 +521,9 @@ void RenderSettingsWindow(ACG::Renderer* renderer, GUIState& state, HWND hwnd) {
                         // Only capture non-empty lines (Python ERROR logs)
                         if (!line.empty()) {
                             errorOutput += line + "\n";
-                            if (pLogMessages) {
+                            if (state.logCallback) {
+                                state.logCallback("[Python] " + line);
+                            } else if (pLogMessages) {
                                 std::lock_guard<std::mutex> lock(g_renderMutex);
                                 pLogMessages->push_back("[Python] " + line);
                             }
@@ -532,13 +536,19 @@ void RenderSettingsWindow(ACG::Renderer* renderer, GUIState& state, HWND hwnd) {
                     if (result == 0) {
                         state.conversionStatus = "Conversion successful!\n\nOutput file:\n" + outputAcgStr;
                         state.showConversionStatus = true;
-                        if (pLogMessages && errorOutput.empty()) {
-                            pLogMessages->push_back("[Info] Scene conversion completed: " + outputAcgStr);
+                        if (errorOutput.empty()) {
+                            if (state.logCallback) {
+                                state.logCallback("[Info] Scene conversion completed: " + outputAcgStr);
+                            } else if (pLogMessages) {
+                                pLogMessages->push_back("[Info] Scene conversion completed: " + outputAcgStr);
+                            }
                         }
                     } else {
                         state.conversionStatus = "Conversion failed!\n\nError code: " + std::to_string(result) + "\n\nCheck log window for details.";
                         state.showConversionStatus = true;
-                        if (pLogMessages) {
+                        if (state.logCallback) {
+                            state.logCallback("[ERROR] Conversion failed with exit code " + std::to_string(result));
+                        } else if (pLogMessages) {
                             pLogMessages->push_back("[ERROR] Conversion failed with exit code " + std::to_string(result));
                         }
                     }
@@ -546,7 +556,9 @@ void RenderSettingsWindow(ACG::Renderer* renderer, GUIState& state, HWND hwnd) {
                     std::lock_guard<std::mutex> lock(g_renderMutex);
                     state.conversionStatus = std::string("Conversion error!\n\n") + e.what();
                     state.showConversionStatus = true;
-                    if (pLogMessages) {
+                    if (state.logCallback) {
+                        state.logCallback(std::string("[ERROR] Conversion exception: ") + e.what());
+                    } else if (pLogMessages) {
                         pLogMessages->push_back(std::string("[ERROR] Conversion exception: ") + e.what());
                     }
                 }

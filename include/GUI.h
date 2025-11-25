@@ -3,6 +3,7 @@
 #include <Windows.h>
 #include <string>
 #include <vector>
+#include <functional>
 #include <d3d12.h>
 
 // Forward declarations
@@ -69,6 +70,9 @@ struct GUIState {
     
     // Pointers to external data
     std::vector<std::string>* pLogMessages = nullptr;
+    
+    // Callback for adding log messages (writes to both GUI and file)
+    std::function<void(const std::string&)> logCallback = nullptr;
 };
 
 // Initialize GUI state with default values
