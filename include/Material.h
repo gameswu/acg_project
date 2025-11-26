@@ -30,7 +30,7 @@ struct MaterialData {
     glm::vec4 baseColor_metallic;  // RGB diffuse color / albedo, W = metallic [0,1]
     glm::vec4 emission_roughness;  // RGB emission (HDR), W = roughness [0,1]
     glm::vec4 ior_opacity_flags_idx; // X=IOR, Y=opacity, Z=layerFlags(as float), W=extendedDataIndex(as float)
-    glm::vec4 texIndices;          // X=baseColorTex, Y=normalTex, Z=metallicRoughnessTex, W=emissionTex (all as floats, cast to int)
+    glm::vec4 texIndices;          // X=baseColorTex(int), Y=normalTex(int), Z=packed(mr:16|emission:16), W=packed(opacity:16|pad:16)
     
     // Constructor
     MaterialData() 
@@ -129,16 +129,19 @@ public:
     void SetNormalTexture(std::shared_ptr<Texture> texture, int32_t texIdx = -1);
     void SetMetallicRoughnessTexture(std::shared_ptr<Texture> texture, int32_t texIdx = -1);
     void SetEmissionTexture(std::shared_ptr<Texture> texture, int32_t texIdx = -1);
+    void SetOpacityTexture(std::shared_ptr<Texture> texture, int32_t texIdx = -1);
     
     std::shared_ptr<Texture> GetBaseColorTexture() const { return m_baseColorTexture; }
     std::shared_ptr<Texture> GetNormalTexture() const { return m_normalTexture; }
     std::shared_ptr<Texture> GetMetallicRoughnessTexture() const { return m_metallicRoughnessTexture; }
     std::shared_ptr<Texture> GetEmissionTexture() const { return m_emissionTexture; }
+    std::shared_ptr<Texture> GetOpacityTexture() const { return m_opacityTexture; }
     
     int32_t GetBaseColorTexIdx() const { return m_baseColorTexIdx; }
     int32_t GetNormalTexIdx() const { return m_normalTexIdx; }
     int32_t GetMetallicRoughnessTexIdx() const { return m_metallicRoughnessTexIdx; }
     int32_t GetEmissionTexIdx() const { return m_emissionTexIdx; }
+    int32_t GetOpacityTexIdx() const { return m_opacityTexIdx; }
     
     // Virtual texture support
     void SetTextureSize(const glm::vec2& size) { m_textureSize = size; }
@@ -174,11 +177,13 @@ protected:
     std::shared_ptr<Texture> m_normalTexture;
     std::shared_ptr<Texture> m_metallicRoughnessTexture;
     std::shared_ptr<Texture> m_emissionTexture;
+    std::shared_ptr<Texture> m_opacityTexture;
     
     int32_t m_baseColorTexIdx;
     int32_t m_normalTexIdx;
     int32_t m_metallicRoughnessTexIdx;
     int32_t m_emissionTexIdx;
+    int32_t m_opacityTexIdx;
     
     // Virtual texture
     glm::vec2 m_textureSize;

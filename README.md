@@ -23,9 +23,9 @@ We are planning to implement a GPU-based renderer that meets the following cours
 - Acceleration structure: Implement an acceleration structure such as BVH (Bounding Volume Hierarchy). This is not required for hardware-based renderers, as the acceleration structure is built-in in that case. (basic, Surface Area Heuristic or another advanced algorithm 2pts) :construction:
 - Material: Create a (non-trivial) custom material. Options include:
     - Transmissive material (basic) :white_check_mark:
-    - Principled BSDF (2pts) :x:
-    - Multi-layer material (2pts) :x:
-    - Rendering of fur, hair, skin, etc. (2pts) :x:
+    - Principled BSDF (2pts) :white_check_mark:
+    - Multi-layer material (2pts) :white_check_mark:
+    - Rendering of fur, hair, skin, etc. (2pts) :construction:
 - Texture: Create your own (non-trivial) texture with proper texture mapping. Options include:
     - Color texture (basic) :white_check_mark:
     - Normal map, height map, attribute map, or any functional texture mapping (1pt for each, up to 2pts) :construction:

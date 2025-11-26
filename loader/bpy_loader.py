@@ -99,18 +99,78 @@ if HAS_BPY:
             return self.scene
         
         def _extract_textures(self) -> Tuple[List[Texture], Dict[str, int]]:
-            """Extract textures from Blender images"""
+            """
+            Extract textures from Blender images (including packed images).
+            
+            Packed textures are exported to a temporary directory.
+            Note: Temporary files will persist until system cleanup.
+            The binary exporter will copy textures to the output location,
+            so temporary files are only needed during the conversion process.
+            """
+            import os
+            import tempfile
+            
             textures = []
             texture_map = {}
             
+            # Create temporary directory for packed textures
+            # Using mkdtemp ensures unique directory name to avoid conflicts
+            temp_dir = tempfile.mkdtemp(prefix="acg_packed_textures_")
+            logger.info(f"Extracting packed textures to: {temp_dir}")
+            
             for img in bpy.data.images:
-                if img.filepath:
-                    # Convert Blender path to absolute path
+                texture_path = None
+                
+                # Check if image is packed inside .blend file
+                if img.packed_file is not None:
+                    # Image is packed - extract it to temporary file
+                    logger.debug(f"Extracting packed texture: {img.name}")
+                    
+                    # Determine file extension from image format
+                    file_format = img.file_format.lower()
+                    if file_format == 'jpeg':
+                        ext = '.jpg'
+                    elif file_format in ['png', 'targa', 'tiff', 'bmp', 'jpeg2000', 'dpx', 'open_exr', 'hdr']:
+                        ext = '.' + file_format.replace('open_exr', 'exr').replace('jpeg2000', 'jp2')
+                    else:
+                        ext = '.png'  # Default to PNG
+                    
+                    # Create safe filename from image name
+                    safe_name = "".join(c if c.isalnum() or c in (' ', '_', '-') else '_' for c in img.name)
+                    temp_path = os.path.join(temp_dir, safe_name + ext)
+                    
+                    # Save packed image to temporary file
+                    # Use save_as() method with explicit filepath
+                    original_filepath = img.filepath_raw
+                    img.filepath_raw = temp_path
+                    try:
+                        img.save()
+                        texture_path = temp_path
+                        logger.debug(f"  Saved packed texture to: {temp_path}")
+                    except Exception as e:
+                        logger.error(f"  Failed to save packed texture {img.name}: {e}")
+                        img.filepath_raw = original_filepath
+                        continue
+                    finally:
+                        img.filepath_raw = original_filepath
+                
+                elif img.filepath:
+                    # External texture file - use absolute path
                     texture_path = bpy.path.abspath(img.filepath)
+                    logger.debug(f"External texture: {img.name} -> {texture_path}")
+                
+                else:
+                    # Generated or missing texture
+                    logger.warning(f"Texture {img.name} has no file path and is not packed, skipping")
+                    continue
+                
+                # Add texture to list
+                if texture_path and os.path.exists(texture_path):
                     texture = Texture(path=texture_path)
                     texture_map[img.name] = len(textures)
                     textures.append(texture)
-                    logger.debug(f"Texture: {img.name} -> {texture_path}")
+                else:
+                    logger.warning(f"Texture path does not exist: {texture_path}")
             
             return textures, texture_map
         
@@ -161,12 +221,13 @@ if HAS_BPY:
             
             # Helper to get value and check for texture connection
             def get_value_and_texture(socket_name: str, default_value, is_color=False):
-                """Get socket value and check for connected texture"""
+                """Get socket value and check for connected texture, with node tree traversal"""
                 if socket_name not in inputs:
                     return default_value, -1
                 
                 socket = inputs[socket_name]
                 texture_idx = -1
+                value = socket.default_value
                 
                 # Check if texture is connected
                 if socket.is_linked:
@@ -178,9 +239,179 @@ if HAS_BPY:
                         img_name = from_node.image.name
                         texture_idx = texture_map.get(img_name, -1)
                         logger.debug(f"  {socket_name} texture: {img_name} (idx={texture_idx})")
+                    
+                    # Traverse Mix nodes recursively to find textures or RGB values
+                    elif from_node.type in ['MIX', 'MIX_RGB', 'MIX_COLOR', 'MIXRGB']:
+                        logger.debug(f"  {socket_name} connected to {from_node.type} node, traversing inputs")
+                        
+                        # Recursive helper to find texture in node tree
+                        def find_texture_recursive(node, depth=0, max_depth=3):
+                            if depth > max_depth:
+                                return None
+                            
+                            # Check all inputs
+                            for inp_name in ['A', 'B', 'Color1', 'Color2', 'Fac', 'Factor', 'Value', '0', '1', '2']:
+                                if inp_name not in node.inputs:
+                                    continue
+                                inp_socket = node.inputs[inp_name]
+                                if not inp_socket.is_linked:
+                                    continue
+                                
+                                linked_node = inp_socket.links[0].from_node
+                                
+                                # Found texture node
+                                if linked_node.type == 'TEX_IMAGE' and linked_node.image:
+                                    return linked_node.image.name
+                                
+                                # Recursively search in math/mix nodes
+                                elif linked_node.type in ['MIX', 'MIX_RGB', 'MATH', 'VALTORGB', 'RGBTOBW', 'SEPRGB', 'COMBRGB']:
+                                    result = find_texture_recursive(linked_node, depth + 1, max_depth)
+                                    if result:
+                                        return result
+                            
+                            return None
+                        
+                        img_name = find_texture_recursive(from_node)
+                        if img_name:
+                            texture_idx = texture_map.get(img_name, -1)
+                            logger.debug(f"    Found texture via recursive search: {img_name} (idx={texture_idx})")
+                        
+                        # Extract base value from Mix node's A input
+                        # Blender 3.4+ Mix node has multiple input sets for different data types
+                        # For RGBA colors: indices 6='A' (color), 7='B' (color)
+                        # For Float: indices 2='A' (float), 3='B' (float)
+                        # For Vector: indices 4='A' (vector), 5='B' (vector)
+                        
+                        mix_a_input = None
+                        mix_b_input = None
+                        
+                        # Try to find color inputs (index 6 and 7 for RGBA)
+                        if len(from_node.inputs) >= 8:
+                            # New-style Mix node (Blender 3.4+) with multiple data type inputs
+                            # Check if color inputs (indices 6&7) are being used
+                            inp_6 = from_node.inputs[6] if len(from_node.inputs) > 6 else None
+                            inp_7 = from_node.inputs[7] if len(from_node.inputs) > 7 else None
+                            
+                            # Use color inputs if any is linked or if socket expects color
+                            use_color = is_color
+                            if inp_6 and inp_6.is_linked:
+                                use_color = True
+                            if inp_7 and inp_7.is_linked:
+                                use_color = True
+                            
+                            if use_color:
+                                # Use color inputs (6 and 7)
+                                mix_a_input = inp_6
+                                mix_b_input = inp_7
+                                logger.debug(f"    Using new Mix node color inputs: A[6] and B[7]")
+                            else:
+                                # Use float inputs (2 and 3)
+                                mix_a_input = from_node.inputs[2] if len(from_node.inputs) > 2 else None
+                                mix_b_input = from_node.inputs[3] if len(from_node.inputs) > 3 else None
+                                logger.debug(f"    Using new Mix node float inputs: A[2] and B[3]")
+                        else:
+                            # Old-style Mix node, try by name
+                            for inp_name in ['A', 'Color1', '6']:
+                                if inp_name in from_node.inputs:
+                                    mix_a_input = from_node.inputs[inp_name]
+                                    break
+                            for inp_name in ['B', 'Color2', '7']:
+                                if inp_name in from_node.inputs:
+                                    mix_b_input = from_node.inputs[inp_name]
+                                    break
+                        
+                        # Choose which input to use as base value
+                        # For Base Color: prefer the brighter value (B is often brighter than A)
+                        # For other properties: prefer A if not linked, otherwise B
+                        chosen_input = None
+                        if mix_a_input and mix_a_input.is_linked:
+                            # A is linked (might be texture), use B as base
+                            chosen_input = mix_b_input
+                            logger.debug(f"    A is linked, using B as base value")
+                        elif mix_b_input and mix_b_input.is_linked:
+                            # B is linked, use A as base
+                            chosen_input = mix_a_input
+                            logger.debug(f"    B is linked, using A as base value")
+                        else:
+                            # Neither linked - for colors, prefer the brighter one
+                            if is_color and mix_a_input and mix_b_input:
+                                if hasattr(mix_a_input, 'default_value') and hasattr(mix_b_input, 'default_value'):
+                                    a_val = mix_a_input.default_value
+                                    b_val = mix_b_input.default_value
+                                    if hasattr(a_val, '__len__') and hasattr(b_val, '__len__'):
+                                        # Calculate luminance
+                                        a_lum = (a_val[0] + a_val[1] + a_val[2]) / 3.0
+                                        b_lum = (b_val[0] + b_val[1] + b_val[2]) / 3.0
+                                        chosen_input = mix_b_input if b_lum > a_lum else mix_a_input
+                                        logger.debug(f"    Using {'B' if b_lum > a_lum else 'A'} (brighter) as base value")
+                                    else:
+                                        chosen_input = mix_a_input
+                                else:
+                                    chosen_input = mix_a_input
+                            else:
+                                # For scalars, use A
+                                chosen_input = mix_a_input
+                                logger.debug(f"    Using A as base value")
+                        
+                        if chosen_input:
+                            if chosen_input.is_linked:
+                                # Follow link to get value from connected node
+                                linked = chosen_input.links[0].from_node
+                                if linked.type == 'RGB' and hasattr(linked.outputs[0], 'default_value'):
+                                    rgb = linked.outputs[0].default_value
+                                    if hasattr(rgb, '__len__') and len(rgb) >= 3:
+                                        value = [float(rgb[0]), float(rgb[1]), float(rgb[2])]
+                                        logger.debug(f"    Using Mix input from RGB node: {value}")
+                                elif linked.type == 'VALUE' and hasattr(linked.outputs[0], 'default_value'):
+                                    value = float(linked.outputs[0].default_value)
+                                    logger.debug(f"    Using Mix input from Value node: {value}")
+                                elif linked.type == 'TEX_IMAGE' and linked.image:
+                                    # Input is textured, keep texture we found earlier
+                                    logger.debug(f"    Mix input is textured: {linked.image.name}")
+                            else:
+                                # Use input's default value
+                                if hasattr(chosen_input, 'default_value'):
+                                    inp_val = chosen_input.default_value
+                                    if is_color and hasattr(inp_val, '__len__') and len(inp_val) >= 3:
+                                        value = [float(inp_val[0]), float(inp_val[1]), float(inp_val[2])]
+                                        logger.debug(f"    Using Mix input default (color): {value}")
+                                    elif not is_color:
+                                        # For scalar socket, extract grayscale from color or use direct value
+                                        if hasattr(inp_val, '__len__') and len(inp_val) >= 3:
+                                            # Color array, convert to grayscale (average RGB)
+                                            value = float((inp_val[0] + inp_val[1] + inp_val[2]) / 3.0)
+                                            logger.debug(f"    Using Mix input default (color->gray): {value}")
+                                        else:
+                                            value = float(inp_val)
+                                            logger.debug(f"    Using Mix input default (scalar): {value}")
+                        # If no texture found, use socket's default_value (fallback)
+                    
+                    # Handle Math nodes
+                    elif from_node.type == 'MATH':
+                        logger.debug(f"  {socket_name} connected to MATH node, checking inputs")
+                        # Check if first input is a texture
+                        if 'Value' in from_node.inputs and from_node.inputs['Value'].is_linked:
+                            math_link = from_node.inputs['Value'].links[0]
+                            math_from = math_link.from_node
+                            if math_from.type == 'TEX_IMAGE' and math_from.image:
+                                img_name = math_from.image.name
+                                texture_idx = texture_map.get(img_name, -1)
+                                logger.debug(f"    Found texture in Math input: {img_name}")
+                    
+                    # Handle RGB/Value nodes
+                    elif from_node.type == 'RGB':
+                        if is_color and hasattr(from_node.outputs[0], 'default_value'):
+                            rgb = from_node.outputs[0].default_value
+                            if hasattr(rgb, '__len__') and len(rgb) >= 3:
+                                value = [float(rgb[0]), float(rgb[1]), float(rgb[2])]
+                                logger.debug(f"  {socket_name} from RGB node: {value}")
+                    
+                    elif from_node.type == 'VALUE':
+                        if not is_color and hasattr(from_node.outputs[0], 'default_value'):
+                            value = float(from_node.outputs[0].default_value)
+                            logger.debug(f"  {socket_name} from Value node: {value}")
                 
-                # Get default value
-                value = socket.default_value
+                # Format and return value
                 if is_color and hasattr(value, '__len__') and len(value) >= 3:
                     return [float(value[0]), float(value[1]), float(value[2])], texture_idx
                 elif not is_color:
@@ -222,8 +453,19 @@ if HAS_BPY:
             material.ior = ior
             
             # Alpha (opacity)
-            alpha, _ = get_value_and_texture('Alpha', 1.0)
+            alpha, alpha_tex_idx = get_value_and_texture('Alpha', 1.0)
+            
+            # Special handling: if opacity texture is found, set base opacity to 1.0
+            # The texture will modulate the opacity (this is the standard workflow)
+            if alpha_tex_idx >= 0:
+                logger.debug(f"  Opacity texture found (idx={alpha_tex_idx}), setting base opacity=1.0")
+                alpha = 1.0
+            
             material.opacity = alpha
+            material.opacity_texture = alpha_tex_idx
+            
+            if alpha_tex_idx >= 0:
+                logger.debug(f"  Opacity texture: index={alpha_tex_idx}")
             
             # Normal map
             if 'Normal' in inputs and inputs['Normal'].is_linked:
@@ -249,7 +491,7 @@ if HAS_BPY:
             self._extract_transmission(inputs, material)
             self._extract_clearcoat(inputs, material)
             self._extract_sheen(inputs, material)
-            self._extract_subsurface(inputs, material)
+            self._extract_subsurface(inputs, material, texture_map)
             self._extract_anisotropy(inputs, material)
             
             # Check for volume shader in material output
@@ -364,7 +606,7 @@ if HAS_BPY:
             
             logger.debug(f"  Sheen: strength={strength:.2f}, roughness={roughness:.2f}, color={color}")
         
-        def _extract_subsurface(self, inputs: dict, material: Material):
+        def _extract_subsurface(self, inputs: dict, material: Material, texture_map: Dict[str, int]):
             """Extract subsurface scattering layer"""
             if 'Subsurface' not in inputs and 'Subsurface Weight' not in inputs:
                 return
@@ -379,18 +621,50 @@ if HAS_BPY:
             if strength < 0.01:
                 return
             
-            # Subsurface scale/radius
+            # Subsurface scale/radius with texture support
             scale = 1.0
+            scale_tex_idx = -1
             if 'Subsurface Scale' in inputs:
-                scale = float(inputs['Subsurface Scale'].default_value)
+                socket = inputs['Subsurface Scale']
+                scale = float(socket.default_value)
+                
+                # Check for texture connection
+                if socket.is_linked:
+                    link = socket.links[0]
+                    from_node = link.from_node
+                    if from_node.type == 'TEX_IMAGE' and from_node.image:
+                        img_name = from_node.image.name
+                        scale_tex_idx = texture_map.get(img_name, -1)
+                        logger.debug(f"  Subsurface Scale texture: {img_name} (idx={scale_tex_idx})")
             
             # Subsurface radius (per-channel scattering distance)
             radius = 1.0
+            radius_scale = [1.0, 1.0, 1.0]
             if 'Subsurface Radius' in inputs:
-                rad = inputs['Subsurface Radius'].default_value
+                socket = inputs['Subsurface Radius']
+                rad = socket.default_value
+                
+                # PRIORITY: Use socket's default_value first (preserves per-channel RGB)
                 if hasattr(rad, '__len__') and len(rad) >= 3:
-                    # Use average of RGB channels
-                    radius = (float(rad[0]) + float(rad[1]) + float(rad[2])) / 3.0
+                    # Direct RGB value - this is the correct per-channel scattering!
+                    radius_scale = [float(rad[0]), float(rad[1]), float(rad[2])]
+                    radius = (radius_scale[0] + radius_scale[1] + radius_scale[2]) / 3.0
+                    logger.debug(f"  Subsurface Radius RGB: ({radius_scale[0]:.3f}, {radius_scale[1]:.3f}, {radius_scale[2]:.3f})")
+                # FALLBACK: Only check linked nodes if default_value is not RGB
+                elif socket.is_linked:
+                    link = socket.links[0]
+                    from_node = link.from_node
+                    if from_node.type == 'VALUE':
+                        # Single value for all channels
+                        radius = float(from_node.outputs[0].default_value)
+                        radius_scale = [radius, radius, radius]
+                        logger.debug(f"  Subsurface Radius (from Value node): {radius:.3f}")
+                    elif from_node.type == 'RGB':
+                        # RGB node with per-channel values
+                        rgb_val = from_node.outputs[0].default_value
+                        radius_scale = [float(rgb_val[0]), float(rgb_val[1]), float(rgb_val[2])]
+                        radius = (radius_scale[0] + radius_scale[1] + radius_scale[2]) / 3.0
+                        logger.debug(f"  Subsurface Radius (from RGB node): ({radius_scale[0]:.3f}, {radius_scale[1]:.3f}, {radius_scale[2]:.3f})")
             
             # Subsurface color
             color = material.base_color.copy()
@@ -400,15 +674,13 @@ if HAS_BPY:
                     color = [float(sss_color[0]), float(sss_color[1]), float(sss_color[2])]
             
             material.subsurface = SubsurfaceLayer(
-                strength=strength,
-                radius=radius,
-                scale=scale,
-                texture_index=-1,
                 color=color,
-                padding=0.0
+                radius=radius,
+                radius_scale=radius_scale,
+                strength=strength  # Save Subsurface Weight
             )
             
-            logger.debug(f"  Subsurface: strength={strength:.2f}, radius={radius:.2f}, scale={scale:.2f}")
+            logger.debug(f"  Subsurface: strength={strength:.2f}, radius={radius:.2f}, radius_scale={radius_scale}")
         
         def _extract_anisotropy(self, inputs: dict, material: Material):
             """Extract anisotropic reflection layer"""

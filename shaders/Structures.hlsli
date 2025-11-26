@@ -38,8 +38,8 @@ struct Material {
     // vec4 #3: ior_opacity_flags_idx (16 bytes)
     float4 ior_opacity_flags_idx; // 32-47: X=IOR, Y=opacity, Z=layerFlags(as float), W=extendedDataIndex(as float)
     
-    // vec4 #4: texIndices (16 bytes)
-    float4 texIndices;          // 48-63: X=baseColorTex, Y=normalTex, Z=metallicRoughnessTex, W=emissionTex (all as floats, cast to int)
+    // vec4 #4: texIndices (16 bytes) - packed layout
+    float4 texIndices;          // 48-63: X=baseColorTex(int32), Y=normalTex(int32), Z=packed(mr:16|emission:16), W=packed(opacity:16|pad:16)
     
     // Total: 64 bytes (4 x 16-byte vec4s)
     
@@ -53,11 +53,12 @@ struct Material {
     uint layerFlags() { return asuint(ior_opacity_flags_idx.z); }
     uint extendedDataIndex() { return asuint(ior_opacity_flags_idx.w); }
     
-    // Texture index helpers (reinterpret float as int)
+    // Texture index helpers - with 16-bit packing for indices Z and W
     int baseColorTexIdx() { return asint(texIndices.x); }
     int normalTexIdx() { return asint(texIndices.y); }
-    int metallicRoughnessTexIdx() { return asint(texIndices.z); }
-    int emissionTexIdx() { return asint(texIndices.w); }
+    int metallicRoughnessTexIdx() { uint packed = asuint(texIndices.z); return int(packed & 0xFFFF) - 32768; }  // Extract low 16 bits, convert from uint16 to int16
+    int emissionTexIdx() { uint packed = asuint(texIndices.z); return int(packed >> 16) - 32768; }  // Extract high 16 bits, convert from uint16 to int16
+    int opacityTexIdx() { uint packed = asuint(texIndices.w); return int(packed & 0xFFFF) - 32768; }  // Extract low 16 bits, convert from uint16 to int16
 };
 
 // ============================================================================
@@ -97,7 +98,7 @@ struct SubsurfaceLayer {
     float radius;               // 12-15
     
     float3 radiusScale;         // 16-27
-    float anisotropy;           // 28-31
+    float strength;             // 28-31: Subsurface weight
 };
 
 struct AnisotropyLayer {
@@ -171,6 +172,114 @@ struct Triangle {
     uint materialIndex;
     uint _pad_mat[3];
 };
+
+// ============================================================================
+// Material Layer Access Helpers (requires g_materialLayers buffer)
+// ============================================================================
+
+// Load VolumeLayer from extended data buffer
+VolumeLayer LoadVolumeLayer(uint extendedDataIndex, StructuredBuffer<MaterialExtendedData> layerBuffer)
+{
+    VolumeLayer vol;
+    MaterialExtendedData data = layerBuffer[extendedDataIndex];
+    
+    // Decode from float4x2 storage (32 bytes total)
+    vol.scatterColor = data.data0.xyz;       // 0-11: scatter color
+    vol.scatterDistance = data.data0.w;      // 12-15: scatter distance
+    vol.absorptionColor = data.data1.xyz;    // 16-27: absorption color
+    vol.density = data.data1.w;              // 28-31: density
+    
+    return vol;
+}
+
+// Load TransmissionLayer from extended data buffer
+TransmissionLayer LoadTransmissionLayer(uint extendedDataIndex, StructuredBuffer<MaterialExtendedData> layerBuffer)
+{
+    TransmissionLayer trans;
+    MaterialExtendedData data = layerBuffer[extendedDataIndex];
+    
+    trans.strength = data.data0.x;           // 0-3: strength
+    trans.roughness = data.data0.y;          // 4-7: roughness
+    trans.depth = data.data0.z;              // 8-11: depth
+    trans.textureIdx = asint(data.data0.w);  // 12-15: texture index
+    trans.color = data.data1.xyz;            // 16-27: color
+    
+    return trans;
+}
+
+// Load ClearcoatLayer from extended data buffer
+ClearcoatLayer LoadClearcoatLayer(uint extendedDataIndex, StructuredBuffer<MaterialExtendedData> layerBuffer)
+{
+    ClearcoatLayer coat;
+    MaterialExtendedData data = layerBuffer[extendedDataIndex];
+    
+    coat.strength = data.data0.x;            // 0-3: strength
+    coat.roughness = data.data0.y;           // 4-7: roughness
+    coat.ior = data.data0.z;                 // 8-11: IOR
+    coat.tint = data.data1.xyz;              // 16-27: tint
+    coat.textureIdx = asint(data.data1.w);   // 28-31: texture index
+    
+    return coat;
+}
+
+// Load SheenLayer from extended data buffer
+SheenLayer LoadSheenLayer(uint extendedDataIndex, StructuredBuffer<MaterialExtendedData> layerBuffer)
+{
+    SheenLayer sheen;
+    MaterialExtendedData data = layerBuffer[extendedDataIndex];
+    
+    sheen.color = data.data0.xyz;            // 0-11: color
+    sheen.roughness = data.data0.w;          // 12-15: roughness
+    sheen.tint = data.data1.xyz;             // 16-27: tint
+    sheen.textureIdx = asint(data.data1.w);  // 28-31: texture index
+    
+    return sheen;
+}
+
+// Load SubsurfaceLayer from extended data buffer
+SubsurfaceLayer LoadSubsurfaceLayer(uint extendedDataIndex, StructuredBuffer<MaterialExtendedData> layerBuffer)
+{
+    SubsurfaceLayer sss;
+    MaterialExtendedData data = layerBuffer[extendedDataIndex];
+    
+    sss.color = data.data0.xyz;              // 0-11: color
+    sss.radius = data.data0.w;               // 12-15: radius
+    sss.radiusScale = data.data1.xyz;        // 16-27: radius scale (per channel)
+    sss.strength = data.data1.w;             // 28-31: strength (subsurface weight)
+    
+    return sss;
+}
+
+// Load AnisotropyLayer from extended data buffer
+AnisotropyLayer LoadAnisotropyLayer(uint extendedDataIndex, StructuredBuffer<MaterialExtendedData> layerBuffer)
+{
+    AnisotropyLayer aniso;
+    MaterialExtendedData data = layerBuffer[extendedDataIndex];
+    
+    aniso.strength = data.data0.x;           // 0-3: strength
+    aniso.rotation = data.data0.y;           // 4-7: rotation (radians)
+    aniso.aspectRatio = data.data0.z;        // 8-11: aspect ratio
+    aniso.textureIdx = asint(data.data0.w);  // 12-15: texture index
+    aniso.tangent = data.data1.xyz;          // 16-27: tangent direction
+    
+    return aniso;
+}
+
+// Load IridescenceLayer from extended data buffer
+IridescenceLayer LoadIridescenceLayer(uint extendedDataIndex, StructuredBuffer<MaterialExtendedData> layerBuffer)
+{
+    IridescenceLayer irid;
+    MaterialExtendedData data = layerBuffer[extendedDataIndex];
+    
+    irid.strength = data.data0.x;                // 0-3: strength
+    irid.ior = data.data0.y;                     // 4-7: IOR of thin film
+    irid.thicknessMin = data.data0.z;            // 8-11: min thickness (nm)
+    irid.thicknessMax = data.data0.w;            // 12-15: max thickness (nm)
+    irid.textureIdx = asint(data.data1.x);       // 16-19: texture index
+    irid.thicknessTexIdx = asint(data.data1.y);  // 20-23: thickness texture index
+    
+    return irid;
+}
 
 struct Ray {
     float3 origin;

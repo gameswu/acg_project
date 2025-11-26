@@ -17,10 +17,12 @@ Material::Material()
     , m_normalTexture(nullptr)
     , m_metallicRoughnessTexture(nullptr)
     , m_emissionTexture(nullptr)
+    , m_opacityTexture(nullptr)
     , m_baseColorTexIdx(-1)
     , m_normalTexIdx(-1)
     , m_metallicRoughnessTexIdx(-1)
     , m_emissionTexIdx(-1)
+    , m_opacityTexIdx(-1)
 {
 }
 
@@ -156,11 +158,26 @@ MaterialData Material::ToGPUData() const {
     std::memcpy(&data.ior_opacity_flags_idx.z, &m_layerFlags, sizeof(uint32_t));
     std::memcpy(&data.ior_opacity_flags_idx.w, &m_extendedDataBaseIndex, sizeof(uint32_t));
     
-    // Pack texture indices (use memcpy to preserve bit pattern for int interpretation in shader)
+    // Pack texture indices with 16-bit packing for last 3 indices
+    // texIndices.x = baseColorTex (int32)
+    // texIndices.y = normalTex (int32)
+    // texIndices.z = packed(metallicRoughnessTex:16 | emissionTex:16)
+    // texIndices.w = packed(opacityTex:16 | padding:16)
+    
     std::memcpy(&data.texIndices.x, &m_baseColorTexIdx, sizeof(int32_t));
     std::memcpy(&data.texIndices.y, &m_normalTexIdx, sizeof(int32_t));
-    std::memcpy(&data.texIndices.z, &m_metallicRoughnessTexIdx, sizeof(int32_t));
-    std::memcpy(&data.texIndices.w, &m_emissionTexIdx, sizeof(int32_t));
+    
+    // Pack MR and Emission into Z (16-bit each)
+    // Convert int32 to int16 (clamp to int16 range)
+    int16_t mrTex16 = static_cast<int16_t>(std::max(-32768, std::min(32767, m_metallicRoughnessTexIdx)));
+    int16_t emissionTex16 = static_cast<int16_t>(std::max(-32768, std::min(32767, m_emissionTexIdx)));
+    uint32_t packedZ = (static_cast<uint16_t>(mrTex16 + 32768)) | (static_cast<uint32_t>(static_cast<uint16_t>(emissionTex16 + 32768)) << 16);
+    std::memcpy(&data.texIndices.z, &packedZ, sizeof(uint32_t));
+    
+    // Pack Opacity into W (16-bit, leave high 16 bits as padding)
+    int16_t opacityTex16 = static_cast<int16_t>(std::max(-32768, std::min(32767, m_opacityTexIdx)));
+    uint32_t packedW = static_cast<uint16_t>(opacityTex16 + 32768);  // High 16 bits = 0
+    std::memcpy(&data.texIndices.w, &packedW, sizeof(uint32_t));
     
     return data;
 }
@@ -252,6 +269,11 @@ void Material::SetMetallicRoughnessTexture(std::shared_ptr<Texture> texture, int
 void Material::SetEmissionTexture(std::shared_ptr<Texture> texture, int32_t texIdx) {
     m_emissionTexture = texture;
     m_emissionTexIdx = texIdx;
+}
+
+void Material::SetOpacityTexture(std::shared_ptr<Texture> texture, int32_t texIdx) {
+    m_opacityTexture = texture;
+    m_opacityTexIdx = texIdx;
 }
 
 } // namespace ACG

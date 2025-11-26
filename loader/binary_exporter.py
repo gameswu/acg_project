@@ -4,9 +4,14 @@ Binary Scene Exporter - 高性能二进制格式
 """
 
 import struct
+import shutil
+import os
 from pathlib import Path
 from typing import BinaryIO
 from data_structures import SceneData, Mesh, Material, Vertex
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class BinarySceneExporter:
@@ -18,6 +23,9 @@ class BinarySceneExporter:
     
     def export(self, scene: SceneData, output_path: str):
         """导出场景到二进制文件"""
+        self.output_path = Path(output_path)
+        self.texture_dir = self.output_path.parent / (self.output_path.stem + "_textures")
+        
         with open(output_path, 'wb') as f:
             self._write_header(f)
             self._write_materials(f, scene.materials)
@@ -47,7 +55,7 @@ class BinarySceneExporter:
             f.write(struct.pack('f', mat.ior))               # 4字节
             f.write(struct.pack('f', mat.opacity))           # 4字节
             
-            # 纹理索引（4个int，-1表示无纹理）
+            # 纹理索引（5个int，-1表示无纹理：base, normal, mr, emission, opacity）
             # 确保转换为整数，处理None和其他类型
             def to_texture_index(val):
                 if val is None or val == -1:
@@ -58,12 +66,13 @@ class BinarySceneExporter:
             normal_tex_idx = to_texture_index(mat.normal_texture)
             mr_tex_idx = to_texture_index(mat.metallic_roughness_texture)
             emission_tex_idx = to_texture_index(mat.emission_texture)
+            opacity_tex_idx = to_texture_index(getattr(mat, 'opacity_texture', -1))
             
             # Debug: print texture indices for materials with textures (disabled for silent mode)
-            # if base_tex_idx >= 0 or normal_tex_idx >= 0 or mr_tex_idx >= 0 or emission_tex_idx >= 0:
-            #     print(f"  Writing material '{mat.name}': texIndices=[{base_tex_idx}, {normal_tex_idx}, {mr_tex_idx}, {emission_tex_idx}]")
+            # if base_tex_idx >= 0 or normal_tex_idx >= 0 or mr_tex_idx >= 0 or emission_tex_idx >= 0 or opacity_tex_idx >= 0:
+            #     print(f"  Writing material '{mat.name}': texIndices=[{base_tex_idx}, {normal_tex_idx}, {mr_tex_idx}, {emission_tex_idx}, {opacity_tex_idx}]")
             
-            f.write(struct.pack('4i', base_tex_idx, normal_tex_idx, mr_tex_idx, emission_tex_idx))
+            f.write(struct.pack('5i', base_tex_idx, normal_tex_idx, mr_tex_idx, emission_tex_idx, opacity_tex_idx))
             
             # 材质层标志 (必须与 C++ MaterialLayers.h 一致)
             flags = 0
@@ -83,31 +92,141 @@ class BinarySceneExporter:
                 flags |= 0x40  # LAYER_VOLUME
             f.write(struct.pack('I', flags))
             
-            # 扩展层数据（如果有）
+            # 扩展层数据（按照标志位顺序写入）
+            # IMPORTANT: 写入顺序必须与C++ SceneLoader::LoadMaterials()读取顺序严格一致
+            
+            # 1. Clearcoat层 (LAYER_CLEARCOAT = 0x01) - 32 bytes
+            if mat.clearcoat:
+                c = mat.clearcoat
+                f.write(struct.pack('f', c.strength))           # 0-3: strength
+                f.write(struct.pack('f', c.roughness))          # 4-7: roughness
+                f.write(struct.pack('f', c.ior))                # 8-11: ior
+                f.write(struct.pack('f', 0.0))                  # 12-15: padding
+                f.write(struct.pack('3f', *c.color))            # 16-27: tint/color
+                f.write(struct.pack('i', c.texture_index))      # 28-31: textureIdx
+            
+            # 2. Transmission层 (LAYER_TRANSMISSION = 0x02) - 32 bytes
             if mat.transmission:
                 t = mat.transmission
-                f.write(struct.pack('2f', t.strength, mat.ior))
+                f.write(struct.pack('f', t.strength))           # 0-3: strength
+                f.write(struct.pack('f', t.roughness))          # 4-7: roughness
+                f.write(struct.pack('f', t.depth))              # 8-11: depth
+                f.write(struct.pack('i', t.texture_index))      # 12-15: textureIdx
+                f.write(struct.pack('3f', *t.color))            # 16-27: color
+                f.write(struct.pack('f', 0.0))                  # 28-31: padding
             
+            # 3. Sheen层 (LAYER_SHEEN = 0x04) - 32 bytes
+            if mat.sheen:
+                s = mat.sheen
+                f.write(struct.pack('3f', *s.color))            # 0-11: color
+                f.write(struct.pack('f', s.roughness))          # 12-15: roughness
+                f.write(struct.pack('3f', 1.0, 1.0, 1.0))       # 16-27: tint (default white)
+                f.write(struct.pack('i', s.texture_index))      # 28-31: textureIdx
+            
+            # 4. Subsurface层 (LAYER_SUBSURFACE = 0x08) - 32 bytes
+            if mat.subsurface:
+                ss = mat.subsurface
+                f.write(struct.pack('3f', *ss.color))           # 0-11: color
+                f.write(struct.pack('f', ss.radius))            # 12-15: radius
+                f.write(struct.pack('3f', *ss.radius_scale))    # 16-27: radius_scale
+                f.write(struct.pack('f', ss.strength))          # 28-31: strength
+            
+            # 5. Anisotropy层 (LAYER_ANISOTROPY = 0x10) - 32 bytes
+            if mat.anisotropy:
+                a = mat.anisotropy
+                f.write(struct.pack('f', a.strength))           # 0-3: strength
+                f.write(struct.pack('f', a.rotation))           # 4-7: rotation
+                f.write(struct.pack('f', 0.5))                  # 8-11: aspectRatio (default)
+                f.write(struct.pack('i', a.texture_index))      # 12-15: textureIdx
+                f.write(struct.pack('3f', *a.tangent))          # 16-27: tangent
+                f.write(struct.pack('f', 0.0))                  # 28-31: padding
+            
+            # 6. Iridescence层 (LAYER_IRIDESCENCE = 0x20) - 32 bytes
+            if mat.iridescence:
+                i = mat.iridescence
+                f.write(struct.pack('f', i.strength))           # 0-3: strength
+                f.write(struct.pack('f', i.ior))                # 4-7: ior
+                f.write(struct.pack('f', i.thickness))          # 8-11: thicknessMin (use single value)
+                f.write(struct.pack('f', i.thickness * 2.0))    # 12-15: thicknessMax (default 2x)
+                f.write(struct.pack('i', i.texture_index))      # 16-19: textureIdx
+                f.write(struct.pack('i', -1))                   # 20-23: thicknessTexIdx
+                f.write(struct.pack('2i', 0, 0))                # 24-31: padding
+            
+            # 7. Volume层 (LAYER_VOLUME = 0x40) - 32 bytes
             if mat.volume:
                 v = mat.volume
-                # VolumeLayer: 32 bytes (scatter_color[12] + scatter_distance[4] + absorption_color[12] + density[4])
                 f.write(struct.pack('3f', *v.scatter_color))        # 0-11: scatter color
                 f.write(struct.pack('f', v.scatter_distance))       # 12-15: scatter distance
                 f.write(struct.pack('3f', *v.absorption_color))     # 16-27: absorption color
                 f.write(struct.pack('f', v.density))                # 28-31: density
     
     def _write_textures(self, f: BinaryIO, textures: list):
-        """写入纹理路径"""
+        """
+        写入纹理路径，并复制纹理文件到输出目录旁边的纹理文件夹。
+        这确保了打包纹理在转换后仍然可用。
+        """
         f.write(struct.pack('I', len(textures)))
-        for texture in textures:
+        
+        # Create texture directory if needed
+        if textures and not self.texture_dir.exists():
+            self.texture_dir.mkdir(parents=True, exist_ok=True)
+            logger.info(f"Created texture directory: {self.texture_dir}")
+        
+        for i, texture in enumerate(textures):
             # Handle both Texture objects and string paths
             if hasattr(texture, 'path'):
-                tex_path = texture.path
+                source_path = texture.path
             else:
-                tex_path = str(texture)
+                source_path = str(texture)
+            
+            source_path = Path(source_path)
+            
+            # Copy texture to output directory if it exists
+            if source_path.exists():
+                # Generate destination path (preserve filename)
+                dest_filename = source_path.name
+                # Handle duplicate filenames by adding index
+                dest_path = self.texture_dir / dest_filename
+                counter = 1
+                while dest_path.exists() and not self._files_are_same(source_path, dest_path):
+                    stem = source_path.stem
+                    suffix = source_path.suffix
+                    dest_filename = f"{stem}_{counter}{suffix}"
+                    dest_path = self.texture_dir / dest_filename
+                    counter += 1
+                
+                # Copy file if not already there
+                if not dest_path.exists():
+                    try:
+                        shutil.copy2(source_path, dest_path)
+                        logger.debug(f"Copied texture [{i}]: {source_path.name} -> {dest_path}")
+                    except Exception as e:
+                        logger.warning(f"Failed to copy texture {source_path}: {e}")
+                        # Fall back to original path
+                        dest_path = source_path
+                
+                # Write relative path (relative to ACG file location)
+                try:
+                    relative_path = dest_path.relative_to(self.output_path.parent)
+                    tex_path = str(relative_path)
+                except ValueError:
+                    # Can't make relative path, use absolute
+                    tex_path = str(dest_path)
+            else:
+                # Source doesn't exist, write original path anyway
+                logger.warning(f"Texture file not found: {source_path}")
+                tex_path = str(source_path)
+            
             path_bytes = tex_path.encode('utf-8')
             f.write(struct.pack('I', len(path_bytes)))
             f.write(path_bytes)
+    
+    def _files_are_same(self, path1: Path, path2: Path) -> bool:
+        """Check if two files are identical"""
+        try:
+            return path1.stat().st_size == path2.stat().st_size
+        except:
+            return False
     
     def _write_meshes(self, f: BinaryIO, meshes: list):
         """写入网格数据"""

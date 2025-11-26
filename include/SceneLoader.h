@@ -49,7 +49,7 @@ public:
 
         // 读取材质、纹理、网格(先加载纹理,再关联到材质)
         std::vector<std::shared_ptr<Texture>> textures;
-        std::vector<std::array<int32_t, 4>> materialTexIndices;  // 暂存材质的纹理索引
+        std::vector<std::array<int32_t, 5>> materialTexIndices;  // 暂存材质的5个纹理索引(base, normal, mr, emission, opacity)
         LoadMaterials(file, scene.get(), materialTexIndices);
         LoadTextures(file, scene.get(), textures);
         
@@ -70,6 +70,9 @@ public:
             }
             if (texIndices[3] >= 0 && texIndices[3] < static_cast<int32_t>(textures.size())) {
                 mat->SetEmissionTexture(textures[texIndices[3]], texIndices[3]);
+            }
+            if (texIndices[4] >= 0 && texIndices[4] < static_cast<int32_t>(textures.size())) {
+                mat->SetOpacityTexture(textures[texIndices[4]], texIndices[4]);
             }
         }
         
@@ -95,7 +98,7 @@ private:
     }
 
     static void LoadMaterials(std::ifstream& file, Scene* scene, 
-                              std::vector<std::array<int32_t, 4>>& materialTexIndices) {
+                              std::vector<std::array<int32_t, 5>>& materialTexIndices) {
         uint32_t count;
         file.read(reinterpret_cast<char*>(&count), sizeof(count));
 
@@ -123,65 +126,101 @@ private:
             mat->SetIOR(ior);
             mat->SetOpacity(opacity);
 
-            // 纹理索引
-            std::array<int32_t, 4> texIndices;
-            file.read(reinterpret_cast<char*>(texIndices.data()), sizeof(int32_t) * 4);
+            // 纹理索引 - 读取5个索引(base, normal, mr, emission, opacity)
+            std::array<int32_t, 5> texIndices;
+            file.read(reinterpret_cast<char*>(texIndices.data()), sizeof(int32_t) * 5);
             materialTexIndices.push_back(texIndices);  // 暂存,稍后关联
             
             // 材质层标志 (必须与 MaterialLayers.h 一致)
             uint32_t flags;
             file.read(reinterpret_cast<char*>(&flags), sizeof(flags));
 
-            // Clearcoat层 (LAYER_CLEARCOAT = 0x01)
+            // CRITICAL: 层读取顺序必须与binary_exporter.py写入顺序严格一致
+            
+            // 1. Clearcoat层 (LAYER_CLEARCOAT = 0x01) - 32 bytes
             if (flags & 0x01) {
-                // 暂不支持 - Python端目前也不导出数据
+                ClearcoatLayer clearcoat;
+                file.read(reinterpret_cast<char*>(&clearcoat.strength), sizeof(float));       // 0-3
+                file.read(reinterpret_cast<char*>(&clearcoat.roughness), sizeof(float));      // 4-7
+                file.read(reinterpret_cast<char*>(&clearcoat.ior), sizeof(float));            // 8-11
+                file.read(reinterpret_cast<char*>(&clearcoat.padding0), sizeof(float));       // 12-15: padding
+                file.read(reinterpret_cast<char*>(&clearcoat.tint), sizeof(glm::vec3));       // 16-27
+                file.read(reinterpret_cast<char*>(&clearcoat.textureIdx), sizeof(int32_t));   // 28-31
+                
+                mat->SetClearcoatLayer(clearcoat);
             }
             
-            // Transmission层 (LAYER_TRANSMISSION = 0x02)
+            // 2. Transmission层 (LAYER_TRANSMISSION = 0x02) - 32 bytes
             if (flags & 0x02) {
-                float strength, transmissionIOR;
-                file.read(reinterpret_cast<char*>(&strength), sizeof(strength));
-                file.read(reinterpret_cast<char*>(&transmissionIOR), sizeof(transmissionIOR));
+                TransmissionLayer transmission;
+                file.read(reinterpret_cast<char*>(&transmission.strength), sizeof(float));    // 0-3
+                file.read(reinterpret_cast<char*>(&transmission.roughness), sizeof(float));   // 4-7
+                file.read(reinterpret_cast<char*>(&transmission.depth), sizeof(float));       // 8-11
+                file.read(reinterpret_cast<char*>(&transmission.textureIdx), sizeof(int32_t)); // 12-15
+                file.read(reinterpret_cast<char*>(&transmission.color), sizeof(glm::vec3));   // 16-27
+                file.read(reinterpret_cast<char*>(&transmission.padding0), sizeof(float));    // 28-31: padding
                 
-                TransmissionLayer transLayer;
-                transLayer.strength = strength;
-                transLayer.roughness = 0.0f;  // 默认值
-                transLayer.depth = 0.0f;
-                transLayer.textureIdx = -1;
-                transLayer.color = glm::vec3(1.0f);
-                
-                mat->SetTransmissionLayer(transLayer);
+                mat->SetTransmissionLayer(transmission);
             }
             
-            // Sheen层 (LAYER_SHEEN = 0x04)
+            // 3. Sheen层 (LAYER_SHEEN = 0x04) - 32 bytes
             if (flags & 0x04) {
-                // 暂不支持 - Python端目前也不导出数据
-            }
-            
-            // Subsurface层 (LAYER_SUBSURFACE = 0x08)
-            if (flags & 0x08) {
-                // 暂不支持 - Python端目前也不导出数据
-            }
-            
-            // Anisotropy层 (LAYER_ANISOTROPY = 0x10)
-            if (flags & 0x10) {
-                // 暂不支持 - Python端目前也不导出数据
-            }
-            
-            // Iridescence层 (LAYER_IRIDESCENCE = 0x20)
-            if (flags & 0x20) {
-                // 暂不支持 - Python端目前也不导出数据
-            }
-            
-            // Volume层 (LAYER_VOLUME = 0x40) - 32 bytes
-            if (flags & 0x40) {
-                VolumeLayer volumeLayer;
-                file.read(reinterpret_cast<char*>(&volumeLayer.scatterColor), sizeof(glm::vec3));      // 0-11
-                file.read(reinterpret_cast<char*>(&volumeLayer.scatterDistance), sizeof(float));       // 12-15
-                file.read(reinterpret_cast<char*>(&volumeLayer.absorptionColor), sizeof(glm::vec3));   // 16-27
-                file.read(reinterpret_cast<char*>(&volumeLayer.density), sizeof(float));               // 28-31
+                SheenLayer sheen;
+                file.read(reinterpret_cast<char*>(&sheen.color), sizeof(glm::vec3));          // 0-11
+                file.read(reinterpret_cast<char*>(&sheen.roughness), sizeof(float));          // 12-15
+                file.read(reinterpret_cast<char*>(&sheen.tint), sizeof(glm::vec3));           // 16-27
+                file.read(reinterpret_cast<char*>(&sheen.textureIdx), sizeof(int32_t));       // 28-31
                 
-                mat->SetVolumeLayer(volumeLayer);
+                mat->SetSheenLayer(sheen);
+            }
+            
+            // 4. Subsurface层 (LAYER_SUBSURFACE = 0x08) - 32 bytes
+            if (flags & 0x08) {
+                SubsurfaceLayer subsurface;
+                file.read(reinterpret_cast<char*>(&subsurface.color), sizeof(glm::vec3));          // 0-11
+                file.read(reinterpret_cast<char*>(&subsurface.radius), sizeof(float));             // 12-15
+                file.read(reinterpret_cast<char*>(&subsurface.radiusScale), sizeof(glm::vec3));    // 16-27
+                file.read(reinterpret_cast<char*>(&subsurface.strength), sizeof(float));           // 28-31
+                
+                mat->SetSubsurfaceLayer(subsurface);
+            }
+            
+            // 5. Anisotropy层 (LAYER_ANISOTROPY = 0x10) - 32 bytes
+            if (flags & 0x10) {
+                AnisotropyLayer anisotropy;
+                file.read(reinterpret_cast<char*>(&anisotropy.strength), sizeof(float));      // 0-3
+                file.read(reinterpret_cast<char*>(&anisotropy.rotation), sizeof(float));      // 4-7
+                file.read(reinterpret_cast<char*>(&anisotropy.aspectRatio), sizeof(float));   // 8-11
+                file.read(reinterpret_cast<char*>(&anisotropy.textureIdx), sizeof(int32_t));  // 12-15
+                file.read(reinterpret_cast<char*>(&anisotropy.tangent), sizeof(glm::vec3));   // 16-27
+                file.read(reinterpret_cast<char*>(&anisotropy.padding0), sizeof(float));      // 28-31: padding
+                
+                mat->SetAnisotropyLayer(anisotropy);
+            }
+            
+            // 6. Iridescence层 (LAYER_IRIDESCENCE = 0x20) - 32 bytes
+            if (flags & 0x20) {
+                IridescenceLayer iridescence;
+                file.read(reinterpret_cast<char*>(&iridescence.strength), sizeof(float));          // 0-3
+                file.read(reinterpret_cast<char*>(&iridescence.ior), sizeof(float));               // 4-7
+                file.read(reinterpret_cast<char*>(&iridescence.thicknessMin), sizeof(float));      // 8-11
+                file.read(reinterpret_cast<char*>(&iridescence.thicknessMax), sizeof(float));      // 12-15
+                file.read(reinterpret_cast<char*>(&iridescence.textureIdx), sizeof(int32_t));      // 16-19
+                file.read(reinterpret_cast<char*>(&iridescence.thicknessTexIdx), sizeof(int32_t)); // 20-23
+                file.read(reinterpret_cast<char*>(&iridescence.padding), sizeof(int32_t) * 2);     // 24-31: padding
+                
+                mat->SetIridescenceLayer(iridescence);
+            }
+            
+            // 7. Volume层 (LAYER_VOLUME = 0x40) - 32 bytes
+            if (flags & 0x40) {
+                VolumeLayer volume;
+                file.read(reinterpret_cast<char*>(&volume.scatterColor), sizeof(glm::vec3));      // 0-11
+                file.read(reinterpret_cast<char*>(&volume.scatterDistance), sizeof(float));       // 12-15
+                file.read(reinterpret_cast<char*>(&volume.absorptionColor), sizeof(glm::vec3));   // 16-27
+                file.read(reinterpret_cast<char*>(&volume.density), sizeof(float));               // 28-31
+                
+                mat->SetVolumeLayer(volume);
             }
 
             scene->AddMaterial(mat);

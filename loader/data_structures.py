@@ -60,13 +60,11 @@ class SheenLayer:
 
 @dataclass
 class SubsurfaceLayer:
-    """Subsurface scattering layer"""
-    strength: float = 0.0
-    radius: float = 1.0
-    scale: float = 1.0
-    texture_index: int = -1
-    color: List[float] = field(default_factory=lambda: [1.0, 1.0, 1.0])
-    padding: float = 0.0
+    """Subsurface scattering layer (32 bytes)"""
+    color: List[float] = field(default_factory=lambda: [1.0, 1.0, 1.0])  # 0-11: color
+    radius: float = 1.0                                                    # 12-15: mean free path
+    radius_scale: List[float] = field(default_factory=lambda: [1.0, 0.5, 0.3])  # 16-27: per-channel scaling
+    strength: float = 0.0                                                  # 28-31: subsurface weight (replaces anisotropy)
 
 
 @dataclass
@@ -119,11 +117,12 @@ class Material:
     layer_flags: int = 0  # Bit flags for enabled layers
     extended_data_index: int = 0  # Index into layer buffer
     
-    # Texture indices (16 bytes in C++)
+    # Texture indices (20 bytes in C++, packed to 16 bytes with uint16)
     base_color_texture: int = -1
     normal_texture: int = -1
     metallic_roughness_texture: int = -1
     emission_texture: int = -1
+    opacity_texture: int = -1  # New: opacity/alpha texture
     
     # Advanced layers (optional, 32 bytes each)
     clearcoat: Optional[ClearcoatLayer] = None
@@ -143,7 +142,7 @@ class Material:
             flags |= (1 << 1)  # LAYER_TRANSMISSION
         if self.sheen and self.sheen.strength > 0.0:
             flags |= (1 << 2)  # LAYER_SHEEN
-        if self.subsurface and self.subsurface.strength > 0.0:
+        if self.subsurface and self.subsurface.radius > 0.0:
             flags |= (1 << 3)  # LAYER_SUBSURFACE
         if self.anisotropy and self.anisotropy.strength > 0.0:
             flags |= (1 << 4)  # LAYER_ANISOTROPY

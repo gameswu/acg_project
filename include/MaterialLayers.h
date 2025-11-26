@@ -104,11 +104,11 @@ struct SubsurfaceLayer {
     float radius;                // 12-15: Mean free path
     
     glm::vec3 radiusScale;       // 16-27: Per-channel radius scaling
-    float anisotropy;            // 28-31: Scattering anisotropy [-1,1]
+    float strength;              // 28-31: Subsurface weight [0,1]
     
     SubsurfaceLayer()
         : color(1.0f, 0.8f, 0.7f), radius(1.0f), 
-          radiusScale(1.0f, 0.5f, 0.3f), anisotropy(0.0f) {}
+          radiusScale(1.0f, 0.5f, 0.3f), strength(0.0f) {}
 };
 static_assert(sizeof(SubsurfaceLayer) == 32, "SubsurfaceLayer must be 32 bytes");
 

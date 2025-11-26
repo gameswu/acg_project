@@ -205,6 +205,21 @@ float4 SampleVirtualTexture(int texIndex, float2 uv)
         return a2 / max(1e-7, denom);
     }
 
+    // Anisotropic GGX distribution
+    float D_GGX_Anisotropic(float3 H, float3 N, float3 T, float3 B, float alphaX, float alphaY)
+    {
+        float NdotH = max(dot(N, H), 0.0);
+        float TdotH = dot(T, H);
+        float BdotH = dot(B, H);
+        
+        float a2 = alphaX * alphaY;
+        float3 v = float3(alphaY * TdotH, alphaX * BdotH, a2 * NdotH);
+        float v2 = dot(v, v);
+        float w2 = a2 / v2;
+        
+        return a2 * w2 * w2 / PI;
+    }
+
     // Schlick-GGX geometry term (Smith masking-shadowing)
     float G_Smith(float NdotV, float NdotL, float alpha)
     {
@@ -352,7 +367,7 @@ float4 SampleVirtualTexture(int texIndex, float2 uv)
             float4 texColor;
             if (g_constants.useVirtualTextures == 1) texColor = SampleVirtualTexture(baseIdx, uv);
             else texColor = g_textures.SampleLevel(g_sampler, float3(uv, baseIdx), 0);
-            albedo = texColor.rgb;
+            albedo *= texColor.rgb;  // Modulate base color with texture (for Mix node workflows)
         }
 
         // Sample metallic-roughness texture if present (GLTF convention: G=roughness, B=metallic)
@@ -369,6 +384,194 @@ float4 SampleVirtualTexture(int texIndex, float2 uv)
         // Compute F0: mix dielectric F0 (from IOR) and metallic F0 (use albedo)
         float3 Fdie = DielectricF0FromIOR(mat.ior());
         F0 = lerp(Fdie, albedo, saturate(metallic));
+    }
+
+    // ============================================================================
+    // Volume Rendering - Homogeneous Volume Scattering
+    // ============================================================================
+    
+    // Sample volume scattering distance using Beer's law (exponential distribution)
+    // Returns true if scattering occurs within the ray segment, false if ray exits volume
+    bool SampleVolumeScattering(float scatterDistance, float density, float rayLength, inout uint rngState, out float t)
+    {
+        // Extinction coefficient (inverse mean free path)
+        float sigma_t = density / max(scatterDistance, 0.001f);
+        
+        // Sample distance from exponential distribution: t = -ln(1-xi) / sigma_t
+        float xi = Random(rngState);
+        t = -log(max(1.0 - xi, 1e-7)) / max(sigma_t, 1e-7);
+        
+        // Check if scattering occurs before ray exits volume
+        return t < rayLength;
+    }
+    
+    // Compute transmittance (Beer-Lambert law) for volume absorption
+    float3 VolumeTransmittance(float3 absorptionColor, float density, float distance, float scatterDistance)
+    {
+        // Absorption coefficient (per-channel for colored absorption)
+        // absorptionColor = 1 means no absorption, 0 means full absorption
+        float3 sigma_a = (1.0 - absorptionColor) * density / max(scatterDistance, 0.001f);
+        
+        // Beer-Lambert: T = exp(-sigma_a * distance)
+        return exp(-sigma_a * distance);
+    }
+    
+    // Henyey-Greenstein phase function for volume scattering
+    // g = anisotropy parameter: g=0 isotropic, g>0 forward, g<0 backward
+    float PhaseHenyeyGreenstein(float cosTheta, float g)
+    {
+        float g2 = g * g;
+        float denom = 1.0 + g2 - 2.0 * g * cosTheta;
+        return (1.0 - g2) / (4.0 * PI * pow(abs(denom), 1.5));
+    }
+    
+    // Sample Henyey-Greenstein phase function direction
+    float3 SamplePhaseHG(float3 incomingDir, float g, inout uint rngState)
+    {
+        float xi1 = Random(rngState);
+        float xi2 = Random(rngState);
+        
+        float cosTheta;
+        if (abs(g) < 1e-3) {
+            // Isotropic case
+            cosTheta = 1.0 - 2.0 * xi1;
+        } else {
+            // Anisotropic case
+            float sqrTerm = (1.0 - g * g) / (1.0 - g + 2.0 * g * xi1);
+            cosTheta = (1.0 + g * g - sqrTerm * sqrTerm) / (2.0 * g);
+        }
+        
+        float sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
+        float phi = 2.0 * PI * xi2;
+        
+        // Build coordinate system aligned with incoming direction
+        float3 w = -incomingDir; // Opposite of incoming for scattering
+        float3 tangent, bitangent;
+        CreateOrthonormalBasis(w, tangent, bitangent);
+        
+        // Construct scattered direction in local coordinates
+        float3 localDir = float3(sinTheta * cos(phi), sinTheta * sin(phi), cosTheta);
+        return normalize(tangent * localDir.x + bitangent * localDir.y + w * localDir.z);
+    }
+
+    // ============================================================================
+    // Sheen Layer - Fabric edge glow effect
+    // ============================================================================
+    
+    // Sheen BRDF using inverted Fresnel (peak at grazing angles)
+    // Based on "Production Friendly Microfacet Sheen BRDF" (Estevez & Kulla, 2017)
+    float3 EvaluateSheen(float3 N, float3 V, float3 L, float3 sheenColor, float sheenRoughness)
+    {
+        float NdotV = max(dot(N, V), 1e-5);
+        float NdotL = max(dot(N, L), 1e-5);
+        
+        // Half vector
+        float3 H = normalize(V + L);
+        float VdotH = max(dot(V, H), 0.0);
+        
+        // Inverted Fresnel: (1 - VdotH)^5 peaks at grazing angles
+        float FH = pow(1.0 - VdotH, 5.0);
+        
+        // Simple sheen distribution (can use more sophisticated models)
+        // Using inverted microfacet distribution for edge glow
+        float sheen = FH * (1.0 + sheenRoughness);
+        
+        return sheenColor * sheen / max(NdotV + NdotL, 1e-5);
+    }
+
+    // ============================================================================
+    // Subsurface Scattering - Simplified diffusion approximation
+    // ============================================================================
+    
+    // Subsurface BRDF using wrap-around diffuse lighting
+    // This is a simplified approximation - real SSS requires multi-bounce simulation
+    float3 EvaluateSubsurface(float3 N, float3 V, float3 L, float3 sssColor, float sssRadius, float3 radiusScale)
+    {
+        float NdotL = dot(N, L);
+        
+        // Wrap-around lighting: allows light to "wrap" around edges
+        // Simulates light penetrating and scattering inside the material
+        float wrap = 0.5; // Amount of wrap (0.5 = moderate subsurface effect)
+        float wrapNdotL = (NdotL + wrap) / ((1.0 + wrap) * (1.0 + wrap));
+        wrapNdotL = max(wrapNdotL, 0.0);
+        
+        // Per-channel attenuation based on radius scale
+        // Different wavelengths penetrate different depths (red goes deeper in skin)
+        float3 attenuation = exp(-radiusScale / max(sssRadius, 0.001));
+        
+        // Subsurface diffuse with color filtering
+        return sssColor * wrapNdotL * attenuation / PI;
+    }
+
+    // ============================================================================
+    // Anisotropic Specular - Stretched highlights for brushed metal, hair, etc.
+    // ============================================================================
+    
+    // Evaluate anisotropic GGX BRDF
+    float3 EvaluateAnisotropicSpecular(float3 N, float3 V, float3 L, float3 tangent, float alphaX, float alphaY, float3 F0)
+    {
+        // Build anisotropic coordinate frame
+        float3 T = normalize(tangent - N * dot(tangent, N)); // Ensure orthogonal to N
+        float3 B = cross(N, T);
+        
+        float3 H = normalize(V + L);
+        float NdotV = max(dot(N, V), 1e-5);
+        float NdotL = max(dot(N, L), 1e-5);
+        float VdotH = max(dot(V, H), 0.0);
+        
+        // Anisotropic GGX distribution
+        float D = D_GGX_Anisotropic(H, N, T, B, alphaX, alphaY);
+        
+        // Geometry term (using average alpha for simplicity)
+        float avgAlpha = (alphaX + alphaY) * 0.5;
+        float G = G_Smith(NdotV, NdotL, avgAlpha);
+        
+        // Fresnel term
+        float3 F = FresnelSchlick(F0, VdotH);
+        
+        // Cook-Torrance BRDF
+        return (D * G * F) / max(1e-7, 4.0 * NdotV * NdotL);
+    }
+
+    // ============================================================================
+    // Iridescence - Thin film interference (soap bubbles, oil slicks, CD discs)
+    // ============================================================================
+    
+    // Compute thin film interference color based on viewing angle and thickness
+    // Based on Abbe's sine condition and constructive/destructive interference
+    float3 ThinFilmInterference(float cosTheta, float filmThickness, float filmIOR, float baseIOR)
+    {
+        // Optical path difference (OPD) through thin film
+        // OPD = 2 * n * d * cos(theta_t) where theta_t is refracted angle
+        float sinTheta2 = (baseIOR / filmIOR) * (baseIOR / filmIOR) * (1.0 - cosTheta * cosTheta);
+        float cosTheta_t = sqrt(max(0.0, 1.0 - sinTheta2));
+        float opd = 2.0 * filmIOR * filmThickness * cosTheta_t;
+        
+        // Phase shift for each wavelength (RGB approximation)
+        // Visible spectrum: R~650nm, G~550nm, B~450nm
+        float3 wavelengths = float3(650.0, 550.0, 450.0); // nanometers
+        float3 phase = (2.0 * PI * opd) / wavelengths;
+        
+        // Constructive/destructive interference using cosine
+        // cos(phase) = 1 for constructive, -1 for destructive
+        float3 interference = (cos(phase) + 1.0) * 0.5; // Map [-1,1] to [0,1]
+        
+        return interference;
+    }
+    
+    // Evaluate iridescence Fresnel with thin film modulation
+    float3 FresnelIridescence(float3 F0, float cosTheta, float filmThickness, float filmIOR, float strength)
+    {
+        // Base Fresnel
+        float3 baseF = FresnelSchlick(F0, cosTheta);
+        
+        // Thin film interference color
+        float3 filmColor = ThinFilmInterference(cosTheta, filmThickness, filmIOR, 1.0);
+        
+        // Modulate Fresnel by film color
+        float3 iridF = baseF * lerp(float3(1, 1, 1), filmColor, strength);
+        
+        return iridF;
     }
 
 
@@ -561,6 +764,50 @@ void ClosestHit(inout RadiancePayload payload, in BuiltInTriangleIntersectionAtt
     }
     normal = normalize(normal);
     
+    // Compute tangent space for anisotropic materials
+    // Use UV derivatives to compute tangent and bitangent
+    float2 deltaUV1 = uv1 - uv0;
+    float2 deltaUV2 = uv2 - uv0;
+    float r = 1.0 / max(abs(deltaUV1.x * deltaUV2.y - deltaUV1.y * deltaUV2.x), 1e-6);
+    float3 tangent = normalize((edge1 * deltaUV2.y - edge2 * deltaUV1.y) * r);
+    // Gram-Schmidt orthogonalization to ensure tangent is perpendicular to normal
+    tangent = normalize(tangent - normal * dot(tangent, normal));
+    
+    // Sample opacity/alpha texture if present
+    float alpha = mat.opacity();
+    int opacityTexIdx = mat.opacityTexIdx();
+    if (opacityTexIdx >= 0) {
+        float4 opacityTex;
+        if (g_constants.useVirtualTextures == 1) {
+            opacityTex = SampleVirtualTexture(opacityTexIdx, texCoord);
+        } else {
+            opacityTex = g_textures.SampleLevel(g_sampler, float3(texCoord, opacityTexIdx), 0);
+        }
+        
+        // Use average of RGB channels or alpha channel as opacity
+        // For grayscale opacity maps, all RGB channels should be same
+        alpha *= (opacityTex.r + opacityTex.g + opacityTex.b) / 3.0;
+    }
+    
+    // Alpha test for transparent/cutout materials
+    // For clouds, we need stochastic alpha testing to create volume-like appearance
+    if (alpha < 0.99) {
+        // Stochastic alpha testing: randomly terminate ray based on alpha value
+        // This creates a volume-like appearance through probabilistic transparency
+        float alphaRand = Random(payload.rngState);
+        
+        // Softer threshold for cloud-like materials (SSS + low alpha)
+        // Use alpha^2 to make transition more gradual
+        float alphaThreshold = alpha * alpha;
+        
+        if (alphaRand > alphaThreshold) {
+            // Ray passes through - continue in same direction
+            payload.nextOrigin = hitPos + rayDir * 0.001;
+            payload.nextDirection = rayDir;
+            return;
+        }
+    }
+    
     // Add emission from this surface
     payload.radiance += payload.throughput * mat.emission();
     
@@ -577,8 +824,63 @@ void ClosestHit(inout RadiancePayload payload, in BuiltInTriangleIntersectionAtt
     
     // ========== MATERIAL TYPE CLASSIFICATION ==========
     // New PBR material system: use layer flags and properties
+    
+    // Check for volume layer (participatory media like fog/smoke/clouds)
+    bool hasVolume = (mat.layerFlags() & LAYER_VOLUME) != 0;
+    
     // Check for transmission layer (glass/transparent materials)
     bool hasTransmission = (mat.layerFlags() & LAYER_TRANSMISSION) != 0;
+    
+    // Handle volume rendering (highest priority - affects ray path inside volumes)
+    if (hasVolume) {
+        // Load volume properties from extended data
+        // CRITICAL: Calculate correct layer index based on layer flags ordering
+        uint layerIdx = mat.extendedDataIndex();
+        uint flags = mat.layerFlags();
+        
+        // Count layers before VOLUME (0x40) to compute offset
+        // Layer order in Scene::CollectAllMaterialLayers():
+        // Clearcoat(0x01) -> Transmission(0x02) -> Sheen(0x04) -> Subsurface(0x08) -> Anisotropy(0x10) -> Iridescence(0x20) -> Volume(0x40)
+        uint layerOffset = 0;
+        if (flags & LAYER_CLEARCOAT) layerOffset++;
+        if (flags & LAYER_TRANSMISSION) layerOffset++;
+        if (flags & LAYER_SHEEN) layerOffset++;
+        if (flags & LAYER_SUBSURFACE) layerOffset++;
+        if (flags & LAYER_ANISOTROPY) layerOffset++;
+        if (flags & LAYER_IRIDESCENCE) layerOffset++;
+        
+        VolumeLayer vol = LoadVolumeLayer(layerIdx + layerOffset, g_materialLayers);
+        
+        // Sample scattering distance
+        float scatterDist;
+        bool scattered = SampleVolumeScattering(vol.scatterDistance, vol.density, t, payload.rngState, scatterDist);
+        
+        if (scattered) {
+            // Scattering event inside volume
+            float3 scatterPos = rayOrigin + rayDir * scatterDist;
+            
+            // Apply transmittance up to scattering point
+            float3 transmittance = VolumeTransmittance(vol.absorptionColor, vol.density, scatterDist, vol.scatterDistance);
+            payload.throughput *= transmittance * vol.scatterColor;
+            
+            // Sample phase function for new direction (using isotropic scattering g=0)
+            float3 newDir = SamplePhaseHG(rayDir, 0.0, payload.rngState);
+            
+            // Continue ray from scattering position
+            payload.nextOrigin = scatterPos;
+            payload.nextDirection = newDir;
+            
+            // Don't terminate - continue tracing through volume
+            return;
+        } else {
+            // No scattering - ray exits volume at surface
+            // Apply full transmittance through volume segment
+            float3 transmittance = VolumeTransmittance(vol.absorptionColor, vol.density, t, vol.scatterDistance);
+            payload.throughput *= transmittance;
+            
+            // Continue with surface interaction (fall through to transmission/BSDF)
+        }
+    }
     
     // Handle refractive/transmissive materials
     if (hasTransmission) {
@@ -640,15 +942,17 @@ void ClosestHit(inout RadiancePayload payload, in BuiltInTriangleIntersectionAtt
         if (rand < fresnel || k < 0.0) {
             // Total internal reflection or Fresnel reflection
             float3 reflectDir = reflect(rayDir, N);
-            // Offset origin away from surface in ray direction hemisphere
-            payload.nextOrigin = dot(rayDir, geometricNormal) > 0.0 ? hitPos + offset : hitPos - offset;
+            // Use geometric normal for consistent offset direction
+            bool entering = dot(rayDir, geometricNormal) < 0.0;
+            payload.nextOrigin = entering ? hitPos - offset : hitPos + offset;
             payload.nextDirection = reflectDir;
             // throughput unchanged except by reflectance (handled elsewhere)
         } else {
             // Refraction
             // Determine current and target IOR from payload stack
             float iorCurrent = payload.iorStack[payload.iorStackTop];
-            bool entering = dot(rayDir, normal) < 0.0; // entering if ray goes against normal
+            // Use geometric normal for robust entering/exiting detection
+            bool entering = dot(rayDir, geometricNormal) < 0.0; // entering if ray goes against geometric normal
             float iorTarget = entering ? mat.ior() : (payload.iorStackTop > 0 ? payload.iorStack[payload.iorStackTop - 1] : 1.0f);
 
             float etaLocal = iorCurrent / iorTarget;
@@ -656,12 +960,14 @@ void ClosestHit(inout RadiancePayload payload, in BuiltInTriangleIntersectionAtt
             // If total internal reflection detected here, fallback to reflection
             if (kLocal < 0.0) {
                 float3 reflectDir = reflect(rayDir, N);
-                payload.nextOrigin = dot(rayDir, geometricNormal) > 0.0 ? hitPos + offset : hitPos - offset;
+                // Always offset away from surface along geometric normal
+                payload.nextOrigin = entering ? hitPos - offset : hitPos + offset;
                 payload.nextDirection = reflectDir;
             } else {
                 float3 refractDir = etaLocal * rayDir + (etaLocal * cosI - sqrt(kLocal)) * N;
                 payload.nextDirection = refractDir;
-                payload.nextOrigin = dot(rayDir, geometricNormal) > 0.0 ? hitPos + offset : hitPos - offset;
+                // Always offset away from surface along geometric normal
+                payload.nextOrigin = entering ? hitPos - offset : hitPos + offset;
 
                 // Update IOR stack: push on entering, pop on exiting
                 if (entering) {
@@ -680,6 +986,9 @@ void ClosestHit(inout RadiancePayload payload, in BuiltInTriangleIntersectionAtt
     }
     // Use Principled BSDF sampling/evaluation for non-transmission materials
     else {
+        // Check for clearcoat layer
+        bool hasClearcoat = (mat.layerFlags() & LAYER_CLEARCOAT) != 0;
+        
         // Fetch material parameters (albedo, metallic, roughness, F0)
         float3 albedo;
         float metallic;
@@ -689,6 +998,68 @@ void ClosestHit(inout RadiancePayload payload, in BuiltInTriangleIntersectionAtt
 
         // View vector (pointing from surface toward camera)
         float3 V = -rayDir;
+        
+        // ========== CLEARCOAT LAYER HANDLING ==========
+        if (hasClearcoat) {
+            // Load clearcoat properties
+            // Clearcoat is always first layer (offset = 0)
+            uint layerIdx = mat.extendedDataIndex();
+            ClearcoatLayer coat = LoadClearcoatLayer(layerIdx, g_materialLayers);
+            
+            // Compute clearcoat Fresnel weight at current angle
+            float NdotV = max(dot(normal, V), 0.0);
+            float F0_coat = ((coat.ior - 1.0) / (coat.ior + 1.0));
+            F0_coat = F0_coat * F0_coat;
+            float fresnel_coat = F0_coat + (1.0 - F0_coat) * pow(1.0 - NdotV, 5.0);
+            float coatWeight = coat.strength * fresnel_coat;
+            
+            // Use Russian Roulette to choose between clearcoat and base layer
+            float clearcoatProb = saturate(coatWeight);
+            float rClearcoat = Random(payload.rngState);
+            
+            if (rClearcoat < clearcoatProb) {
+                // ===== Sample clearcoat layer (specular GGX) =====
+                float3 sampledDir;
+                float samplePdf;
+                SampleGGX_Direction(normal, V, coat.roughness, payload.rngState, sampledDir, samplePdf);
+                
+                float NdotL = max(dot(normal, sampledDir), 0.0);
+                if (NdotL <= 0.0 || samplePdf <= 0.0) {
+                    payload.terminated = true;
+                    return;
+                }
+                
+                // Evaluate clearcoat specular BRDF (GGX with clearcoat IOR)
+                float3 coatF0 = float3(F0_coat, F0_coat, F0_coat);
+                float3 coatBRDF = Specular_GGX(normal, V, sampledDir, coat.roughness, coatF0);
+                
+                // Apply clearcoat tint
+                coatBRDF *= coat.tint;
+                
+                // Update throughput: f * cosTheta / pdf / selectionProb
+                payload.throughput *= coatBRDF * NdotL / samplePdf / clearcoatProb;
+                
+                payload.nextOrigin = hitPos + geometricNormal * 0.001;
+                payload.nextDirection = sampledDir;
+                return;
+            } else {
+                // ===== Sample base layer (with clearcoat attenuation) =====
+                // Energy that passes through clearcoat reduces base layer contribution
+                float baseProb = 1.0 - clearcoatProb;
+                
+                // Continue to base layer sampling (same as before, but adjust throughput)
+                // The base layer sees less energy due to clearcoat reflection
+                // This is implicitly handled by the Russian Roulette probability
+                // We'll adjust throughput by 1/baseProb to account for selection probability
+                
+                // [Fall through to base layer sampling below]
+                // Adjust initial throughput factor
+                float baseThroughputFactor = 1.0 / max(baseProb, 0.01);
+                payload.throughput *= (1.0 - coatWeight) * baseThroughputFactor;
+            }
+        }
+        
+        // ========== BASE LAYER SAMPLING (Original BSDF) ==========
 
         // Decide between specular (GGX) and diffuse sampling
         // Weight specular more when metallic is high or roughness is low
@@ -726,6 +1097,130 @@ void ClosestHit(inout RadiancePayload payload, in BuiltInTriangleIntersectionAtt
         float3 f;
         float dummyPdf;
         EvaluatePrincipledBSDF(normal, V, sampledDir, albedo, metallic, roughness, F0, f, dummyPdf);
+        
+        // ========== APPLY IRIDESCENCE TO FRESNEL ==========
+        bool hasIridescence = (mat.layerFlags() & LAYER_IRIDESCENCE) != 0;
+        if (hasIridescence) {
+            // Load iridescence properties
+            uint layerIdx = mat.extendedDataIndex();
+            uint flags = mat.layerFlags();
+            uint layerOffset = 0;
+            if (flags & LAYER_CLEARCOAT) layerOffset++;
+            if (flags & LAYER_TRANSMISSION) layerOffset++;
+            if (flags & LAYER_SHEEN) layerOffset++;
+            if (flags & LAYER_SUBSURFACE) layerOffset++;
+            if (flags & LAYER_ANISOTROPY) layerOffset++;
+            // Iridescence is 6th layer in order
+            IridescenceLayer irid = LoadIridescenceLayer(layerIdx + layerOffset, g_materialLayers);
+            
+            // Use average thickness (can sample texture for variation)
+            float thickness = (irid.thicknessMin + irid.thicknessMax) * 0.5;
+            
+            // Compute view-dependent iridescent Fresnel
+            float NdotV = max(dot(normal, V), 0.0);
+            float3 iridF = FresnelIridescence(F0, NdotV, thickness, irid.ior, irid.strength);
+            
+            // Modulate specular component by iridescent Fresnel
+            // Approximate: scale entire BRDF by Fresnel ratio (iridF / baseF)
+            float3 baseF = FresnelSchlick(F0, NdotV);
+            float3 fresnelRatio = iridF / max(baseF, 1e-5);
+            
+            // Apply to specular-like materials (high metallic/low roughness)
+            float iridWeight = saturate(metallic + (1.0 - roughness) * 0.5);
+            f *= lerp(float3(1, 1, 1), fresnelRatio, iridWeight * irid.strength);
+        }
+        
+        // ========== ADD SHEEN LAYER CONTRIBUTION ==========
+        bool hasSheen = (mat.layerFlags() & LAYER_SHEEN) != 0;
+        if (hasSheen) {
+            // Load sheen properties
+            uint layerIdx = mat.extendedDataIndex();
+            uint flags = mat.layerFlags();
+            uint layerOffset = 0;
+            if (flags & LAYER_CLEARCOAT) layerOffset++;
+            if (flags & LAYER_TRANSMISSION) layerOffset++;
+            // Sheen is 3rd layer in order
+            SheenLayer sheen = LoadSheenLayer(layerIdx + layerOffset, g_materialLayers);
+            
+            // Evaluate sheen BRDF and add to base BRDF
+            float3 sheenBRDF = EvaluateSheen(normal, V, sampledDir, sheen.color, sheen.roughness);
+            
+            // Apply sheen tint
+            sheenBRDF *= sheen.tint;
+            
+            // Add sheen contribution to total BRDF
+            f += sheenBRDF;
+        }
+        
+        // ========== ADD SUBSURFACE SCATTERING CONTRIBUTION ==========
+        bool hasSubsurface = (mat.layerFlags() & LAYER_SUBSURFACE) != 0;
+        if (hasSubsurface) {
+            // Load subsurface properties
+            uint layerIdx = mat.extendedDataIndex();
+            uint flags = mat.layerFlags();
+            uint layerOffset = 0;
+            if (flags & LAYER_CLEARCOAT) layerOffset++;
+            if (flags & LAYER_TRANSMISSION) layerOffset++;
+            if (flags & LAYER_SHEEN) layerOffset++;
+            // Subsurface is 4th layer in order
+            SubsurfaceLayer sss = LoadSubsurfaceLayer(layerIdx + layerOffset, g_materialLayers);
+            
+            // Evaluate subsurface BRDF
+            float3 sssBRDF = EvaluateSubsurface(normal, V, sampledDir, sss.color, sss.radius, sss.radiusScale);
+            
+            // Mix subsurface with base BRDF based on Subsurface Weight
+            // When strength=0, use base BRDF; when strength=1, use pure SSS
+            float3 baseDiffuse = (1.0 - metallic) * Diffuse_Burley(albedo, normal, V, sampledDir);
+            float3 specular = Specular_GGX(normal, V, sampledDir, roughness, F0);
+            
+            // Replace diffuse component with SSS based on strength
+            float3 mixedDiffuse = lerp(baseDiffuse, sssBRDF, saturate(sss.strength));
+            
+            // For high SSS strength (cloud-like materials), reduce specular contribution
+            // This prevents mirror-like appearance on volumetric surfaces
+            float specularWeight = saturate(1.0 - sss.strength * 0.8);
+            f = specular * specularWeight + mixedDiffuse;
+        }
+        
+        // ========== MODIFY SPECULAR FOR ANISOTROPY ==========
+        bool hasAnisotropy = (mat.layerFlags() & LAYER_ANISOTROPY) != 0;
+        if (hasAnisotropy) {
+            // Load anisotropy properties
+            uint layerIdx = mat.extendedDataIndex();
+            uint flags = mat.layerFlags();
+            uint layerOffset = 0;
+            if (flags & LAYER_CLEARCOAT) layerOffset++;
+            if (flags & LAYER_TRANSMISSION) layerOffset++;
+            if (flags & LAYER_SHEEN) layerOffset++;
+            if (flags & LAYER_SUBSURFACE) layerOffset++;
+            // Anisotropy is 5th layer in order
+            AnisotropyLayer aniso = LoadAnisotropyLayer(layerIdx + layerOffset, g_materialLayers);
+            
+            // Compute anisotropic roughness parameters
+            float aspect = aniso.aspectRatio;
+            float alphaX = roughness;
+            float alphaY = roughness * aspect;
+            
+            // Rotate tangent by anisotropy rotation
+            float cosRot = cos(aniso.rotation);
+            float sinRot = sin(aniso.rotation);
+            float3 rotTangent = tangent * cosRot + cross(normal, tangent) * sinRot;
+            
+            // Use anisotropic tangent from material if provided, otherwise use computed
+            float3 anisoTangent = length(aniso.tangent) > 0.1 ? aniso.tangent : rotTangent;
+            
+            // Evaluate anisotropic specular BRDF
+            float3 anisoSpec = EvaluateAnisotropicSpecular(normal, V, sampledDir, anisoTangent, alphaX, alphaY, F0);
+            
+            // Blend anisotropic specular with isotropic based on anisotropy strength
+            float3 isoSpec = Specular_GGX(normal, V, sampledDir, roughness, F0);
+            float3 finalSpec = lerp(isoSpec, anisoSpec, aniso.strength);
+            
+            // Replace specular component in BRDF
+            // Extract diffuse component (approximate: f - specular)
+            float3 diffuse = (1.0 - metallic) * Diffuse_Burley(albedo, normal, V, sampledDir);
+            f = finalSpec + diffuse;
+        }
 
         // Update throughput: multiply by contribution = f * cosTheta / pdf
         payload.throughput *= f * NdotL / samplePdf;
