@@ -193,7 +193,9 @@ namespace ACG {
         UINT m_sbtEntrySize;
         UINT m_sbtRayGenOffset;
         UINT m_sbtMissOffset;
+        UINT m_sbtShadowMissOffset;      // Shadow ray miss shader offset
         UINT m_sbtHitGroupOffset;
+        UINT m_sbtShadowHitGroupOffset;  // Shadow ray hit group offset
         
         // DXR Shader Library
         Microsoft::WRL::ComPtr<IDxcBlob> m_raytracingShaderLibrary;
