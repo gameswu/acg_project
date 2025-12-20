@@ -15,12 +15,6 @@ struct RadiancePayload
     uint iorStackTop;     // Current top index
 };
 
-// Shadow ray payload (minimal structure for visibility queries)
-struct ShadowPayload
-{
-    bool visible;  // True if ray reaches target without occlusion
-};
-
 // Global root signature
 // #define GlobalRootSignature \
 //     "DescriptorTable(UAV(u0))," /* Output texture */ \
@@ -183,102 +177,9 @@ float4 SampleVirtualTexture(int texIndex, float2 uv)
     return sampledColor;
 }
 
-    // ===================== Multiple Importance Sampling (MIS) Helpers =====================
-    
-    // Constants
-    static const float PI = 3.14159265359;
-    
-    // Power heuristic for MIS weight computation (balance between sampling strategies)
-    // pdf_a: PDF of strategy A, pdf_b: PDF of strategy B, beta: power parameter (typically 2)
-    float PowerHeuristic(float pdf_a, float pdf_b, float beta = 2.0)
-    {
-        float wa = pow(abs(pdf_a), beta);
-        float wb = pow(abs(pdf_b), beta);
-        return wa / max(wa + wb, 1e-8);
-    }
-    
-    // Balance heuristic (beta=1 case, simpler but less variance reduction)
-    float BalanceHeuristic(float pdf_a, float pdf_b)
-    {
-        return pdf_a / max(pdf_a + pdf_b, 1e-8);
-    }
-    
-    // Compute PDF for sampling a direction on equirectangular environment map
-    // Accounts for Jacobian from spherical to texture space: sin(theta) term
-    float EnvironmentMapPdf(float3 direction)
-    {
-        // Convert direction to spherical coordinates
-        float theta = acos(clamp(direction.y, -1.0, 1.0));  // polar angle [0, pi]
-        float sinTheta = sin(theta);
-        
-        // Uniform sampling over sphere: pdf = 1/(4*pi)
-        // But equirectangular has non-uniform area: need Jacobian correction
-        // Jacobian for equirectangular: 1/(2*pi*pi*sin(theta))
-        // For uniform sampling: pdf = sin(theta) / (4*pi)
-        float pdf = max(sinTheta, 1e-8) / (4.0 * PI);
-        
-        return pdf;
-    }
-    
-    // Sample environment map direction uniformly (simplified importance sampling)
-    // For production: use CDF-based importance sampling weighted by luminance
-    float3 SampleEnvironmentMap(inout uint rngState, out float pdf)
-    {
-        // Uniform sampling on unit sphere using spherical coordinates
-        float u1 = Random(rngState);
-        float u2 = Random(rngState);
-        
-        // Sample theta (polar angle) with sin(theta) weighting for uniform area
-        float cosTheta = 1.0 - 2.0 * u1;  // [-1, 1]
-        float sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
-        
-        // Sample phi (azimuthal angle) uniformly
-        float phi = 2.0 * PI * u2;
-        
-        // Convert to Cartesian coordinates
-        float3 direction = float3(
-            sinTheta * cos(phi),
-            cosTheta,
-            sinTheta * sin(phi)
-        );
-        
-        // PDF for uniform sphere sampling
-        pdf = EnvironmentMapPdf(direction);
-        
-        return normalize(direction);
-    }
-    
-    // Trace shadow ray to test visibility between two points
-    bool TraceShadowRay(float3 origin, float3 direction, float maxDistance)
-    {
-        RayDesc shadowRay;
-        shadowRay.Origin = origin;
-        shadowRay.Direction = direction;
-        shadowRay.TMin = 0.001;  // Avoid self-intersection
-        shadowRay.TMax = maxDistance - 0.001;  // Stop slightly before target
-        
-        ShadowPayload shadowPayload;
-        shadowPayload.visible = true;
-        
-        // Shadow ray configuration:
-        // - RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH: terminate on first hit
-        // - RAY_FLAG_SKIP_CLOSEST_HIT_SHADER: don't need full hit shader for shadows
-        // IndexOffsetMultiplier and GeometryContributionMultiplier should both be 0 for simple setup
-        TraceRay(g_scene, 
-                 RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | 
-                 RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,
-                 0xFF,  // Instance inclusion mask
-                 0,     // RayContributionToHitGroupIndex (use 0, will be offset by multiplier)
-                 1,     // MultiplierForGeometryContributionToHitGroupIndex (0*1 + 1 = HitGroup index 1)
-                 1,     // MissShaderIndex (ShadowMiss at index 1)
-                 shadowRay, 
-                 shadowPayload);
-        
-        return shadowPayload.visible;
-    }
-
     // ===================== Principled / Microfacet BSDF Helpers =====================
     // Interfaces (prototypes)
+    static const float PI = 3.14159265359;
 
     float3 FresnelSchlick(float3 F0, float cosTheta);
     float D_GGX(float NdotH, float alpha);
@@ -794,73 +695,6 @@ void Miss(inout RadiancePayload payload)
     payload.terminated = true;
 }
 
-// Shadow ray miss shader - ray reached environment without hitting geometry
-[shader("miss")]
-void ShadowMiss(inout ShadowPayload payload)
-{
-    // Ray is visible - no occlusion
-    payload.visible = true;
-}
-
-// Shadow ray any-hit shader - handle alpha-tested materials
-[shader("anyhit")]
-void ShadowAnyHit(inout ShadowPayload payload, in BuiltInTriangleIntersectionAttributes attribs)
-{
-    // Get material to check for alpha testing
-    uint primitiveIndex = PrimitiveIndex();
-    uint materialIndex = g_triangleMaterialIndices[primitiveIndex];
-    
-    const uint MAX_MATERIALS = 512;
-    if (materialIndex >= MAX_MATERIALS) {
-        materialIndex = 0;
-    }
-    
-    Material mat = g_materials[materialIndex];
-    
-    // If material has opacity texture or alpha < 1, need to test
-    float alpha = mat.opacity();
-    int opacityTexIdx = mat.opacityTexIdx();
-    
-    if (opacityTexIdx >= 0 || alpha < 0.99) {
-        // Interpolate texture coordinates
-        uint i0 = g_indices[primitiveIndex * 3 + 0];
-        uint i1 = g_indices[primitiveIndex * 3 + 1];
-        uint i2 = g_indices[primitiveIndex * 3 + 2];
-        
-        float2 uv0 = g_vertices[i0].texCoord;
-        float2 uv1 = g_vertices[i1].texCoord;
-        float2 uv2 = g_vertices[i2].texCoord;
-        
-        float3 barycentrics = float3(1.0 - attribs.barycentrics.x - attribs.barycentrics.y,
-                                      attribs.barycentrics.x,
-                                      attribs.barycentrics.y);
-        
-        float2 texCoord = uv0 * barycentrics.x + uv1 * barycentrics.y + uv2 * barycentrics.z;
-        
-        // Sample opacity texture if present
-        if (opacityTexIdx >= 0) {
-            float4 opacityTex;
-            if (g_constants.useVirtualTextures == 1) {
-                opacityTex = SampleVirtualTexture(opacityTexIdx, texCoord);
-            } else {
-                opacityTex = g_textures.SampleLevel(g_sampler, float3(texCoord, opacityTexIdx), 0);
-            }
-            alpha *= (opacityTex.r + opacityTex.g + opacityTex.b) / 3.0;
-        }
-        
-        // Stochastic alpha testing for shadow rays
-        // For shadows, we use deterministic threshold to avoid noise
-        if (alpha < 0.5) {
-            // Treat as transparent - ignore this hit and continue
-            IgnoreHit();
-        }
-    }
-    
-    // If we reach here, surface is opaque - shadow ray is occluded
-    payload.visible = false;
-    AcceptHitAndEndSearch();
-}
-
 [shader("closesthit")]
 void ClosestHit(inout RadiancePayload payload, in BuiltInTriangleIntersectionAttributes attribs)
 {
@@ -1225,195 +1059,21 @@ void ClosestHit(inout RadiancePayload payload, in BuiltInTriangleIntersectionAtt
             }
         }
         
-        // ========== BASE LAYER SAMPLING (MIS TEMPORARILY DISABLED) ==========
-        // TODO: Debug and re-enable MIS after verifying base path tracing works
-        
-        // For now, use original single-strategy BRDF sampling without shadow rays
-        float3 directLighting = float3(0, 0, 0);  // No explicit direct lighting for now
-        
-        #if 0  // Disable entire MIS block
-        // ========== BASE LAYER SAMPLING WITH MIS ==========
-        // Use Multiple Importance Sampling combining BRDF and environment light sampling
-        
-        float3 directLighting = float3(0, 0, 0);
-        
-        // ===== Strategy 1: BRDF Importance Sampling (TEMPORARILY DISABLED FOR DEBUGGING) =====
-        // TODO: Re-enable after verifying shadow ray performance
-        #if 0
-        {
-            // Decide between specular (GGX) and diffuse sampling
-            float specProb = saturate(metallic + (1.0 - roughness) * (1.0 - metallic));
-            float r = Random(payload.rngState);
+        // ========== BASE LAYER SAMPLING (Original BSDF) ==========
 
-            float3 sampledDir;
-            float brdfPdf = 0.0;
-            float selectionProb = 1.0;
-
-            if (r < specProb) {
-                // Sample GGX specular lobe
-                SampleGGX_Direction(normal, V, roughness, payload.rngState, sampledDir, brdfPdf);
-                selectionProb = specProb;
-            } else {
-                // Cosine-weighted hemisphere (diffuse)
-                float r1 = Random(payload.rngState);
-                float r2 = Random(payload.rngState);
-                float sinTheta = sqrt(r1);
-                float cosTheta = sqrt(1.0 - r1);
-                float phi = 2.0 * PI * r2;
-
-                float3 tangent, bitangent;
-                CreateOrthonormalBasis(normal, tangent, bitangent);
-                float3 localDir = float3(sinTheta * cos(phi), sinTheta * sin(phi), cosTheta);
-                sampledDir = normalize(tangent * localDir.x + bitangent * localDir.y + normal * localDir.z);
-                brdfPdf = max(dot(normal, sampledDir), 0.0) / PI;
-                selectionProb = max(1.0 - specProb, 0.0);
-            }
-
-            float NdotL = max(dot(normal, sampledDir), 0.0);
-            if (NdotL > 0.0 && brdfPdf > 0.0) {
-                // Evaluate BRDF
-                float3 f;
-                float dummyPdf;
-                EvaluatePrincipledBSDF(normal, V, sampledDir, albedo, metallic, roughness, F0, f, dummyPdf);
-                
-                // Apply material layers to BRDF (same as indirect bounces)
-                // Iridescence
-                if ((mat.layerFlags() & LAYER_IRIDESCENCE) != 0) {
-                    uint layerIdx = mat.extendedDataIndex();
-                    uint flags = mat.layerFlags();
-                    uint layerOffset = 0;
-                    if (flags & LAYER_CLEARCOAT) layerOffset++;
-                    if (flags & LAYER_TRANSMISSION) layerOffset++;
-                    if (flags & LAYER_SHEEN) layerOffset++;
-                    if (flags & LAYER_SUBSURFACE) layerOffset++;
-                    if (flags & LAYER_ANISOTROPY) layerOffset++;
-                    IridescenceLayer irid = LoadIridescenceLayer(layerIdx + layerOffset, g_materialLayers);
-                    float thickness = (irid.thicknessMin + irid.thicknessMax) * 0.5;
-                    float NdotV = max(dot(normal, V), 0.0);
-                    float3 iridF = FresnelIridescence(F0, NdotV, thickness, irid.ior, irid.strength);
-                    float3 baseF = FresnelSchlick(F0, NdotV);
-                    float3 fresnelRatio = iridF / max(baseF, 1e-5);
-                    float iridWeight = saturate(metallic + (1.0 - roughness) * 0.5);
-                    f *= lerp(float3(1, 1, 1), fresnelRatio, iridWeight * irid.strength);
-                }
-                // Sheen
-                if ((mat.layerFlags() & LAYER_SHEEN) != 0) {
-                    uint layerIdx = mat.extendedDataIndex();
-                    uint flags = mat.layerFlags();
-                    uint layerOffset = 0;
-                    if (flags & LAYER_CLEARCOAT) layerOffset++;
-                    if (flags & LAYER_TRANSMISSION) layerOffset++;
-                    SheenLayer sheen = LoadSheenLayer(layerIdx + layerOffset, g_materialLayers);
-                    f += EvaluateSheen(normal, V, sampledDir, sheen.color, sheen.roughness) * sheen.tint;
-                }
-                // Subsurface
-                if ((mat.layerFlags() & LAYER_SUBSURFACE) != 0) {
-                    uint layerIdx = mat.extendedDataIndex();
-                    uint flags = mat.layerFlags();
-                    uint layerOffset = 0;
-                    if (flags & LAYER_CLEARCOAT) layerOffset++;
-                    if (flags & LAYER_TRANSMISSION) layerOffset++;
-                    if (flags & LAYER_SHEEN) layerOffset++;
-                    SubsurfaceLayer sss = LoadSubsurfaceLayer(layerIdx + layerOffset, g_materialLayers);
-                    float3 sssBRDF = EvaluateSubsurface(normal, V, sampledDir, sss.color, sss.radius, sss.radiusScale);
-                    float3 baseDiffuse = (1.0 - metallic) * Diffuse_Burley(albedo, normal, V, sampledDir);
-                    float3 specular = Specular_GGX(normal, V, sampledDir, roughness, F0);
-                    float3 mixedDiffuse = lerp(baseDiffuse, sssBRDF, saturate(sss.strength));
-                    float specularWeight = saturate(1.0 - sss.strength * 0.8);
-                    f = specular * specularWeight + mixedDiffuse;
-                }
-                // Anisotropy
-                if ((mat.layerFlags() & LAYER_ANISOTROPY) != 0) {
-                    uint layerIdx = mat.extendedDataIndex();
-                    uint flags = mat.layerFlags();
-                    uint layerOffset = 0;
-                    if (flags & LAYER_CLEARCOAT) layerOffset++;
-                    if (flags & LAYER_TRANSMISSION) layerOffset++;
-                    if (flags & LAYER_SHEEN) layerOffset++;
-                    if (flags & LAYER_SUBSURFACE) layerOffset++;
-                    AnisotropyLayer aniso = LoadAnisotropyLayer(layerIdx + layerOffset, g_materialLayers);
-                    float aspect = aniso.aspectRatio;
-                    float alphaX = roughness;
-                    float alphaY = roughness * aspect;
-                    float cosRot = cos(aniso.rotation);
-                    float sinRot = sin(aniso.rotation);
-                    float3 rotTangent = tangent * cosRot + cross(normal, tangent) * sinRot;
-                    float3 anisoTangent = length(aniso.tangent) > 0.1 ? aniso.tangent : rotTangent;
-                    float3 anisoSpec = EvaluateAnisotropicSpecular(normal, V, sampledDir, anisoTangent, alphaX, alphaY, F0);
-                    float3 isoSpec = Specular_GGX(normal, V, sampledDir, roughness, F0);
-                    float3 finalSpec = lerp(isoSpec, anisoSpec, aniso.strength);
-                    float3 diffuse = (1.0 - metallic) * Diffuse_Burley(albedo, normal, V, sampledDir);
-                    f = finalSpec + diffuse;
-                }
-                
-                // Trace shadow ray to test visibility
-                bool visible = TraceShadowRay(hitPos + geometricNormal * 0.001, sampledDir, 10000.0);
-                
-                if (visible) {
-                    // Sample environment map at this direction
-                    float2 envUV = DirectionToEquirectangularUV(sampledDir);
-                    float3 envRadiance = g_environmentMap.SampleLevel(g_sampler, envUV, 0).rgb * g_constants.environmentLightIntensity;
-                    
-                    // Compute light PDF for this direction
-                    float lightPdf = EnvironmentMapPdf(sampledDir);
-                    
-                    // MIS weight: power heuristic with beta=2
-                    float misWeight = PowerHeuristic(brdfPdf, lightPdf);
-                    
-                    // Contribution: f * L * cos(theta) * weight / pdf
-                    directLighting += f * envRadiance * NdotL * misWeight / (brdfPdf * selectionProb);
-                }
-            }
-        }
-        #endif // Strategy 1 disabled
-        
-        // ===== Strategy 2: Environment Light Importance Sampling =====
-        // This strategy samples light first, then evaluates BRDF
-        {
-            float lightPdf;
-            float3 lightDir = SampleEnvironmentMap(payload.rngState, lightPdf);
-            
-            float NdotL = max(dot(normal, lightDir), 0.0);
-            if (NdotL > 0.0 && lightPdf > 0.0) {
-                // Trace shadow ray
-                bool visible = TraceShadowRay(hitPos + geometricNormal * 0.001, lightDir, 10000.0);
-                
-                if (visible) {
-                    // Evaluate BRDF for this direction
-                    float3 f;
-                    float brdfPdf;
-                    EvaluatePrincipledBSDF(normal, V, lightDir, albedo, metallic, roughness, F0, f, brdfPdf);
-                    
-                    // Sample environment radiance
-                    float2 envUV = DirectionToEquirectangularUV(lightDir);
-                    float3 envRadiance = g_environmentMap.SampleLevel(g_sampler, envUV, 0).rgb * g_constants.environmentLightIntensity;
-                    
-                    // MIS weight: power heuristic with beta=2
-                    float misWeight = PowerHeuristic(lightPdf, brdfPdf);
-                    
-                    // Contribution: f * L * cos(theta) * weight / pdf
-                    directLighting += f * envRadiance * NdotL * misWeight / lightPdf;
-                }
-            }
-        }
-        #endif  // End MIS block
-        
-        // Add direct lighting contribution (currently zero - will be lit by indirect bounces only)
-        payload.radiance += payload.throughput * directLighting;
-        
-        // ===== Continue path with BRDF sampling for next bounce =====
-        // Original path tracing logic without MIS
+        // Decide between specular (GGX) and diffuse sampling
+        // Weight specular more when metallic is high or roughness is low
         float specProb = saturate(metallic + (1.0 - roughness) * (1.0 - metallic));
         float r = Random(payload.rngState);
 
         float3 sampledDir;
         float samplePdf = 0.0;
-        float selectionProb = 1.0;
 
         if (r < specProb) {
+            // Sample GGX specular lobe
             SampleGGX_Direction(normal, V, roughness, payload.rngState, sampledDir, samplePdf);
-            selectionProb = specProb;
         } else {
+            // Cosine-weighted hemisphere (diffuse)
             float r1 = Random(payload.rngState);
             float r2 = Random(payload.rngState);
             float sinTheta = sqrt(r1);
@@ -1425,7 +1085,6 @@ void ClosestHit(inout RadiancePayload payload, in BuiltInTriangleIntersectionAtt
             float3 localDir = float3(sinTheta * cos(phi), sinTheta * sin(phi), cosTheta);
             sampledDir = normalize(tangent * localDir.x + bitangent * localDir.y + normal * localDir.z);
             samplePdf = max(dot(normal, sampledDir), 0.0) / PI;
-            selectionProb = max(1.0 - specProb, 0.0);
         }
 
         float NdotL = max(dot(normal, sampledDir), 0.0);
@@ -1434,6 +1093,7 @@ void ClosestHit(inout RadiancePayload payload, in BuiltInTriangleIntersectionAtt
             return;
         }
 
+        // Evaluate BRDF value for chosen direction
         float3 f;
         float dummyPdf;
         EvaluatePrincipledBSDF(normal, V, sampledDir, albedo, metallic, roughness, F0, f, dummyPdf);
@@ -1563,9 +1223,7 @@ void ClosestHit(inout RadiancePayload payload, in BuiltInTriangleIntersectionAtt
         }
 
         // Update throughput: multiply by contribution = f * cosTheta / pdf
-        // Also divide by the probability of choosing this sampling branch (selectionProb)
-        selectionProb = max(selectionProb, 1e-6); // protect against zero
-        payload.throughput *= f * NdotL / (samplePdf * selectionProb);
+        payload.throughput *= f * NdotL / samplePdf;
 
         // Russian roulette termination (if throughput very small)
         float maxThroughput = max(max(payload.throughput.r, payload.throughput.g), payload.throughput.b);

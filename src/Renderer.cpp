@@ -1051,29 +1051,16 @@ namespace ACG {
             libdxil.BytecodeLength = m_raytracingShaderLibrary->GetBufferSize();
             libdxil.pShaderBytecode = m_raytracingShaderLibrary->GetBufferPointer();
             lib->SetDXILLibrary(&libdxil);
-            // Export radiance shaders and shadow shaders
-            const WCHAR* shaderExports[] = { 
-                L"RayGen", 
-                L"Miss", 
-                L"ClosestHit",
-                L"ShadowMiss",
-                L"ShadowAnyHit"
-            };
+            const WCHAR* shaderExports[] = { L"RayGen", L"Miss", L"ClosestHit" };
             lib->DefineExports(shaderExports);
 
-            // 2. Primary Hit Group (radiance rays)
+            // 2. Hit Group
             auto hitGroup = raytracingPipeline.CreateSubobject<CD3DX12_HIT_GROUP_SUBOBJECT>();
             hitGroup->SetClosestHitShaderImport(L"ClosestHit");
             hitGroup->SetHitGroupExport(L"HitGroup");
             hitGroup->SetHitGroupType(D3D12_HIT_GROUP_TYPE_TRIANGLES);
-            
-            // 3. Shadow Hit Group (shadow rays with alpha testing)
-            auto shadowHitGroup = raytracingPipeline.CreateSubobject<CD3DX12_HIT_GROUP_SUBOBJECT>();
-            shadowHitGroup->SetAnyHitShaderImport(L"ShadowAnyHit");
-            shadowHitGroup->SetHitGroupExport(L"ShadowHitGroup");
-            shadowHitGroup->SetHitGroupType(D3D12_HIT_GROUP_TYPE_TRIANGLES);
 
-            // 4. Shader Config
+            // 3. Shader Config
             auto shaderConfig = raytracingPipeline.CreateSubobject<CD3DX12_RAYTRACING_SHADER_CONFIG_SUBOBJECT>();
             // RadiancePayload layout in HLSL:
             //   float3 radiance;      // 12
@@ -1085,18 +1072,15 @@ namespace ACG {
             //   float  iorStack[4];   // 16
             //   uint   iorStackTop;   // 4
             // Total = 76 bytes
-            // ShadowPayload layout:
-            //   bool visible;         // 4 bytes
-            // Use max of both payloads
             UINT payloadSize = (4 * 3 * sizeof(float)) + (2 * sizeof(UINT)) + (4 * sizeof(float)) + sizeof(UINT);
             UINT attributeSize = 2 * sizeof(float); // BuiltInTriangleIntersectionAttributes: float2 barycentrics
             shaderConfig->Config(payloadSize, attributeSize);
 
-            // 5. Global Root Signature
+            // 4. Global Root Signature
             auto globalRootSignature = raytracingPipeline.CreateSubobject<CD3DX12_GLOBAL_ROOT_SIGNATURE_SUBOBJECT>();
             globalRootSignature->SetRootSignature(m_raytracingGlobalRootSignature.Get());
 
-            // 6. Pipeline Config
+            // 7. Pipeline Config
             auto pipelineConfig = raytracingPipeline.CreateSubobject<CD3DX12_RAYTRACING_PIPELINE_CONFIG_SUBOBJECT>();
             UINT maxRecursionDepth = 1; // No recursion - iterative path tracing in RayGen
             pipelineConfig->Config(maxRecursionDepth);
@@ -2688,10 +2672,8 @@ void ACG::Renderer::SetSunIntensity(float intensity) {
         void* rayGenID = stateObjectProps->GetShaderIdentifier(L"RayGen");
         void* missID = stateObjectProps->GetShaderIdentifier(L"Miss");
         void* hitGroupID = stateObjectProps->GetShaderIdentifier(L"HitGroup");
-        void* shadowMissID = stateObjectProps->GetShaderIdentifier(L"ShadowMiss");
-        void* shadowHitGroupID = stateObjectProps->GetShaderIdentifier(L"ShadowHitGroup");
 
-        if (!rayGenID || !missID || !hitGroupID || !shadowMissID || !shadowHitGroupID) {
+        if (!rayGenID || !missID || !hitGroupID) {
             throw std::runtime_error("Failed to get shader identifiers");
         }
 
@@ -2706,15 +2688,12 @@ void ACG::Renderer::SetSunIntensity(float intensity) {
         // Store entry size for later use
         m_sbtEntrySize = shaderRecordAlignedSize;
 
-        // Calculate offsets for all shader tables
-        // SBT layout: [RayGen] [Miss] [ShadowMiss] [HitGroup] [ShadowHitGroup]
+        // Calculate offsets
         m_sbtRayGenOffset = 0;
         m_sbtMissOffset = m_sbtRayGenOffset + shaderRecordAlignedSize;
-        m_sbtShadowMissOffset = m_sbtMissOffset + shaderRecordAlignedSize;
-        m_sbtHitGroupOffset = m_sbtShadowMissOffset + shaderRecordAlignedSize;
-        m_sbtShadowHitGroupOffset = m_sbtHitGroupOffset + shaderRecordAlignedSize;
+        m_sbtHitGroupOffset = m_sbtMissOffset + shaderRecordAlignedSize;
         
-        UINT sbtSize = m_sbtShadowHitGroupOffset + shaderRecordAlignedSize;
+        UINT sbtSize = m_sbtHitGroupOffset + shaderRecordAlignedSize;
 
         // Create SBT upload buffer
         ThrowIfFailed(m_device->CreateCommittedResource(
@@ -2732,27 +2711,18 @@ void ACG::Renderer::SetSunIntensity(float intensity) {
         // Write RayGen record
         memcpy(mappedData + m_sbtRayGenOffset, rayGenID, shaderIdentifierSize);
         
-        // Write Miss record (primary rays)
+        // Write Miss record
         memcpy(mappedData + m_sbtMissOffset, missID, shaderIdentifierSize);
         
-        // Write Shadow Miss record
-        memcpy(mappedData + m_sbtShadowMissOffset, shadowMissID, shaderIdentifierSize);
-        
-        // Write HitGroup record (primary rays)
+        // Write HitGroup record
         memcpy(mappedData + m_sbtHitGroupOffset, hitGroupID, shaderIdentifierSize);
-        
-        // Write Shadow HitGroup record
-        memcpy(mappedData + m_sbtShadowHitGroupOffset, shadowHitGroupID, shaderIdentifierSize);
         
         m_sbtBuffer->Unmap(0, nullptr);
 
-        std::cout << "Shader Binding Table created:" << std::endl;
-        std::cout << "  RayGen @ " << m_sbtRayGenOffset << std::endl;
-        std::cout << "  Miss @ " << m_sbtMissOffset << std::endl;
-        std::cout << "  ShadowMiss @ " << m_sbtShadowMissOffset << std::endl;
-        std::cout << "  HitGroup @ " << m_sbtHitGroupOffset << std::endl;
-        std::cout << "  ShadowHitGroup @ " << m_sbtShadowHitGroupOffset << std::endl;
-        std::cout << "  EntrySize = " << m_sbtEntrySize << " bytes" << std::endl;
+        std::cout << "Shader Binding Table created: RayGen@" << m_sbtRayGenOffset 
+                  << " Miss@" << m_sbtMissOffset 
+                  << " HitGroup@" << m_sbtHitGroupOffset 
+                  << " EntrySize=" << m_sbtEntrySize << std::endl;
     }
 
     void Renderer::OnUpdate() {
