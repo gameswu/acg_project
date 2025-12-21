@@ -10,9 +10,17 @@ struct RadiancePayload
     float3 nextDirection; // Next ray direction (for iterative tracing)
     uint rngState;        // RNG state
     bool terminated;      // Path terminated flag
+    float misWeight;      // MIS weight for BSDF sampling (used when hitting environment)
+    uint bounceCount;     // Current bounce count (for adaptive sampling)
     // Medium tracking (IOR stack) for nested refractive media
     float iorStack[4];    // Small stack for nested IORs (stack[0] = 1.0 = air)
     uint iorStackTop;     // Current top index
+};
+
+// Lightweight payload for shadow rays (only need visibility test)
+struct ShadowPayload
+{
+    bool isVisible;  // True if ray reaches infinity without hitting geometry
 };
 
 // Global root signature
@@ -247,8 +255,11 @@ float4 SampleVirtualTexture(int texIndex, float2 uv)
         float G = G_Smith(NdotV, NdotL, alpha);
         float3 F = FresnelSchlick(F0, VdotH);
 
+        // Standard Cook-Torrance microfacet BRDF (without cosine term)
+        // f_spec = (D × F × G) / (4 × NdotV × NdotL)
+        // Cosine term (NdotL) will be applied separately in rendering equation
         float denom = 4.0 * NdotV * NdotL + 1e-7;
-        float3 spec = (D * G) / denom * F;
+        float3 spec = (D * G * F) / denom;
         return spec;
     }
 
@@ -319,19 +330,27 @@ float4 SampleVirtualTexture(int texIndex, float2 uv)
         float3 F0_metal = albedo;
         float3 F0_final = lerp(Fdielectric, F0_metal, metallic);
 
-        // Specular term
+        // Compute half vector for Fresnel evaluation
+        float3 H = normalize(V + L);
+        float VdotH = max(dot(V, H), 0.0);
+        
+        // Evaluate Fresnel at this angle
+        float3 F = FresnelSchlick(F0_final, VdotH);
+
+        // Specular term (microfacet BRDF)
         float3 spec = Specular_GGX(N, V, L, roughness, F0_final);
 
-        // Diffuse term (zero for metals)
-        float3 diff = (1.0 - metallic) * Diffuse_Burley(albedo, N, V, L);
+        // Diffuse term with energy conservation
+        // For dielectrics: diffuse receives (1 - F) of the energy
+        // For metals: no diffuse component (metallic kills it)
+        float3 kD = (1.0 - F) * (1.0 - metallic);
+        float3 diff = kD * Diffuse_Burley(albedo, N, V, L);
 
         f = spec + diff;
 
         // Rough heuristic pdf: mix between specular and diffuse pdfs by metallic
         // Specular pdf from GGX sampling (approximated via half-vector)
-        float3 H = normalize(V + L);
         float NdotH = max(dot(N, H), 0.0);
-        float VdotH = max(dot(V, H), 0.0);
         float alpha = max(0.001, roughness * roughness);
         float D = D_GGX(NdotH, alpha);
         float pdfSpec = (D * NdotH) / max(1e-7, 4.0 * VdotH);
@@ -350,6 +369,44 @@ float4 SampleVirtualTexture(int texIndex, float2 uv)
         float f = (ior - 1.0) / (ior + 1.0);
         float f0 = f * f;
         return float3(f0, f0, f0);
+    }
+
+    // ============================================================================
+    // Multiple Importance Sampling (MIS)
+    // ============================================================================
+    
+    // Balance heuristic for MIS weight calculation
+    // w = (n1 * pdf1) / (n1 * pdf1 + n2 * pdf2)
+    // For one sample from each strategy, n1 = n2 = 1
+    float MISWeight(float pdf1, float pdf2)
+    {
+        return pdf1 / max(pdf1 + pdf2, 1e-7);
+    }
+    
+    // Power heuristic (beta = 2) - typically better variance reduction
+    float MISWeightPower(float pdf1, float pdf2)
+    {
+        float p1 = pdf1 * pdf1;
+        float p2 = pdf2 * pdf2;
+        return p1 / max(p1 + p2, 1e-7);
+    }
+    
+    // Sample environment map using uniform sphere sampling (simplified)
+    // Returns sampled direction and PDF
+    float3 SampleEnvironmentUniform(inout uint rngState, out float pdf)
+    {
+        // Uniform sphere sampling
+        float u1 = Random(rngState);
+        float u2 = Random(rngState);
+        
+        float z = 1.0 - 2.0 * u1;
+        float r = sqrt(max(0.0, 1.0 - z * z));
+        float phi = 2.0 * PI * u2;
+        
+        float3 dir = float3(r * cos(phi), r * sin(phi), z);
+        pdf = 1.0 / (4.0 * PI); // Uniform sphere PDF
+        
+        return dir;
     }
 
     // Fetch material parameters: albedo, metallic, roughness, and compute F0
@@ -476,7 +533,8 @@ float4 SampleVirtualTexture(int texIndex, float2 uv)
         // Using inverted microfacet distribution for edge glow
         float sheen = FH * (1.0 + sheenRoughness);
         
-        return sheenColor * sheen / max(NdotV + NdotL, 1e-5);
+        // Return BRDF without cosine term (will be applied in rendering equation)
+        return sheenColor * sheen;
     }
 
     // ============================================================================
@@ -633,12 +691,17 @@ void RayGen()
     payload.nextDirection = float3(0, 0, 0);
     payload.rngState = rngState;
     payload.terminated = false;
+    payload.misWeight = 1.0; // Primary ray doesn't need MIS
+    payload.bounceCount = 0; // Start at bounce 0
     // Initialize medium stack (start in air)
     payload.iorStack[0] = 1.0f;
     payload.iorStackTop = 0;
     
     // Iterative path tracing (multiple bounces)
     for (uint bounce = 0; bounce < g_constants.maxBounces && !payload.terminated; bounce++) {
+        // Update bounce count in payload
+        payload.bounceCount = bounce;
+        
         // Trace ray
         TraceRay(g_scene, RAY_FLAG_NONE, 0xFF, 0, 0, 0, ray, payload);
         
@@ -672,13 +735,12 @@ void Miss(inout RadiancePayload payload)
     float2 envUV = DirectionToEquirectangularUV(rayDir);
     float4 envColor = g_environmentMap.SampleLevel(g_sampler, envUV, 0);
     
-    // Apply environment light intensity and add to radiance
-    payload.radiance += payload.throughput * envColor.rgb * g_constants.environmentLightIntensity;
+    // Apply MIS weight to environment light contribution (BSDF sampling path)
+    // misWeight was computed in ClosestHit for balance heuristic
+    payload.radiance += payload.throughput * envColor.rgb * g_constants.environmentLightIntensity * payload.misWeight;
 
     // Add directional sun contribution for rays that reach infinity.
-    // We evaluate sun radiance along the ray direction; if the ray direction
-    // aligns with the sun direction, add sun contribution. Using intensity>0
-    // as the enable check (g_constants.sunDirIntensity.w).
+    // Sun is delta distribution, so BSDF sampling has zero probability - no MIS needed
     if (g_constants.sunDirIntensity.w > 0.0) {
         float3 sunDir = normalize(g_constants.sunDirIntensity.xyz);
         float sunIntensity = g_constants.sunDirIntensity.w;
@@ -687,12 +749,28 @@ void Miss(inout RadiancePayload payload)
         // Alignment between ray direction and sun direction (1 when exactly aligned)
         float align = max(0.0, dot(rayDir, sunDir));
         if (align > 0.0) {
-            // Add sun radiance seen along this direction
+            // Add sun radiance seen along this direction (no MIS for delta lights)
             payload.radiance += payload.throughput * sunColor * sunIntensity * align;
         }
     }
 
     payload.terminated = true;
+}
+
+[shader("miss")]
+void ShadowMiss(inout ShadowPayload payload)
+{
+    // Shadow ray reached infinity - light is visible
+    payload.isVisible = true;
+}
+
+[shader("anyhit")]
+void ShadowAnyHit(inout ShadowPayload payload, in BuiltInTriangleIntersectionAttributes attribs)
+{
+    // Shadow ray hit geometry - light is occluded
+    payload.isVisible = false;
+    // Accept hit and terminate search immediately
+    AcceptHitAndEndSearch();
 }
 
 [shader("closesthit")]
@@ -833,6 +911,15 @@ void ClosestHit(inout RadiancePayload payload, in BuiltInTriangleIntersectionAtt
     
     // Handle volume rendering (highest priority - affects ray path inside volumes)
     if (hasVolume) {
+        // CRITICAL: Volume scattering can cause many internal bounces
+        // Terminate early if throughput is too low or too many bounces
+        float maxThroughput = max(max(payload.throughput.r, payload.throughput.g), payload.throughput.b);
+        if (maxThroughput < 0.01 || payload.bounceCount >= (g_constants.maxBounces - 1)) {
+            // Terminate volume path early to avoid excessive scattering
+            payload.terminated = true;
+            return;
+        }
+        
         // Load volume properties from extended data
         // CRITICAL: Calculate correct layer index based on layer flags ordering
         uint layerIdx = mat.extendedDataIndex();
@@ -1043,19 +1130,14 @@ void ClosestHit(inout RadiancePayload payload, in BuiltInTriangleIntersectionAtt
                 payload.nextDirection = sampledDir;
                 return;
             } else {
-                // ===== Sample base layer (with clearcoat attenuation) =====
-                // Energy that passes through clearcoat reduces base layer contribution
-                float baseProb = 1.0 - clearcoatProb;
+                // ===== Sample base layer with clearcoat transmission =====
+                // When using Russian Roulette with prob = coatWeight:
+                // - Transmission factor: (1 - coatWeight)
+                // - Probability compensation: 1 / (1 - coatWeight)
+                // These two factors cancel out perfectly, so NO throughput adjustment needed!
+                // This is the beauty of setting selection probability equal to energy weight.
                 
-                // Continue to base layer sampling (same as before, but adjust throughput)
-                // The base layer sees less energy due to clearcoat reflection
-                // This is implicitly handled by the Russian Roulette probability
-                // We'll adjust throughput by 1/baseProb to account for selection probability
-                
-                // [Fall through to base layer sampling below]
-                // Adjust initial throughput factor
-                float baseThroughputFactor = 1.0 / max(baseProb, 0.01);
-                payload.throughput *= (1.0 - coatWeight) * baseThroughputFactor;
+                // [Fall through to base layer sampling - no throughput modification]
             }
         }
         
@@ -1066,6 +1148,54 @@ void ClosestHit(inout RadiancePayload payload, in BuiltInTriangleIntersectionAtt
         float specProb = saturate(metallic + (1.0 - roughness) * (1.0 - metallic));
         float r = Random(payload.rngState);
 
+        // ========== MIS: Direct Lighting Sampling ==========
+        // Phase 2: Sun sampling only (environment causes timeout - investigating)
+        float3 directLighting = float3(0, 0, 0);
+        
+        // OPTIMIZATION: Only sample direct lighting on first bounce (most important contribution)
+        if (payload.bounceCount == 0) {
+            // Strategy: 5% sun sampling, 95% skip (rely on BSDF only)
+            float lightChoice = Random(payload.rngState);
+            
+            // 1. Sample directional sun light (5% probability)
+            if (lightChoice < 0.05 && g_constants.sunDirIntensity.w > 0.0) {
+                float3 sunDir = normalize(g_constants.sunDirIntensity.xyz);
+                float sunIntensity = g_constants.sunDirIntensity.w;
+                float3 sunColor = g_constants.sunColorEnabled.rgb;
+                
+                float NdotL_sun = max(dot(normal, sunDir), 0.0);
+                if (NdotL_sun > 0.0) {
+                    RayDesc shadowRay;
+                    shadowRay.Origin = hitPos + geometricNormal * 0.001;
+                    shadowRay.Direction = sunDir;
+                    shadowRay.TMin = 0.001;
+                    shadowRay.TMax = 10000.0;
+                    
+                    ShadowPayload shadowPayload;
+                    shadowPayload.isVisible = false;
+                    
+                    TraceRay(g_scene, RAY_FLAG_NONE, 0xFF, 0, 0, 1, shadowRay, shadowPayload);
+                    
+                    if (shadowPayload.isVisible) {
+                        float3 f_sun;
+                        float pdf_bsdf_sun;
+                        EvaluatePrincipledBSDF(normal, V, sunDir, albedo, metallic, roughness, F0, f_sun, pdf_bsdf_sun);
+                        
+                        // Sun is delta - no MIS. Account for 5% probability (1/0.05 = 20.0)
+                        directLighting += f_sun * sunColor * sunIntensity * NdotL_sun * 20.0;
+                    }
+                }
+            }
+            // 2. Environment light MIS - DISABLED (causes double-counting with BSDF path)
+            // ISSUE: Environment is already sampled via BSDF path with MIS at lines 1378-1387
+            // Direct sampling here would count the same light twice
+            // TODO: Implement one-sample MIS or proper multiple importance sampling
+        }
+        
+        // Add direct lighting contribution
+        payload.radiance += payload.throughput * directLighting;
+        
+        // ========== MIS: Indirect Lighting (BSDF Sampling) ==========
         float3 sampledDir;
         float samplePdf = 0.0;
 
@@ -1130,28 +1260,6 @@ void ClosestHit(inout RadiancePayload payload, in BuiltInTriangleIntersectionAtt
             f *= lerp(float3(1, 1, 1), fresnelRatio, iridWeight * irid.strength);
         }
         
-        // ========== ADD SHEEN LAYER CONTRIBUTION ==========
-        bool hasSheen = (mat.layerFlags() & LAYER_SHEEN) != 0;
-        if (hasSheen) {
-            // Load sheen properties
-            uint layerIdx = mat.extendedDataIndex();
-            uint flags = mat.layerFlags();
-            uint layerOffset = 0;
-            if (flags & LAYER_CLEARCOAT) layerOffset++;
-            if (flags & LAYER_TRANSMISSION) layerOffset++;
-            // Sheen is 3rd layer in order
-            SheenLayer sheen = LoadSheenLayer(layerIdx + layerOffset, g_materialLayers);
-            
-            // Evaluate sheen BRDF and add to base BRDF
-            float3 sheenBRDF = EvaluateSheen(normal, V, sampledDir, sheen.color, sheen.roughness);
-            
-            // Apply sheen tint
-            sheenBRDF *= sheen.tint;
-            
-            // Add sheen contribution to total BRDF
-            f += sheenBRDF;
-        }
-        
         // ========== ADD SUBSURFACE SCATTERING CONTRIBUTION ==========
         bool hasSubsurface = (mat.layerFlags() & LAYER_SUBSURFACE) != 0;
         if (hasSubsurface) {
@@ -1168,18 +1276,43 @@ void ClosestHit(inout RadiancePayload payload, in BuiltInTriangleIntersectionAtt
             // Evaluate subsurface BRDF
             float3 sssBRDF = EvaluateSubsurface(normal, V, sampledDir, sss.color, sss.radius, sss.radiusScale);
             
-            // Mix subsurface with base BRDF based on Subsurface Weight
-            // When strength=0, use base BRDF; when strength=1, use pure SSS
+            // Mix subsurface with base diffuse component based on SSS strength
+            // Extract current diffuse from f (approximate: assume first evaluation had spec+diff)
             float3 baseDiffuse = (1.0 - metallic) * Diffuse_Burley(albedo, normal, V, sampledDir);
             float3 specular = Specular_GGX(normal, V, sampledDir, roughness, F0);
             
-            // Replace diffuse component with SSS based on strength
+            // Replace diffuse component with lerped SSS, keep specular
             float3 mixedDiffuse = lerp(baseDiffuse, sssBRDF, saturate(sss.strength));
             
             // For high SSS strength (cloud-like materials), reduce specular contribution
-            // This prevents mirror-like appearance on volumetric surfaces
             float specularWeight = saturate(1.0 - sss.strength * 0.8);
-            f = specular * specularWeight + mixedDiffuse;
+            
+            // Reconstruct BRDF: keep existing modifications (e.g. sheen from previous step)
+            // Remove old diffuse, add new mixed diffuse
+            f = f - baseDiffuse + mixedDiffuse;
+            f = f - specular + specular * specularWeight;
+        }
+        
+        // ========== ADD SHEEN LAYER CONTRIBUTION ==========
+        bool hasSheen = (mat.layerFlags() & LAYER_SHEEN) != 0;
+        if (hasSheen) {
+            // Load sheen properties
+            uint layerIdx = mat.extendedDataIndex();
+            uint flags = mat.layerFlags();
+            uint layerOffset = 0;
+            if (flags & LAYER_CLEARCOAT) layerOffset++;
+            if (flags & LAYER_TRANSMISSION) layerOffset++;
+            // Sheen is 3rd layer in order
+            SheenLayer sheen = LoadSheenLayer(layerIdx + layerOffset, g_materialLayers);
+            
+            // Evaluate sheen BRDF and add to base BRDF
+            float3 sheenBRDF = EvaluateSheen(normal, V, sampledDir, sheen.color, sheen.roughness);
+            
+            // Apply sheen tint (no strength parameter in SheenLayer)
+            sheenBRDF *= sheen.tint;
+            
+            // Add sheen contribution (additive layer on top)
+            f += sheenBRDF;
         }
         
         // ========== MODIFY SPECULAR FOR ANISOTROPY ==========
@@ -1222,7 +1355,14 @@ void ClosestHit(inout RadiancePayload payload, in BuiltInTriangleIntersectionAtt
             f = finalSpec + diffuse;
         }
 
-        // Update throughput: multiply by contribution = f * cosTheta / pdf
+        // Compute MIS weight for BSDF sampling path (will be used if ray hits environment)
+        // Compare BSDF pdf with environment light pdf (uniform sphere)
+        // Use power heuristic (beta=2) for better variance reduction
+        float envLightPdf = 1.0 / (4.0 * PI);
+        float mis_weight_bsdf = MISWeightPower(samplePdf, envLightPdf);
+        payload.misWeight = mis_weight_bsdf;
+        
+        // Update throughput: multiply by BRDF contribution
         payload.throughput *= f * NdotL / samplePdf;
 
         // Russian roulette termination (if throughput very small)

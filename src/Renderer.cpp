@@ -1051,32 +1051,39 @@ namespace ACG {
             libdxil.BytecodeLength = m_raytracingShaderLibrary->GetBufferSize();
             libdxil.pShaderBytecode = m_raytracingShaderLibrary->GetBufferPointer();
             lib->SetDXILLibrary(&libdxil);
-            const WCHAR* shaderExports[] = { L"RayGen", L"Miss", L"ClosestHit" };
+            // Export all shaders: main path (RayGen, Miss, ClosestHit) + shadow path (ShadowMiss, ShadowAnyHit)
+            const WCHAR* shaderExports[] = { L"RayGen", L"Miss", L"ClosestHit", L"ShadowMiss", L"ShadowAnyHit" };
             lib->DefineExports(shaderExports);
 
-            // 2. Hit Group
+            // 2. Main Hit Group (for radiance rays)
             auto hitGroup = raytracingPipeline.CreateSubobject<CD3DX12_HIT_GROUP_SUBOBJECT>();
             hitGroup->SetClosestHitShaderImport(L"ClosestHit");
             hitGroup->SetHitGroupExport(L"HitGroup");
             hitGroup->SetHitGroupType(D3D12_HIT_GROUP_TYPE_TRIANGLES);
 
-            // 3. Shader Config
-            auto shaderConfig = raytracingPipeline.CreateSubobject<CD3DX12_RAYTRACING_SHADER_CONFIG_SUBOBJECT>();
-            // RadiancePayload layout in HLSL:
-            //   float3 radiance;      // 12
-            //   float3 throughput;    // 12
-            //   float3 nextOrigin;    // 12
-            //   float3 nextDirection; // 12
-            //   uint   rngState;      // 4
-            //   bool   terminated;    // 4 (HLSL bool is 4 bytes)
-            //   float  iorStack[4];   // 16
-            //   uint   iorStackTop;   // 4
-            // Total = 76 bytes
-            UINT payloadSize = (4 * 3 * sizeof(float)) + (2 * sizeof(UINT)) + (4 * sizeof(float)) + sizeof(UINT);
-            UINT attributeSize = 2 * sizeof(float); // BuiltInTriangleIntersectionAttributes: float2 barycentrics
-            shaderConfig->Config(payloadSize, attributeSize);
+            // 3. Shadow Hit Group (for shadow rays with any-hit shader)
+            auto shadowHitGroup = raytracingPipeline.CreateSubobject<CD3DX12_HIT_GROUP_SUBOBJECT>();
+            shadowHitGroup->SetAnyHitShaderImport(L"ShadowAnyHit");
+            shadowHitGroup->SetHitGroupExport(L"ShadowHitGroup");
+            shadowHitGroup->SetHitGroupType(D3D12_HIT_GROUP_TYPE_TRIANGLES);
 
-            // 4. Global Root Signature
+            // 4. Shader Config (unified for all shaders)
+            // CRITICAL: HLSL ray payload uses PACKED layout, not 16-byte aligned!
+            // RadiancePayload: 4*float3(48) + uint(4) + bool(4) + float(4) + uint(4) + float[4](16) + uint(4) = 84 bytes
+            // ShadowPayload: bool(4) = 4 bytes
+            // Use MAX payload size for all shaders (simpler and more compatible)
+            auto shaderConfig = raytracingPipeline.CreateSubobject<CD3DX12_RAYTRACING_SHADER_CONFIG_SUBOBJECT>();
+            UINT maxPayloadSize = 84; // RadiancePayload size (with bounceCount)
+            UINT attributeSize = 2 * sizeof(float); // BuiltInTriangleIntersectionAttributes
+            shaderConfig->Config(maxPayloadSize, attributeSize);
+            
+            // 5. Default association: apply to all shaders
+            // This is the Microsoft-recommended pattern for simple pipelines
+            auto configAssociation = raytracingPipeline.CreateSubobject<CD3DX12_SUBOBJECT_TO_EXPORTS_ASSOCIATION_SUBOBJECT>();
+            configAssociation->SetSubobjectToAssociate(*shaderConfig);
+            // Leave exports empty = applies to all shaders by default
+
+            // 6. Global Root Signature
             auto globalRootSignature = raytracingPipeline.CreateSubobject<CD3DX12_GLOBAL_ROOT_SIGNATURE_SUBOBJECT>();
             globalRootSignature->SetRootSignature(m_raytracingGlobalRootSignature.Get());
 
@@ -2672,8 +2679,10 @@ void ACG::Renderer::SetSunIntensity(float intensity) {
         void* rayGenID = stateObjectProps->GetShaderIdentifier(L"RayGen");
         void* missID = stateObjectProps->GetShaderIdentifier(L"Miss");
         void* hitGroupID = stateObjectProps->GetShaderIdentifier(L"HitGroup");
+        void* shadowMissID = stateObjectProps->GetShaderIdentifier(L"ShadowMiss");
+        void* shadowHitGroupID = stateObjectProps->GetShaderIdentifier(L"ShadowHitGroup");
 
-        if (!rayGenID || !missID || !hitGroupID) {
+        if (!rayGenID || !missID || !hitGroupID || !shadowMissID || !shadowHitGroupID) {
             throw std::runtime_error("Failed to get shader identifiers");
         }
 
@@ -2688,12 +2697,15 @@ void ACG::Renderer::SetSunIntensity(float intensity) {
         // Store entry size for later use
         m_sbtEntrySize = shaderRecordAlignedSize;
 
-        // Calculate offsets
+        // Calculate offsets for SBT layout:
+        // [RayGen][Miss][ShadowMiss][HitGroup][ShadowHitGroup]
         m_sbtRayGenOffset = 0;
         m_sbtMissOffset = m_sbtRayGenOffset + shaderRecordAlignedSize;
-        m_sbtHitGroupOffset = m_sbtMissOffset + shaderRecordAlignedSize;
+        UINT sbtShadowMissOffset = m_sbtMissOffset + shaderRecordAlignedSize;
+        m_sbtHitGroupOffset = sbtShadowMissOffset + shaderRecordAlignedSize;
+        UINT sbtShadowHitGroupOffset = m_sbtHitGroupOffset + shaderRecordAlignedSize;
         
-        UINT sbtSize = m_sbtHitGroupOffset + shaderRecordAlignedSize;
+        UINT sbtSize = sbtShadowHitGroupOffset + shaderRecordAlignedSize;
 
         // Create SBT upload buffer
         ThrowIfFailed(m_device->CreateCommittedResource(
@@ -2708,20 +2720,26 @@ void ACG::Renderer::SetSunIntensity(float intensity) {
         uint8_t* mappedData;
         ThrowIfFailed(m_sbtBuffer->Map(0, nullptr, reinterpret_cast<void**>(&mappedData)));
         
-        // Write RayGen record
+        // Write RayGen record (index 0)
         memcpy(mappedData + m_sbtRayGenOffset, rayGenID, shaderIdentifierSize);
         
-        // Write Miss record
+        // Write Miss record (index 0)
         memcpy(mappedData + m_sbtMissOffset, missID, shaderIdentifierSize);
         
-        // Write HitGroup record
+        // Write ShadowMiss record (index 1)
+        memcpy(mappedData + sbtShadowMissOffset, shadowMissID, shaderIdentifierSize);
+        
+        // Write HitGroup record (index 0)
         memcpy(mappedData + m_sbtHitGroupOffset, hitGroupID, shaderIdentifierSize);
+        
+        // Write ShadowHitGroup record (index 1)
+        memcpy(mappedData + sbtShadowHitGroupOffset, shadowHitGroupID, shaderIdentifierSize);
         
         m_sbtBuffer->Unmap(0, nullptr);
 
         std::cout << "Shader Binding Table created: RayGen@" << m_sbtRayGenOffset 
-                  << " Miss@" << m_sbtMissOffset 
-                  << " HitGroup@" << m_sbtHitGroupOffset 
+                  << " Miss@" << m_sbtMissOffset << "/" << sbtShadowMissOffset
+                  << " HitGroup@" << m_sbtHitGroupOffset << "/" << sbtShadowHitGroupOffset
                   << " EntrySize=" << m_sbtEntrySize << std::endl;
     }
 
