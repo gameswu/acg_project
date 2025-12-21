@@ -36,6 +36,15 @@ bool PersistentConfig::Load(const std::string& filename) {
         else if (key == "cameraFOV") {
             iss >> cameraFOV;
         }
+        else if (key == "enableDepthOfField") {
+            iss >> enableDepthOfField;
+        }
+        else if (key == "focusDistance") {
+            iss >> focusDistance;
+        }
+        else if (key == "aperture") {
+            iss >> aperture;
+        }
         else if (key == "samplesPerPixel") {
             iss >> samplesPerPixel;
         }
@@ -96,7 +105,10 @@ bool PersistentConfig::Save(const std::string& filename) const {
     file << "# Camera settings\n";
     file << "cameraPosition " << cameraPosition.x << " " << cameraPosition.y << " " << cameraPosition.z << "\n";
     file << "cameraDirection " << cameraDirection.x << " " << cameraDirection.y << " " << cameraDirection.z << "\n";
-    file << "cameraFOV " << cameraFOV << "\n\n";
+    file << "cameraFOV " << cameraFOV << "\n";
+    file << "enableDepthOfField " << enableDepthOfField << "\n";
+    file << "focusDistance " << focusDistance << "\n";
+    file << "aperture " << aperture << "\n\n";
     
     file << "# Render Settings\n";
     file << "samplesPerPixel " << samplesPerPixel << "\n";

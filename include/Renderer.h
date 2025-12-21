@@ -54,6 +54,7 @@ namespace ACG {
         void SetSunDirection(const glm::vec3& dir);
         void SetSunColor(const glm::vec3& color);
         void SetSunIntensity(float intensity);
+        void SetDepthOfField(bool enable, float focusDistance, float aperture);
         void ResetAccumulation() { m_accumulatedSamples = 0; }
         int GetAccumulatedSamples() const { return m_accumulatedSamples; }
         int GetSamplesPerPixel() const { return m_samplesPerPixel; }
@@ -224,6 +225,10 @@ namespace ACG {
         glm::vec3 m_sunDirection = glm::vec3(0.0f, 1.0f, 0.0f);
         glm::vec3 m_sunColor = glm::vec3(1.0f, 1.0f, 1.0f);
         float m_sunIntensity = 0.0f;  // 0 = disabled
+        // Depth of Field parameters
+        bool m_enableDepthOfField = false;
+        float m_focusDistance = 5.0f;
+        float m_aperture = 0.1f;
         std::atomic<bool> m_isRendering;
         
         // OIDN降噪器

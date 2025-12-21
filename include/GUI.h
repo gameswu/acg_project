@@ -54,6 +54,11 @@ struct GUIState {
     bool cameraAnglesInitialized = false;
     float cameraUpAngle = 0.0f; // roll angle in degrees (rotation around camera forward)
     
+    // Depth of Field settings
+    bool enableDepthOfField = false;
+    float focusDistance = 5.0f;
+    float aperture = 0.1f;
+    
     // Internal state
     std::string renderStatus = "";
     bool showRenderStatus = false;

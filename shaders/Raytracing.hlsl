@@ -196,6 +196,7 @@ float4 SampleVirtualTexture(int texIndex, float2 uv)
     float3 Diffuse_Burley(float3 albedo, float3 N, float3 V, float3 L);
     float SampleGGX_Direction(float3 N, float3 V, float roughness, inout uint rngState, out float3 sampledDir, out float pdf);
     void EvaluatePrincipledBSDF(float3 N, float3 V, float3 L, float3 albedo, float metallic, float roughness, float3 F0, out float3 f, out float pdf);
+    float2 SampleCircularAperture(inout uint rngState);
 
     // Implementations
     float3 FresnelSchlick(float3 F0, float cosTheta)
@@ -369,6 +370,39 @@ float4 SampleVirtualTexture(int texIndex, float2 uv)
         float f = (ior - 1.0) / (ior + 1.0);
         float f0 = f * f;
         return float3(f0, f0, f0);
+    }
+
+    // ============================================================================
+    // Depth of Field - Thin Lens Camera Model
+    // ============================================================================
+    
+    // Sample a point on circular aperture (lens) using concentric disk mapping
+    // Returns offset in lens plane coordinates
+    float2 SampleCircularAperture(inout uint rngState)
+    {
+        // Uniform square samples [0,1] x [0,1]
+        float u1 = Random(rngState);
+        float u2 = Random(rngState);
+        
+        // Map to [-1,1] x [-1,1]
+        float sx = 2.0 * u1 - 1.0;
+        float sy = 2.0 * u2 - 1.0;
+        
+        // Concentric mapping to unit disk (Shirley & Chiu)
+        float r, theta;
+        if (sx == 0.0 && sy == 0.0) {
+            return float2(0.0, 0.0);
+        }
+        
+        if (abs(sx) > abs(sy)) {
+            r = sx;
+            theta = (PI / 4.0) * (sy / sx);
+        } else {
+            r = sy;
+            theta = (PI / 2.0) - (PI / 4.0) * (sx / sy);
+        }
+        
+        return r * float2(cos(theta), sin(theta));
     }
 
     // ============================================================================
@@ -668,10 +702,41 @@ void RayGen()
     float3 cameraRight = g_constants.viewInverse[0].xyz;     // First row
     float3 cameraUp = g_constants.viewInverse[1].xyz;        // Second row
     float3 cameraForward = -g_constants.viewInverse[2].xyz;  // Third row, camera looks along -Z
-    float3 origin = g_constants.viewInverse[3].xyz;          // Fourth row - position
+    float3 cameraPos = g_constants.viewInverse[3].xyz;       // Fourth row - position
     
-    // Build ray direction: forward + horizontal offset + vertical offset
-    float3 direction = normalize(cameraForward + ndc.x * cameraRight + ndc.y * cameraUp);
+    // ========== DEPTH OF FIELD (Thin Lens Camera Model) ==========
+    // Extract DOF parameters from cameraParams (z = aperture, w = focusDistance)
+    float aperture = g_constants.cameraParams.z;
+    float focusDistance = g_constants.cameraParams.w;
+    
+    float3 origin;
+    float3 direction;
+    
+    if (aperture > 0.001 && focusDistance > 0.1) {
+        // Thin lens camera with depth of field
+        
+        // 1. Compute focal point: where the ideal pinhole ray intersects the focus plane
+        float3 idealDirection = normalize(cameraForward + ndc.x * cameraRight + ndc.y * cameraUp);
+        float3 focalPoint = cameraPos + idealDirection * focusDistance;
+        
+        // 2. Sample a random point on the lens (circular aperture)
+        // Industry-standard thin lens model: aperture parameter directly controls lens radius
+        // Circle of Confusion (CoC) for depth z: CoC = |z - focusDistance| / z * (lensRadius / focusDistance)
+        // Typical values: aperture=0.05 for subtle DOF, aperture=0.2 for strong DOF, aperture=0.5 for extreme DOF
+        float lensRadius = aperture;  // Aperture directly represents lens radius in world space
+        float2 lensUV = SampleCircularAperture(rngState);
+        float3 lensOffset = lensRadius * (lensUV.x * cameraRight + lensUV.y * cameraUp);
+        
+        // 3. Ray origin is at the lens sample point
+        origin = cameraPos + lensOffset;
+        
+        // 4. Ray direction points from lens sample to focal point
+        direction = normalize(focalPoint - origin);
+    } else {
+        // Pinhole camera (no depth of field)
+        origin = cameraPos;
+        direction = normalize(cameraForward + ndc.x * cameraRight + ndc.y * cameraUp);
+    }
 
     // Path tracing with multiple bounces
     float3 radiance = float3(0, 0, 0);

@@ -14,6 +14,9 @@ struct PersistentConfig {
     glm::vec3 cameraPosition = glm::vec3(0.0f, 1.0f, 5.0f);
     glm::vec3 cameraDirection = glm::vec3(0.0f, 0.0f, -1.0f);
     float cameraFOV = 60.0f;
+    bool enableDepthOfField = false;
+    float focusDistance = 5.0f;
+    float aperture = 0.1f;
     
     // Render settings
     int samplesPerPixel = 100;

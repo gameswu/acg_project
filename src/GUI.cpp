@@ -966,6 +966,43 @@ void RenderCameraWindow(ACG::Renderer* renderer, GUIState& state) {
             camera->SetFOV(fov);
         }
         
+        ImGui::Separator();
+        ImGui::Text("Depth of Field");
+        
+        bool dofChanged = false;
+        if (ImGui::Checkbox("Enable Depth of Field", &state.enableDepthOfField)) {
+            dofChanged = true;
+        }
+        
+        if (state.enableDepthOfField) {
+            if (ImGui::InputFloat("Focus Distance", &state.focusDistance, 0.1f, 1.0f, "%.2f")) {
+                dofChanged = true;
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Auto Focus")) {
+                // Auto focus to center of scene (distance from camera to target)
+                glm::vec3 camPos = camera->GetPosition();
+                glm::vec3 target = camera->GetTarget();
+                state.focusDistance = glm::length(target - camPos);
+                dofChanged = true;
+            }
+            
+            // Aperture now represents physical lens radius in world space
+            // Typical values: 0.01=subtle DOF, 0.05=moderate, 0.1=strong, 0.2+=extreme
+            if (ImGui::SliderFloat("Aperture (Lens Radius)", &state.aperture, 0.001f, 0.3f, "%.3f")) {
+                dofChanged = true;
+            }
+            ImGui::TextWrapped("Tip: Aperture controls lens radius (0.05=moderate blur, 0.1=strong). Focus distance sets the sharp plane.");
+        }
+        
+        if (dofChanged) {
+            renderer->SetDepthOfField(state.enableDepthOfField, 
+                                     state.focusDistance, 
+                                     state.aperture);
+            renderer->ResetAccumulation();
+        }
+        
+        ImGui::Separator();
         if (ImGui::Button("Reset to Default")) {
             camera->SetPosition(glm::vec3(0.0f, 1.0f, 3.0f));
             camera->SetTarget(glm::vec3(0.0f, 0.0f, 0.0f));

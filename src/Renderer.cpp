@@ -1274,6 +1274,16 @@ void ACG::Renderer::SetSunIntensity(float intensity) {
     m_sunIntensity = intensity;
 }
 
+void ACG::Renderer::SetDepthOfField(bool enable, float focusDistance, float aperture) {
+    m_enableDepthOfField = enable;
+    m_focusDistance = focusDistance;
+    m_aperture = aperture;
+    // Propagate to Camera so camera constants reflect GUI changes
+    m_camera.SetFocusDistance(focusDistance);
+    // If DOF disabled, ensure camera aperture is zero to avoid accidental blur
+    m_camera.SetAperture(enable ? aperture : 0.0f);
+}
+
     void Renderer::CreateAccelerationStructures(ID3D12GraphicsCommandList4* cmdList) {
         if (!m_dxrSupported) {
             std::cout << "Skipping AS creation: DXR not supported" << std::endl;
