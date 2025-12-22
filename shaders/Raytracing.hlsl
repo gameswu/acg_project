@@ -21,7 +21,11 @@ struct RadiancePayload
 struct ShadowPayload
 {
     bool isVisible;  // True if ray reaches infinity without hitting geometry
+    uint rngState;   // RNG state for stochastic decisions inside anyhit
+    float transmittance; // Accumulated transmittance along the shadow ray (1.0 = fully transmissive)
 };
+
+// (Moved below after texture/virtual-texture helpers to ensure resources are declared)
 
 // Global root signature
 // #define GlobalRootSignature \
@@ -183,6 +187,26 @@ float4 SampleVirtualTexture(int texIndex, float2 uv)
     float4 sampledColor = g_virtualTextureCache.SampleLevel(g_sampler, finalCacheUV, 0);
     
     return sampledColor;
+}
+
+// Helper: sample opacity for a material at given texcoord (uses virtual textures when enabled)
+float SampleMaterialOpacity(uint materialIndex, float2 texCoord)
+{
+    Material mat = g_materials[materialIndex];
+    float alpha = mat.opacity();
+    int opacityTexIdx = mat.opacityTexIdx();
+    if (opacityTexIdx >= 0) {
+        float4 opacityTex;
+        if (g_constants.useVirtualTextures == 1) {
+            opacityTex = SampleVirtualTexture(opacityTexIdx, texCoord);
+        } else {
+            opacityTex = g_textures.SampleLevel(g_sampler, float3(texCoord, opacityTexIdx), 0);
+        }
+        // Use average RGB as grayscale opacity, fallback to alpha channel if provided
+        float texAlpha = (opacityTex.r + opacityTex.g + opacityTex.b) / 3.0;
+        alpha *= texAlpha;
+    }
+    return saturate(alpha);
 }
 
     // ===================== Principled / Microfacet BSDF Helpers =====================
@@ -832,10 +856,58 @@ void ShadowMiss(inout ShadowPayload payload)
 [shader("anyhit")]
 void ShadowAnyHit(inout ShadowPayload payload, in BuiltInTriangleIntersectionAttributes attribs)
 {
-    // Shadow ray hit geometry - light is occluded
-    payload.isVisible = false;
-    // Accept hit and terminate search immediately
-    AcceptHitAndEndSearch();
+    // Shadow ray hit geometry - perform stochastic alpha test for probabilistic transmission
+    uint primitiveIndex = PrimitiveIndex();
+    uint materialIndex = g_triangleMaterialIndices[primitiveIndex];
+
+    // Fetch triangle vertex indices and barycentrics (same as ClosestHit)
+    uint i0 = g_indices[primitiveIndex * 3 + 0];
+    uint i1 = g_indices[primitiveIndex * 3 + 1];
+    uint i2 = g_indices[primitiveIndex * 3 + 2];
+
+    float2 uv0 = g_vertices[i0].texCoord;
+    float2 uv1 = g_vertices[i1].texCoord;
+    float2 uv2 = g_vertices[i2].texCoord;
+
+    float3 barycentrics = float3(1.0 - attribs.barycentrics.x - attribs.barycentrics.y,
+                                  attribs.barycentrics.x,
+                                  attribs.barycentrics.y);
+    float2 texCoord = uv0 * barycentrics.x + uv1 * barycentrics.y + uv2 * barycentrics.z;
+
+    // Compute material opacity (0 = fully transmissive, 1 = opaque)
+    float opacity = SampleMaterialOpacity(materialIndex, texCoord);
+
+    // Fully opaque -> occlude immediately
+    if (opacity >= 0.999f) {
+        payload.isVisible = false;
+        AcceptHitAndEndSearch();
+        return;
+    }
+
+    // Fully transparent -> ignore this hit and continue traversal
+    if (opacity <= 1e-3f) {
+        IgnoreHit(); // continue traversal
+        return;
+    }
+
+    // Stochastic alpha: decide probabilistically whether this hit occludes
+    float r = Random(payload.rngState);
+    if (r < opacity) {
+        // Ray is occluded by this surface
+        payload.isVisible = false;
+        AcceptHitAndEndSearch();
+        return;
+    } else {
+        // Ray passes through; apply unbiased weight correction (divide by pass probability)
+        float passProb = 1.0 - opacity;
+        // Avoid division by zero (shouldn't happen due to earlier checks)
+        if (passProb > 1e-6f) {
+            payload.transmittance *= 1.0 / passProb;
+        }
+        // Ignore this hit and continue searching for further occluders
+        IgnoreHit();
+        return;
+    }
 }
 
 [shader("closesthit")]
@@ -1238,16 +1310,22 @@ void ClosestHit(inout RadiancePayload payload, in BuiltInTriangleIntersectionAtt
                     
                     ShadowPayload shadowPayload;
                     shadowPayload.isVisible = false;
-                    
+                    shadowPayload.rngState = payload.rngState; // seed from current path RNG
+                    shadowPayload.transmittance = 1.0f;
+
                     TraceRay(g_scene, RAY_FLAG_NONE, 0xFF, 0, 0, 1, shadowRay, shadowPayload);
-                    
-                    if (shadowPayload.isVisible) {
+
+                    // Update RNG state back to path payload to keep sequences in sync
+                    payload.rngState = shadowPayload.rngState;
+
+                    // Multiply direct lighting by accumulated transmittance (handles semi-transparent occluders)
+                    if (shadowPayload.transmittance > 0.0f) {
                         float3 f_sun;
                         float pdf_bsdf_sun;
                         EvaluatePrincipledBSDF(normal, V, sunDir, albedo, metallic, roughness, F0, f_sun, pdf_bsdf_sun);
                         
                         // Sun is delta - no MIS. Account for 5% probability (1/0.05 = 20.0)
-                        directLighting += f_sun * sunColor * sunIntensity * NdotL_sun * 20.0;
+                        directLighting += f_sun * sunColor * sunIntensity * NdotL_sun * 20.0 * shadowPayload.transmittance;
                     }
                 }
             }
