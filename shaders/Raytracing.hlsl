@@ -95,6 +95,32 @@ float2 DirectionToEquirectangularUV(float3 dir)
     return float2(u, v);
 }
 
+// ============================================================================
+// RGB Chromatic Dispersion - Compute wavelength-dependent IOR
+// ============================================================================
+
+// Calculate RGB channel-specific IOR for chromatic dispersion
+// Formula: IOR_channel = 1 + (baseIOR - 1) * channelFactor
+// Red has lowest IOR (longest wavelength), Blue has highest (shortest wavelength)
+float3 ComputeDispersedIOR(float baseIOR)
+{
+    // Dispersion strength: 0.15 means 15% variation across visible spectrum
+    const float dispersionStrength = 0.15;
+    
+    // Base offset from vacuum IOR
+    float iorOffset = baseIOR - 1.0;
+    
+    // RGB wavelength factors (relative to center wavelength)
+    // Red: -1.0 (below center), Green: 0.0 (center), Blue: +1.0 (above center)
+    float3 wavelengthFactors = float3(-1.0, 0.0, 1.0);
+    
+    // Compute dispersed IOR for each channel
+    // Lower wavelength (blue) -> higher IOR -> more refraction
+    float3 dispersedIOR = 1.0 + iorOffset * (1.0 + wavelengthFactors * dispersionStrength);
+    
+    return dispersedIOR;
+}
+
 // Helper function to create orthonormal basis from normal
 void CreateOrthonormalBasis(float3 normal, out float3 tangent, out float3 bitangent)
 {
@@ -962,7 +988,12 @@ void ClosestHit(inout RadiancePayload payload, in BuiltInTriangleIntersectionAtt
     float3 faceNormal = normalize(cross(edge1, edge2));
     
     // Interpolated shading normal
-    float3 interpolatedNormal = normalize(n0 * barycentrics.x + n1 * barycentrics.y + n2 * barycentrics.z);
+    float3 n0_check = g_vertices[i0].normal;
+    float3 n1_check = g_vertices[i1].normal;
+    float3 n2_check = g_vertices[i2].normal;
+    float3 interpolatedNormal = n0_check * barycentrics.x + n1_check * barycentrics.y + n2_check * barycentrics.z;
+    float normLength = length(interpolatedNormal);
+    interpolatedNormal = normLength > 0.001 ? interpolatedNormal / normLength : faceNormal;
     
     // Ensure face normal points away from the ray (outward from the surface)
     if (dot(faceNormal, rayDir) > 0.0) {
@@ -1172,23 +1203,69 @@ void ClosestHit(inout RadiancePayload payload, in BuiltInTriangleIntersectionAtt
             payload.nextDirection = reflectDir;
             // throughput unchanged except by reflectance (handled elsewhere)
         } else {
-            // Refraction
+            // ========== RGB CHROMATIC DISPERSION REFRACTION ==========
+            // Each color channel refracts at different angle due to wavelength-dependent IOR
+            
             // Determine current and target IOR from payload stack
             float iorCurrent = payload.iorStack[payload.iorStackTop];
             // Use geometric normal for robust entering/exiting detection
             bool entering = dot(rayDir, geometricNormal) < 0.0; // entering if ray goes against geometric normal
-            float iorTarget = entering ? mat.ior() : (payload.iorStackTop > 0 ? payload.iorStack[payload.iorStackTop - 1] : 1.0f);
+            float baseIorTarget = entering ? mat.ior() : (payload.iorStackTop > 0 ? payload.iorStack[payload.iorStackTop - 1] : 1.0f);
 
-            float etaLocal = iorCurrent / iorTarget;
-            float kLocal = 1.0 - etaLocal * etaLocal * (1.0 - cosI * cosI);
-            // If total internal reflection detected here, fallback to reflection
-            if (kLocal < 0.0) {
+            // Compute dispersed IOR for RGB channels
+            float3 iorTargetRGB = entering ? ComputeDispersedIOR(mat.ior()) : float3(baseIorTarget, baseIorTarget, baseIorTarget);
+            
+            // Safety check: ensure IOR values are valid (> 0.1)
+            iorTargetRGB = max(iorTargetRGB, float3(0.1, 0.1, 0.1));
+            
+            // Calculate refraction for each RGB channel independently
+            float3 etaRGB = iorCurrent / iorTargetRGB;
+            float3 kRGB = 1.0 - etaRGB * etaRGB * (1.0 - cosI * cosI);
+            
+            // Check if any channel has total internal reflection
+            bool anyTIR = any(kRGB < 0.0);
+            
+            if (anyTIR) {
+                // Total internal reflection - fallback to regular reflection
                 float3 reflectDir = reflect(rayDir, N);
                 // Always offset away from surface along geometric normal
                 payload.nextOrigin = entering ? hitPos - offset : hitPos + offset;
                 payload.nextDirection = reflectDir;
             } else {
-                float3 refractDir = etaLocal * rayDir + (etaLocal * cosI - sqrt(kLocal)) * N;
+                // ========== RGB CHROMATIC DISPERSION (Monte Carlo Sampling) ==========
+                // Compute refracted direction for each RGB channel independently
+                float etaR = etaRGB.r;
+                float etaG = etaRGB.g;
+                float etaB = etaRGB.b;
+                
+                float kR = kRGB.r;
+                float kG = kRGB.g;
+                float kB = kRGB.b;
+                
+                float3 refractDirR = normalize(etaR * rayDir + (etaR * cosI - sqrt(kR)) * N);
+                float3 refractDirG = normalize(etaG * rayDir + (etaG * cosI - sqrt(kG)) * N);
+                float3 refractDirB = normalize(etaB * rayDir + (etaB * cosI - sqrt(kB)) * N);
+                
+                // Monte Carlo wavelength sampling: randomly select R, G, or B
+                // Each sample traces one wavelength, convergence gives correct spectral distribution
+                float wavelengthChoice = Random(payload.rngState);
+                float3 refractDir;
+                float3 wavelengthWeight = float3(1, 1, 1); // Weight for unbiased estimator
+                
+                if (wavelengthChoice < 0.333) {
+                    // Sample red wavelength
+                    refractDir = refractDirR;
+                    wavelengthWeight = float3(3.0, 0.0, 0.0); // Multiply by 1/pdf = 3
+                } else if (wavelengthChoice < 0.666) {
+                    // Sample green wavelength  
+                    refractDir = refractDirG;
+                    wavelengthWeight = float3(0.0, 3.0, 0.0);
+                } else {
+                    // Sample blue wavelength
+                    refractDir = refractDirB;
+                    wavelengthWeight = float3(0.0, 0.0, 3.0);
+                }
+                
                 payload.nextDirection = refractDir;
                 // Always offset away from surface along geometric normal
                 payload.nextOrigin = entering ? hitPos - offset : hitPos + offset;
@@ -1202,8 +1279,8 @@ void ClosestHit(inout RadiancePayload payload, in BuiltInTriangleIntersectionAtt
                     if (payload.iorStackTop > 0) payload.iorStackTop--;
                 }
 
-                // Apply color filtering (use texture-modified base color) and transmission amount
-                payload.throughput *= baseColor * trans;
+                // Apply color filtering with wavelength-specific weight for unbiased MC estimator
+                payload.throughput *= baseColor * trans * wavelengthWeight;
             }
         }
         return;

@@ -5,6 +5,7 @@ Extracts geometry and converts Phong materials to PBR approximations.
 """
 
 import os
+import sys
 from pathlib import Path
 from typing import List, Tuple
 import logging
@@ -249,12 +250,33 @@ class WavefrontLoader(BaseLoader):
             
             # Check illumination model for special handling
             illum = getattr(mat, 'illumination_model', 2)
-            is_mirror = (illum == 5)  # Perfect mirror
-            # Only treat as glass if illum 7 OR if illum 4/6 AND material is actually transparent
-            # Many exporters use illum 4 for all materials, so check actual transparency
-            is_glass = (illum == 7)  # Glass (refraction + reflection)
             
-            logger.debug(f"  illum mode: {illum} (mirror={is_mirror}, glass={is_glass})")
+            # illum 5 can be mirror OR glass - check IOR to determine
+            # If material has IOR > 1.0, treat as glass (like water), otherwise treat as mirror
+            ior_value = getattr(mat, 'optical_density', 1.0)
+            is_mirror = False
+            is_glass = False
+            
+            # Get Tf (transmission filter) color FIRST for base_color decision
+            tf_color = tf_values.get(mat_name, [1.0, 1.0, 1.0])
+            tf_avg = sum(tf_color) / 3.0
+            
+            # DEBUG: Print to stderr to bypass logging level filter
+            print(f"[DEBUG] Material '{mat_name}': illum={illum}, IOR={ior_value:.2f}, Tf={tf_avg:.2f}", file=sys.stderr)
+            
+            if illum == 5:
+                if ior_value > 1.01:  # Has meaningful refraction
+                    is_glass = True
+                    print(f"[DEBUG]   → Treating as GLASS (has refraction)", file=sys.stderr)
+                else:
+                    is_mirror = True
+                    print(f"[DEBUG]   → Treating as MIRROR (no refraction)", file=sys.stderr)
+            elif illum == 7:
+                is_glass = True
+            elif illum == 3:
+                is_mirror = True
+            
+            logger.debug(f"  illum mode: {illum} (mirror={is_mirror}, glass={is_glass}, IOR={ior_value:.2f})")
             
             # Diffuse color -> base color
             # For mirror materials, prefer specular color as base_color
@@ -265,6 +287,15 @@ class WavefrontLoader(BaseLoader):
                     float(mat.specular[2])
                 ]
                 logger.debug(f"  Using specular as base_color for mirror: {material.base_color}")
+            elif is_glass:
+                # For highly transparent glass (Tf > 0.7), use white base color
+                # For water-like materials (Tf < 0.7), use tinted base color
+                if tf_avg > 0.7:
+                    material.base_color = [0.95, 0.95, 0.95]  # Nearly white for transparent glass
+                    print(f"[DEBUG]   → Using white base_color for transparent glass (Tf={tf_avg:.2f})", file=sys.stderr)
+                else:
+                    material.base_color = [0.15, 0.25, 0.30]  # Blue-green tint for water
+                    print(f"[DEBUG]   → Using tinted base_color for water (Tf={tf_avg:.2f})", file=sys.stderr)
             elif hasattr(mat, 'diffuse') and mat.diffuse:
                 material.base_color = [
                     float(mat.diffuse[0]),
@@ -289,10 +320,14 @@ class WavefrontLoader(BaseLoader):
                 spec_intensity = sum(mat.specular[:3]) / 3.0
                 has_specular = spec_intensity > 0.01  # Consider > 0.01 as having specular
                 
-                # Mirror materials (illum 5) should be highly metallic
+                # Mirror materials (illum 5 without IOR) should be highly metallic
+                # Glass materials (illum 5 with IOR) should be dielectric (non-metallic)
                 if is_mirror:
                     material.metallic = 1.0
-                    logger.debug(f"  Metallic: 1.0 (mirror material, illum=5)")
+                    logger.debug(f"  Metallic: 1.0 (mirror material)")
+                elif is_glass:
+                    material.metallic = 0.0  # Dielectric, not metallic
+                    logger.debug(f"  Metallic: 0.0 (glass material)")
                 elif spec_intensity > 0.5:
                     material.metallic = min(spec_intensity, 1.0)
                     logger.debug(f"  Metallic (from specular): {material.metallic:.2f}")
@@ -302,7 +337,11 @@ class WavefrontLoader(BaseLoader):
             if is_mirror:
                 # Mirror materials should have very low roughness
                 material.roughness = 0.0
-                logger.debug(f"  Roughness: 0.0 (mirror material, illum=5)")
+                logger.debug(f"  Roughness: 0.0 (mirror material)")
+            elif is_glass:
+                # Glass materials: slightly rough for realistic surface
+                material.roughness = 0.05  # Very smooth but not perfect
+                logger.debug(f"  Roughness: 0.05 (glass material)")
             elif not has_specular:
                 material.roughness = 1.0
                 logger.debug(f"  Roughness: 1.0 (purely diffuse, no specular)")
@@ -326,15 +365,13 @@ class WavefrontLoader(BaseLoader):
                     logger.debug(f"  Emission: {material.emission} (intensity: {emission_intensity:.2f})")
             
             # Opacity/transparency
-            # Get Tf (transmission filter) color if available
-            tf_color = tf_values.get(mat_name, [1.0, 1.0, 1.0])
+            # Tf color already extracted above
             
             # Check if material is actually transparent (not just illum mode)
             # Only treat as transparent if:
             # 1. Has explicit transparency value (d < 0.99)
             # 2. OR Tf (transmission filter) is NOT white (colored transmission)
             kd_avg = sum(material.base_color) / 3.0 if material.base_color else 1.0
-            tf_avg = sum(tf_color) / 3.0
             has_explicit_transparency = hasattr(mat, 'transparency') and mat.transparency < 0.99
             has_colored_transmission = tf_avg < 0.99  # Tf != white means colored glass
             is_actually_transparent = has_explicit_transparency or has_colored_transmission
@@ -344,9 +381,13 @@ class WavefrontLoader(BaseLoader):
             
             # For glass materials (illum 7) OR illum 4/6 with actual transparency, enable transmission
             if is_glass or (illum in [4, 6] and is_actually_transparent):
-                # Glass material - high transmission
-                material.opacity = 0.1  # Very transparent
-                transmission_strength = 0.9
+                # Glass material - use Tf value to control transparency
+                # Tf close to 1.0 = highly transparent, Tf close to 0.0 = opaque
+                # opacity: lower = more transparent, higher = more reflective
+                # transmission_strength: higher = more light passes through
+                material.opacity = 1.0 - tf_avg  # Tf=0.85 → opacity=0.15 (very transparent)
+                transmission_strength = tf_avg  # Tf=0.85 → strength=0.85 (high transmission)
+                print(f"[DEBUG]   → Glass transmission: Tf={tf_avg:.2f}, opacity={material.opacity:.2f}, strength={transmission_strength:.2f}", file=sys.stderr)
                 material.transmission = TransmissionLayer(
                     strength=transmission_strength,
                     roughness=material.roughness,
@@ -443,6 +484,7 @@ class WavefrontLoader(BaseLoader):
         materials: List[Material]
     ) -> List[Mesh]:
         """Extract geometry from PyWavefront scene"""
+        print(f"[DEBUG] _extract_meshes called, materials dict size: {len(wavefront_scene.materials)}")
         meshes = []
         material_map = {mat.name: idx for idx, mat in enumerate(materials)}
         
@@ -450,12 +492,17 @@ class WavefrontLoader(BaseLoader):
             if not hasattr(mesh_mat, 'vertices') or not mesh_mat.vertices:
                 continue
             
-            logger.debug(f"Processing mesh: {mesh_name}")
+            print(f"[DEBUG] Processing mesh: {mesh_name}")
+            logger.info(f"Processing mesh: {mesh_name}")
             
             # Determine vertex stride
             vertex_format = mesh_mat.vertex_format
+            print(f"[DEBUG]   Vertex format: {vertex_format}")
+            logger.info(f"  Vertex format: {vertex_format}")
             # Format example: "V3F N3F T2F" means 3+3+2=8 floats per vertex
             stride = self._calculate_stride(vertex_format)
+            print(f"[DEBUG]   Calculated stride: {stride}")
+            logger.info(f"  Calculated stride: {stride}")
             
             # Extract vertices
             vertices_flat = mesh_mat.vertices
@@ -474,11 +521,44 @@ class WavefrontLoader(BaseLoader):
             # Generate indices (assuming already triangulated)
             indices = list(range(num_vertices))
             
-            # Check if normals need to be computed
+            # ALWAYS compute smooth normals for meshes without explicit normals
+            # Check if normals need to be computed (OBJ files without vn lines)
             needs_normal_computation = 'N' not in vertex_format.upper()
+            
+            print(f"[DEBUG]   Needs normal computation: {needs_normal_computation}")
+            logger.info(f"  Needs normal computation: {needs_normal_computation}")
+            
             if needs_normal_computation:
-                logger.debug(f"  Computing normals for {mesh_name} (format: {vertex_format})")
+                print(f"[DEBUG]   Format '{vertex_format}' has no normals, computing smooth normals")
+                logger.info(f"  Format '{vertex_format}' has no normals, computing smooth normals for {mesh_name}")
+            
+            # Also check if all normals are identical (PyWavefront may generate flat normals)
+            if not needs_normal_computation and len(vertices) > 3:
+                first_normal = vertices[0].normal
+                print(f"[DEBUG]   First normal: {first_normal}")
+                # Check first 20 vertices to detect flat normals
+                sample_size = min(20, len(vertices))
+                all_same = all(
+                    abs(v.normal[0] - first_normal[0]) < 0.001 and
+                    abs(v.normal[1] - first_normal[1]) < 0.001 and
+                    abs(v.normal[2] - first_normal[2]) < 0.001
+                    for v in vertices[:sample_size]
+                )
+                print(f"[DEBUG]   All normals same: {all_same}")
+                if all_same:
+                    print(f"[DEBUG]   Detected flat normals ({first_normal}), recomputing smooth normals")
+                    logger.info(f"  Detected flat normals ({first_normal}) in {mesh_name}, recomputing smooth normals")
+                    needs_normal_computation = True
+                else:
+                    print(f"[DEBUG]   Normals vary, keeping original")
+                    logger.info(f"  Format '{vertex_format}' has varying normals, keeping original normals for {mesh_name}")
+            
+            if needs_normal_computation:
+                print(f"[DEBUG]   Computing smooth normals for {num_vertices} vertices")
+                logger.info(f"  Computing smooth normals for {mesh_name} ({num_vertices} vertices)")
                 vertices = self._compute_normals(vertices, indices)
+                print(f"[DEBUG]   Smooth normals computed")
+                logger.info(f"  Smooth normals computed for {mesh_name}")
             
             # Create mesh
             mesh = Mesh(
