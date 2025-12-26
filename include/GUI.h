@@ -59,6 +59,10 @@ struct GUIState {
     float focusDistance = 5.0f;
     float aperture = 0.1f;
     
+    // Cartoon style settings
+    bool simplifiedRendering = false;
+    bool specialStyle = false;
+    
     // Internal state
     std::string renderStatus = "";
     bool showRenderStatus = false;

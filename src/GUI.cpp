@@ -35,6 +35,88 @@ static std::unique_ptr<std::thread> g_renderThread;
 static std::string g_lastLoadedScene;
 static std::string g_lastLoadedEnvMap;
 
+// Apply cartoon-style post-processing to PPM image
+void ApplyCartoonStyleToImage(const std::string& imagePath) {
+    std::cout << "Applying cartoon style post-processing..." << std::endl;
+    
+    // Read PPM file
+    std::ifstream file(imagePath, std::ios::binary);
+    if (!file.is_open()) {
+        std::cerr << "Failed to open image for cartoon processing: " << imagePath << std::endl;
+        return;
+    }
+    
+    // Parse PPM header
+    std::string magic;
+    int width, height, maxval;
+    file >> magic >> width >> height >> maxval;
+    file.get(); // Skip newline
+    
+    if (magic != "P6" || maxval != 255) {
+        std::cerr << "Unsupported PPM format" << std::endl;
+        file.close();
+        return;
+    }
+    
+    // Read pixel data
+    std::vector<uint8_t> pixels(width * height * 3);
+    file.read(reinterpret_cast<char*>(pixels.data()), pixels.size());
+    file.close();
+    
+    // Apply cartoon-style effects:
+    // 1. Color quantization (reduce to 8 colors per channel)
+    // 2. Edge enhancement for cel-shading look
+    std::vector<uint8_t> processed(width * height * 3);
+    
+    const int colorLevels = 8; // Reduce to 8 levels per channel (cartoon posterization)
+    const int stepSize = 256 / colorLevels;
+    
+    for (int i = 0; i < width * height * 3; i++) {
+        int quantized = (pixels[i] / stepSize) * stepSize;
+        processed[i] = static_cast<uint8_t>(std::min(255, quantized));
+    }
+    
+    // Simple edge detection and enhancement (Sobel-like)
+    std::vector<uint8_t> withEdges = processed;
+    for (int y = 1; y < height - 1; y++) {
+        for (int x = 1; x < width - 1; x++) {
+            int idx = (y * width + x) * 3;
+            
+            // Calculate gradient for each channel
+            for (int c = 0; c < 3; c++) {
+                int gx = 
+                    -processed[((y-1)*width + (x-1))*3 + c] + processed[((y-1)*width + (x+1))*3 + c] +
+                    -2*processed[(y*width + (x-1))*3 + c] + 2*processed[(y*width + (x+1))*3 + c] +
+                    -processed[((y+1)*width + (x-1))*3 + c] + processed[((y+1)*width + (x+1))*3 + c];
+                    
+                int gy = 
+                    -processed[((y-1)*width + (x-1))*3 + c] - 2*processed[((y-1)*width + x)*3 + c] - processed[((y-1)*width + (x+1))*3 + c] +
+                    processed[((y+1)*width + (x-1))*3 + c] + 2*processed[((y+1)*width + x)*3 + c] + processed[((y+1)*width + (x+1))*3 + c];
+                
+                int gradient = std::abs(gx) + std::abs(gy);
+                
+                // If edge detected, darken the pixel (cel-shading black outlines)
+                if (gradient > 100) {
+                    withEdges[idx + c] = static_cast<uint8_t>(withEdges[idx + c] * 0.3f);
+                }
+            }
+        }
+    }
+    
+    // Write processed image back
+    std::ofstream outFile(imagePath, std::ios::binary);
+    if (!outFile.is_open()) {
+        std::cerr << "Failed to write processed image" << std::endl;
+        return;
+    }
+    
+    outFile << "P6\n" << width << " " << height << "\n255\n";
+    outFile.write(reinterpret_cast<const char*>(withEdges.data()), withEdges.size());
+    outFile.close();
+    
+    std::cout << "Cartoon style applied successfully" << std::endl;
+}
+
 void InitializeGUIState(GUIState& state, const std::string& exeDirectory) {
     // Set default output path
     if (!exeDirectory.empty()) {
@@ -674,6 +756,14 @@ void RenderControlsWindow(ACG::Renderer* renderer, GUIState& state) {
                 int bounces = state.maxBounces;
                 int renderWidth = state.width;
                 int renderHeight = state.height;
+                bool useSimplifiedRendering = state.simplifiedRendering;
+                bool useSpecialStyle = state.specialStyle;
+                
+                // Apply simplified rendering: force 32x32 resolution
+                if (useSimplifiedRendering) {
+                    renderWidth = 32;
+                    renderHeight = 32;
+                }
                 
                 // Join previous thread if exists
                 if (g_renderThread && g_renderThread->joinable()) {
@@ -697,7 +787,7 @@ void RenderControlsWindow(ACG::Renderer* renderer, GUIState& state) {
                 // Record start time
                 auto startTime = std::chrono::steady_clock::now();
                 
-                g_renderThread = std::make_unique<std::thread>([renderer, modelPathStr, outputPathStr, envMapPathStr, samples, bounces, renderWidth, renderHeight, needsSceneLoad, needsEnvMapLoad, startTime, &state]() {
+                g_renderThread = std::make_unique<std::thread>([renderer, modelPathStr, outputPathStr, envMapPathStr, samples, bounces, renderWidth, renderHeight, needsSceneLoad, needsEnvMapLoad, startTime, useSpecialStyle, &state]() {
                     try {
                         // Set rendering flags at the start
                         g_isRendering.store(true);
@@ -788,6 +878,11 @@ void RenderControlsWindow(ACG::Renderer* renderer, GUIState& state) {
                         });
                         
                         renderer->RenderToFile(outputPathStr, samples, bounces);
+                        
+                        // Apply cartoon style post-processing if enabled
+                        if (useSpecialStyle) {
+                            ApplyCartoonStyleToImage(outputPathStr);
+                        }
                         
                         // Signal progress thread to stop and wait for it
                         progressThreadRunning.store(false);
@@ -1014,6 +1109,35 @@ void RenderCameraWindow(ACG::Renderer* renderer, GUIState& state) {
     ImGui::End();
 }
 
+void RenderCartoonStyleWindow(ACG::Renderer* renderer, GUIState& state) {
+    ImGui::Begin("Cartoon Style", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
+    
+    ImGui::Text("Cartoon Rendering Options");
+    ImGui::Separator();
+    
+    if (ImGui::Checkbox("Old School", &state.simplifiedRendering)) {
+        // Reset accumulation when option changes
+        renderer->ResetAccumulation();
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("(?)");
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Enable old school low-res rendering (32x32)");
+    }
+    
+    if (ImGui::Checkbox("Special Style", &state.specialStyle)) {
+        // Reset accumulation when option changes
+        renderer->ResetAccumulation();
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("(?)");
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Apply special cartoon visual effects");
+    }
+    
+    ImGui::End();
+}
+
 void RenderResultWindow(ACG::Renderer* renderer, GUIState& state) {
     ImGui::SetNextWindowSize(ImVec2(850, 650), ImGuiCond_FirstUseEver);
     ImGui::Begin("Render Result");
@@ -1145,6 +1269,7 @@ void RenderGUI(ACG::Renderer* renderer, GUIState& state, HWND hwnd) {
     RenderSettingsWindow(renderer, state, hwnd);
     RenderControlsWindow(renderer, state);
     RenderCameraWindow(renderer, state);
+    RenderCartoonStyleWindow(renderer, state);
     RenderResultWindow(renderer, state);
     
     if (state.pLogMessages) {
