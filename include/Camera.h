@@ -39,6 +39,14 @@ public:
     // 相机控制
     void Rotate(float yaw, float pitch);
     void Move(const glm::vec3& offset);
+    
+    // 狭义相对论渲染参数
+    void SetRelativisticEnabled(bool enabled) { m_relativisticEnabled = enabled; }
+    bool GetRelativisticEnabled() const { return m_relativisticEnabled; }
+    void SetRelativisticVelocity(const glm::vec3& velocity);  // 速度向量 (单位: c)
+    glm::vec3 GetRelativisticVelocity() const { return m_relativisticVelocity; }
+    float GetBeta() const;   // |v|/c
+    float GetGamma() const;  // 洛伦兹因子: 1 / sqrt(1 - beta^2)
 
 private:
     glm::vec3 m_position;
@@ -51,6 +59,10 @@ private:
     float m_aspectRatio;
     float m_aperture;       // Depth of field
     float m_focusDistance;  // Depth of field
+    
+    // 狭义相对论参数
+    bool m_relativisticEnabled;     // 是否启用相对论效果
+    glm::vec3 m_relativisticVelocity;  // 相对于静止场景的速度 (单位: c, 光速)
     
     void UpdateVectors();
 };

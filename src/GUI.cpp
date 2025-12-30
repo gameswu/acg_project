@@ -1097,6 +1097,60 @@ void RenderCameraWindow(ACG::Renderer* renderer, GUIState& state) {
             renderer->ResetAccumulation();
         }
         
+        // ==================== Relativistic Rendering Section ====================
+        ImGui::Separator();
+        ImGui::Text("Special Relativity Effects");
+        ImGui::TextWrapped("Simulate visual effects of camera moving at relativistic speeds along its forward direction");
+        
+        bool relativisticChanged = false;
+        if (ImGui::Checkbox("Enable Relativistic Rendering", &state.relativisticEnabled)) {
+            relativisticChanged = true;
+        }
+        
+        if (state.relativisticEnabled) {
+            // Speed control (0 to 0.99c)
+            if (ImGui::SliderFloat("Speed (fraction of c)", &state.relativisticSpeed, 0.0f, 0.99f, "%.3f")) {
+                relativisticChanged = true;
+            }
+            
+            // Note: velocity direction is camera forward (simplifies physics and GPU data)
+            ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Direction: Camera Forward");
+            ImGui::TextWrapped("Tip: Rotate the camera to change the direction of motion");
+            
+            // Quick presets
+            if (ImGui::Button("Preset: 0.5c")) {
+                state.relativisticSpeed = 0.5f;
+                relativisticChanged = true;
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Preset: 0.9c")) {
+                state.relativisticSpeed = 0.9f;
+                relativisticChanged = true;
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Preset: 0.99c")) {
+                state.relativisticSpeed = 0.99f;
+                relativisticChanged = true;
+            }
+            
+            // Display computed values
+            float beta = state.relativisticSpeed;
+            float gamma = (beta < 0.0001f) ? 1.0f : 1.0f / sqrt(1.0f - beta * beta);
+            ImGui::Text("Lorentz Factor (gamma): %.3f", gamma);
+            ImGui::Text("Time Dilation: %.3fx slower", gamma);
+            
+            ImGui::TextWrapped("Effects: Aberration (light bends toward motion), Doppler shift (blue forward, red backward), Headlight effect (brighter forward)");
+        }
+        
+        if (relativisticChanged) {
+            // Velocity direction is now always camera forward, just set speed
+            glm::vec3 velocity = glm::vec3(0, 0, -1) * state.relativisticSpeed;  // Placeholder, actual direction from camera
+            
+            camera->SetRelativisticEnabled(state.relativisticEnabled);
+            camera->SetRelativisticVelocity(velocity);
+            renderer->ResetAccumulation();
+        }
+        
         ImGui::Separator();
         if (ImGui::Button("Reset to Default")) {
             camera->SetPosition(glm::vec3(0.0f, 1.0f, 3.0f));

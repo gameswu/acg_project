@@ -59,6 +59,12 @@ struct GUIState {
     float focusDistance = 5.0f;
     float aperture = 0.1f;
     
+    // Relativistic rendering settings (狭义相对论渲染)
+    bool relativisticEnabled = false;
+    float relativisticSpeed = 0.0f;      // Speed as fraction of c (0.0 - 0.99)
+    float relativisticAzimuth = 0.0f;    // Direction azimuth in degrees
+    float relativisticElevation = 0.0f;  // Direction elevation in degrees
+    
     // Cartoon style settings
     bool simplifiedRendering = false;
     bool specialStyle = false;

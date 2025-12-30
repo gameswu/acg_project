@@ -80,7 +80,7 @@ namespace ACG {
             glm::vec4 cameraParams;
             // Sun parameters packed as vec4 for safe alignment
             glm::vec4 sunDirIntensity; // xyz = direction (toward light), w = intensity
-            glm::vec4 sunColorEnabled; // rgb = color, a = enabled (0 or 1)
+            glm::vec4 sunColorEnabled; // rgb = color, a = relativistic speed (0 = disabled, >0 = beta)
         };
 
         void InitPipeline(HWND hwnd);

@@ -8,6 +8,7 @@ struct RadiancePayload
     float3 throughput;    // Path throughput
     float3 nextOrigin;    // Next ray origin (for iterative tracing)
     float3 nextDirection; // Next ray direction (for iterative tracing)
+    float3 initialRayDir; // Initial ray direction (for relativistic Doppler calculation)
     uint rngState;        // RNG state
     bool terminated;      // Path terminated flag
     float misWeight;      // MIS weight for BSDF sampling (used when hitting environment)
@@ -47,7 +48,7 @@ struct CameraConstants
     uint useVirtualTextures;  // 0 = texture array, 1 = virtual textures
     float4 cameraParams;      // x = FOV, y = aspectRatio, z = aperture, w = focusDistance
     float4 sunDirIntensity;   // xyz = sun direction, w = intensity
-    float4 sunColorEnabled;   // rgb = sun color, a = enabled
+    float4 sunColorEnabled;   // rgb = sun color, a = relativistic speed (0 = disabled, >0 = beta)
 };
 
 // Scene constants (using new structure)
@@ -98,8 +99,124 @@ float2 DirectionToEquirectangularUV(float3 dir)
 // ============================================================================
 // RGB Chromatic Dispersion - Compute wavelength-dependent IOR
 // ============================================================================
+// SPECIAL RELATIVITY HELPER FUNCTIONS
+// ============================================================================
+// When camera moves at relativistic speeds, light undergoes:
+// 1. Aberration (光行差): Light direction shifts toward motion direction
+// 2. Doppler shift (多普勒频移): Colors shift (blueshift forward, redshift backward)
+// 3. Headlight effect (探照灯效应): Brightness increases in forward direction
 
-// Calculate RGB channel-specific IOR for chromatic dispersion
+// Get relativistic parameters from sunColorEnabled.a
+// Returns: x = beta (speed/c), y = gamma (Lorentz factor), z = enabled (0 or 1)
+float3 GetRelativisticParams()
+{
+    float beta = g_constants.sunColorEnabled.a;  // Speed as fraction of c (0 = disabled)
+    float enabled = (beta > 0.001) ? 1.0 : 0.0;
+    float gamma = (beta > 0.001) ? (1.0 / sqrt(1.0 - beta * beta)) : 1.0;
+    return float3(beta, gamma, enabled);
+}
+
+// Get camera forward direction from view matrix
+float3 GetCameraForward()
+{
+    // viewInverse column 2 is the camera's -Z axis (forward direction)
+    return -normalize(float3(g_constants.viewInverse[0][2], 
+                              g_constants.viewInverse[1][2], 
+                              g_constants.viewInverse[2][2]));
+}
+
+// Relativistic aberration: transform ray direction from observer frame to scene frame
+// When observer moves with velocity v, light from angle θ in scene appears at angle θ' in observer frame
+// We need the INVERSE: given where observer looks (θ'), find where light came from in scene (θ)
+float3 RelativisticAberration(float3 dirObserver, float3 velocity, float beta, float gamma)
+{
+    if (beta < 0.001) return dirObserver;
+    
+    float3 v_hat = velocity / beta;
+    float cosThetaPrime = dot(dirObserver, v_hat);  // θ' = angle in observer's frame
+    
+    // INVERSE aberration formula: cos(θ) = (cos(θ') - β) / (1 - β·cos(θ'))
+    // This gives us where the light actually came from in the scene
+    float cosTheta = (cosThetaPrime - beta) / (1.0 - beta * cosThetaPrime);
+    
+    float3 parallel = v_hat * cosThetaPrime;
+    float3 perp = dirObserver - parallel;
+    float perpLen = length(perp);
+    
+    float sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
+    
+    if (perpLen > 1e-6) {
+        float3 perp_hat = perp / perpLen;
+        return normalize(v_hat * cosTheta + perp_hat * sinTheta);
+    } else {
+        return cosTheta >= 0.0 ? v_hat : -v_hat;
+    }
+}
+
+// Relativistic Doppler factor: D = γ(1 + β·cos(θ))
+// D > 1: blueshift (approaching), D < 1: redshift (receding)
+float RelativisticDopplerFactor(float3 rayDir, float3 velocity, float beta, float gamma)
+{
+    if (beta < 0.001) return 1.0;
+    float3 lightDir = -rayDir;
+    float3 v_hat = velocity / beta;
+    float cosTheta = dot(lightDir, v_hat);
+    return gamma * (1.0 + beta * cosTheta);
+}
+
+// Convert wavelength (nm) to approximate RGB color
+float3 WavelengthToRGB(float wavelength)
+{
+    float3 rgb;
+    rgb.r = exp(-0.5 * pow((wavelength - 600.0) / 60.0, 2.0));
+    rgb.g = exp(-0.5 * pow((wavelength - 550.0) / 40.0, 2.0));
+    rgb.b = exp(-0.5 * pow((wavelength - 450.0) / 30.0, 2.0));
+    return rgb;
+}
+
+// Apply relativistic Doppler shift to color
+// Uses smooth intensity falloff for wavelengths outside visible range
+float3 ApplyRelativisticDopplerShift(float3 originalColor, float dopplerFactor)
+{
+    // Clamp doppler factor to prevent extreme color distortion
+    // At very high speeds, allow larger shifts but not infinite
+    float clampedDoppler = clamp(dopplerFactor, 0.2, 5.0);
+    
+    float3 wavelengths = float3(650.0, 550.0, 450.0);  // RGB reference wavelengths
+    float3 shiftedWavelengths = wavelengths / clampedDoppler;
+    
+    float3 result = float3(0, 0, 0);
+    
+    // Smooth falloff function for wavelengths outside visible range (380-780nm)
+    // Returns 1.0 in visible range, fades to 0 outside
+    #define VISIBLE_FALLOFF(wl) saturate(1.0 - max(0.0, 380.0 - (wl)) / 100.0) * saturate(1.0 - max(0.0, (wl) - 780.0) / 200.0)
+    
+    // Red channel contribution
+    float shiftedR = shiftedWavelengths.x;
+    float falloffR = VISIBLE_FALLOFF(shiftedR);
+    result += WavelengthToRGB(clamp(shiftedR, 380.0, 780.0)) * originalColor.r * falloffR;
+    
+    // Green channel contribution  
+    float shiftedG = shiftedWavelengths.y;
+    float falloffG = VISIBLE_FALLOFF(shiftedG);
+    result += WavelengthToRGB(clamp(shiftedG, 380.0, 780.0)) * originalColor.g * falloffG;
+    
+    // Blue channel contribution
+    float shiftedB = shiftedWavelengths.z;
+    float falloffB = VISIBLE_FALLOFF(shiftedB);
+    result += WavelengthToRGB(clamp(shiftedB, 380.0, 780.0)) * originalColor.b * falloffB;
+    
+    #undef VISIBLE_FALLOFF
+    
+    // Headlight effect: intensity scales as D^3
+    float intensityFactor = min(pow(dopplerFactor, 3.0), 10.0);
+    
+    return result * intensityFactor;
+}
+
+// ============================================================================
+// RGB Chromatic Dispersion - Compute wavelength-dependent IOR
+// ============================================================================
 // Formula: IOR_channel = 1 + (baseIOR - 1) * channelFactor
 // Red has lowest IOR (longest wavelength), Blue has highest (shortest wavelength)
 float3 ComputeDispersedIOR(float baseIOR)
@@ -787,6 +904,16 @@ void RayGen()
         origin = cameraPos;
         direction = normalize(cameraForward + ndc.x * cameraRight + ndc.y * cameraUp);
     }
+    
+    // ========== SPECIAL RELATIVITY: Aberration ==========
+    // When relativistic rendering is enabled, transform ray direction from observer frame to scene frame
+    float3 relParams = GetRelativisticParams();  // x=beta, y=gamma, z=enabled
+    if (relParams.z > 0.5) {
+        float beta = relParams.x;
+        float gamma = relParams.y;
+        float3 velocity = GetCameraForward() * beta;  // Velocity = camera forward * speed
+        direction = RelativisticAberration(direction, velocity, beta, gamma);
+    }
 
     // Path tracing with multiple bounces
     float3 radiance = float3(0, 0, 0);
@@ -804,6 +931,7 @@ void RayGen()
     payload.throughput = throughput;
     payload.nextOrigin = float3(0, 0, 0);
     payload.nextDirection = float3(0, 0, 0);
+    payload.initialRayDir = normalize(direction);  // Store initial direction for relativistic Doppler
     payload.rngState = rngState;
     payload.terminated = false;
     payload.misWeight = 1.0; // Primary ray doesn't need MIS
@@ -850,22 +978,52 @@ void Miss(inout RadiancePayload payload)
     float2 envUV = DirectionToEquirectangularUV(rayDir);
     float4 envColor = g_environmentMap.SampleLevel(g_sampler, envUV, 0);
     
+    // ========== SPECIAL RELATIVITY: Doppler Shift & Headlight Effect ==========
+    // Use initial ray direction for all Doppler calculations (consistent frequency shift)
+    // The Doppler factor represents how light frequency changes when entering observer's eye
+    float3 finalEnvColor = envColor.rgb;
+    float3 finalSunColor = g_constants.sunColorEnabled.rgb;
+    float headlightFactor = 1.0;  // Relativistic beaming intensity factor
+    
+    float3 relParams = GetRelativisticParams();  // x=beta, y=gamma, z=enabled
+    if (relParams.z > 0.5) {
+        float beta = relParams.x;
+        float gamma = relParams.y;
+        float3 velocity = GetCameraForward() * beta;
+        
+        // Use initial ray direction - the direction light ultimately enters the observer's eye
+        // This gives consistent color shift across the entire path
+        float3 observerDir = payload.initialRayDir;
+        float dopplerFactor = RelativisticDopplerFactor(observerDir, velocity, beta, gamma);
+        
+        // Apply Doppler color shift to environment
+        finalEnvColor = ApplyRelativisticDopplerShift(envColor.rgb, dopplerFactor);
+        finalSunColor = ApplyRelativisticDopplerShift(g_constants.sunColorEnabled.rgb, dopplerFactor);
+        
+        // Headlight effect: relativistic beaming increases intensity in forward direction
+        // For extended sources: intensity scales as D^3 (D = Doppler factor)
+        // We use D^2 for a less extreme but still noticeable effect
+        headlightFactor = dopplerFactor * dopplerFactor;
+        // Clamp to prevent extreme values
+        headlightFactor = clamp(headlightFactor, 0.1, 10.0);
+    }
+    
     // Apply MIS weight to environment light contribution (BSDF sampling path)
     // misWeight was computed in ClosestHit for balance heuristic
-    payload.radiance += payload.throughput * envColor.rgb * g_constants.environmentLightIntensity * payload.misWeight;
+    payload.radiance += payload.throughput * finalEnvColor * g_constants.environmentLightIntensity * payload.misWeight * headlightFactor;
 
     // Add directional sun contribution for rays that reach infinity.
     // Sun is delta distribution, so BSDF sampling has zero probability - no MIS needed
     if (g_constants.sunDirIntensity.w > 0.0) {
         float3 sunDir = normalize(g_constants.sunDirIntensity.xyz);
         float sunIntensity = g_constants.sunDirIntensity.w;
-        float3 sunColor = g_constants.sunColorEnabled.rgb;
 
         // Alignment between ray direction and sun direction (1 when exactly aligned)
         float align = max(0.0, dot(rayDir, sunDir));
         if (align > 0.0) {
             // Add sun radiance seen along this direction (no MIS for delta lights)
-            payload.radiance += payload.throughput * sunColor * sunIntensity * align;
+            // Apply headlight factor for relativistic intensity boost
+            payload.radiance += payload.throughput * finalSunColor * sunIntensity * align * headlightFactor;
         }
     }
 
@@ -1055,7 +1213,26 @@ void ClosestHit(inout RadiancePayload payload, in BuiltInTriangleIntersectionAtt
     }
     
     // Add emission from this surface
-    payload.radiance += payload.throughput * mat.emission();
+    // Apply relativistic Doppler shift and headlight effect to emissive materials
+    float3 emission = mat.emission();
+    float3 relParams = GetRelativisticParams();
+    if (relParams.z > 0.5 && dot(emission, float3(1,1,1)) > 0.001) {
+        float beta = relParams.x;
+        float gamma = relParams.y;
+        float3 velocity = GetCameraForward() * beta;
+        
+        // Use initial ray direction for consistent Doppler across path
+        float3 observerDir = payload.initialRayDir;
+        float dopplerFactor = RelativisticDopplerFactor(observerDir, velocity, beta, gamma);
+        
+        // Apply Doppler color shift
+        emission = ApplyRelativisticDopplerShift(emission, dopplerFactor);
+        
+        // Apply headlight effect (D^2 intensity boost)
+        float headlightFactor = clamp(dopplerFactor * dopplerFactor, 0.1, 10.0);
+        emission *= headlightFactor;
+    }
+    payload.radiance += payload.throughput * emission;
     
     // If this is an emissive surface, terminate the path
     float emissionMagnitude = dot(mat.emission(), float3(1, 1, 1));

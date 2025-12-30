@@ -14,6 +14,8 @@ Camera::Camera()
     , m_aspectRatio(16.0f / 9.0f)
     , m_aperture(0.0f)
     , m_focusDistance(5.0f)
+    , m_relativisticEnabled(false)
+    , m_relativisticVelocity(0.0f, 0.0f, 0.0f)
 {
     SetTarget(m_target);
 }
@@ -124,6 +126,27 @@ void Camera::Rotate(float yaw, float pitch) {
 
 void Camera::Move(const glm::vec3& offset) {
     m_position += offset;
+}
+
+// 狭义相对论参数实现
+void Camera::SetRelativisticVelocity(const glm::vec3& velocity) {
+    // 限制速度不超过光速 (|v| < c, 即 |velocity| < 1.0)
+    float speed = glm::length(velocity);
+    if (speed >= 0.9999f) {
+        m_relativisticVelocity = glm::normalize(velocity) * 0.9999f;
+    } else {
+        m_relativisticVelocity = velocity;
+    }
+}
+
+float Camera::GetBeta() const {
+    return glm::length(m_relativisticVelocity);
+}
+
+float Camera::GetGamma() const {
+    float beta = GetBeta();
+    if (beta < 0.0001f) return 1.0f;
+    return 1.0f / std::sqrt(1.0f - beta * beta);
 }
 
 void Camera::UpdateVectors() {

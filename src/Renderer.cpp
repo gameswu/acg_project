@@ -372,7 +372,8 @@ namespace ACG {
                 m_camera.GetFocusDistance()
             );
             cameraConstants.sunDirIntensity = glm::vec4(m_sunDirection, m_sunIntensity);
-            cameraConstants.sunColorEnabled = glm::vec4(m_sunColor, 1.0f);  // Always 1.0, controlled by intensity
+            cameraConstants.sunColorEnabled = glm::vec4(m_sunColor, 
+                m_camera.GetRelativisticEnabled() ? m_camera.GetBeta() : 0.0f);  // a = relativistic speed (0 = disabled)
             
             // Set root constants (CameraConstants size in DWORDs) - ROOT PARAMETER 12
             renderCommandList->SetComputeRoot32BitConstants(12, sizeof(CameraConstants) / 4, &cameraConstants, 0);
@@ -451,7 +452,8 @@ namespace ACG {
                     m_camera.GetFocusDistance()
                 );
                 cameraConstants.sunDirIntensity = glm::vec4(m_sunDirection, m_sunIntensity);
-                cameraConstants.sunColorEnabled = glm::vec4(m_sunColor, 1.0f);  // Always 1.0, controlled by intensity
+                cameraConstants.sunColorEnabled = glm::vec4(m_sunColor, 
+                    m_camera.GetRelativisticEnabled() ? m_camera.GetBeta() : 0.0f);  // a = relativistic speed (0 = disabled)
                 renderCommandList->SetComputeRoot32BitConstants(12, sizeof(CameraConstants) / 4, &cameraConstants, 0);
                 
                 // PIX: Mark individual sample
@@ -599,7 +601,8 @@ namespace ACG {
                             m_camera.GetFocusDistance()
                         );
                         nextCameraConstants.sunDirIntensity = glm::vec4(m_sunDirection, m_sunIntensity);
-                        nextCameraConstants.sunColorEnabled = glm::vec4(m_sunColor, 1.0f);  // Always 1.0, controlled by intensity
+                        nextCameraConstants.sunColorEnabled = glm::vec4(m_sunColor, 
+                            m_camera.GetRelativisticEnabled() ? m_camera.GetBeta() : 0.0f);  // a = relativistic speed (0 = disabled)
                         
                         renderCommandList->SetComputeRoot32BitConstants(12, sizeof(CameraConstants) / 4, &nextCameraConstants, 0);
                         
@@ -1069,11 +1072,11 @@ namespace ACG {
 
             // 4. Shader Config (unified for all shaders)
             // CRITICAL: HLSL ray payload uses PACKED layout, not 16-byte aligned!
-            // RadiancePayload: 4*float3(48) + uint(4) + bool(4) + float(4) + uint(4) + float[4](16) + uint(4) = 84 bytes
+            // RadiancePayload: 5*float3(60) + uint(4) + bool(4) + float(4) + uint(4) + float[4](16) + uint(4) = 96 bytes
             // ShadowPayload: bool(4) = 4 bytes
             // Use MAX payload size for all shaders (simpler and more compatible)
             auto shaderConfig = raytracingPipeline.CreateSubobject<CD3DX12_RAYTRACING_SHADER_CONFIG_SUBOBJECT>();
-            UINT maxPayloadSize = 84; // RadiancePayload size (with bounceCount)
+            UINT maxPayloadSize = 96; // RadiancePayload size (with initialRayDir for relativistic rendering)
             UINT attributeSize = 2 * sizeof(float); // BuiltInTriangleIntersectionAttributes
             shaderConfig->Config(maxPayloadSize, attributeSize);
             
