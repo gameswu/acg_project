@@ -24,3 +24,5 @@ imgui.ini
 # Lib bin and build files
 !lib/**/bin
 !lib/**/build/
+
+scripts/

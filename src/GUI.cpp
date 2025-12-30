@@ -36,6 +36,14 @@ static std::string g_lastLoadedScene;
 static std::string g_lastLoadedEnvMap;
 
 // Apply cartoon-style post-processing to PPM image
+// Global cartoon style parameters
+struct CartoonStyleParams {
+    int colorLevels = 12;        // Color quantization levels (4-32)
+    int edgeThreshold = 150;     // Edge detection threshold (50-500)
+    float darkenFactor = 0.5f;   // Edge darkening factor (0.1-1.0)
+    float highlightThreshold = 200.0f; // Preserve highlights above this brightness
+} g_cartoonParams;
+
 void ApplyCartoonStyleToImage(const std::string& imagePath) {
     std::cout << "Applying cartoon style post-processing..." << std::endl;
     
@@ -64,41 +72,58 @@ void ApplyCartoonStyleToImage(const std::string& imagePath) {
     file.close();
     
     // Apply cartoon-style effects:
-    // 1. Color quantization (reduce to 8 colors per channel)
-    // 2. Edge enhancement for cel-shading look
+    // 1. Color quantization for posterization effect
+    // 2. Edge detection and enhancement for cel-shading look
     std::vector<uint8_t> processed(width * height * 3);
     
-    const int colorLevels = 8; // Reduce to 8 levels per channel (cartoon posterization)
-    const int stepSize = 256 / colorLevels;
+    const int stepSize = 256 / g_cartoonParams.colorLevels;
     
     for (int i = 0; i < width * height * 3; i++) {
         int quantized = (pixels[i] / stepSize) * stepSize;
         processed[i] = static_cast<uint8_t>(std::min(255, quantized));
     }
     
-    // Simple edge detection and enhancement (Sobel-like)
+    // Optimized edge detection using grayscale gradient (Sobel)
     std::vector<uint8_t> withEdges = processed;
-    for (int y = 1; y < height - 1; y++) {
-        for (int x = 1; x < width - 1; x++) {
+    
+    auto getGray = [&](int x, int y) -> int {
+        if (x < 0 || x >= width || y < 0 || y >= height) {
+            return 0; // Handle edge pixels
+        }
+        int idx = (y * width + x) * 3;
+        // Standard grayscale conversion
+        return static_cast<int>(0.299f * processed[idx] + 0.587f * processed[idx + 1] + 0.114f * processed[idx + 2]);
+    };
+    
+    // Process all pixels including edges
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
             int idx = (y * width + x) * 3;
             
-            // Calculate gradient for each channel
-            for (int c = 0; c < 3; c++) {
-                int gx = 
-                    -processed[((y-1)*width + (x-1))*3 + c] + processed[((y-1)*width + (x+1))*3 + c] +
-                    -2*processed[(y*width + (x-1))*3 + c] + 2*processed[(y*width + (x+1))*3 + c] +
-                    -processed[((y+1)*width + (x-1))*3 + c] + processed[((y+1)*width + (x+1))*3 + c];
-                    
-                int gy = 
-                    -processed[((y-1)*width + (x-1))*3 + c] - 2*processed[((y-1)*width + x)*3 + c] - processed[((y-1)*width + (x+1))*3 + c] +
-                    processed[((y+1)*width + (x-1))*3 + c] + 2*processed[((y+1)*width + x)*3 + c] + processed[((y+1)*width + (x+1))*3 + c];
+            // Sobel operator on grayscale
+            int gx = -getGray(x-1, y-1) + getGray(x+1, y-1) +
+                     -2*getGray(x-1, y)   + 2*getGray(x+1, y) +
+                     -getGray(x-1, y+1)   + getGray(x+1, y+1);
+                     
+            int gy = -getGray(x-1, y-1) - 2*getGray(x, y-1) - getGray(x+1, y-1) +
+                      getGray(x-1, y+1) + 2*getGray(x, y+1) + getGray(x+1, y+1);
+            
+            int gradient = std::abs(gx) + std::abs(gy);
+            
+            // If edge detected, darken the pixel (cel-shading outlines)
+            if (gradient > g_cartoonParams.edgeThreshold) {
+                // Calculate pixel brightness
+                float brightness = 0.299f * withEdges[idx] + 0.587f * withEdges[idx + 1] + 0.114f * withEdges[idx + 2];
                 
-                int gradient = std::abs(gx) + std::abs(gy);
-                
-                // If edge detected, darken the pixel (cel-shading black outlines)
-                if (gradient > 100) {
-                    withEdges[idx + c] = static_cast<uint8_t>(withEdges[idx + c] * 0.3f);
+                // Preserve highlights - reduce darkening for bright areas
+                float darkenAmount = g_cartoonParams.darkenFactor;
+                if (brightness > g_cartoonParams.highlightThreshold) {
+                    darkenAmount *= 0.3f; // Less darkening for highlights
                 }
+                
+                withEdges[idx]     = static_cast<uint8_t>(withEdges[idx] * darkenAmount);
+                withEdges[idx + 1] = static_cast<uint8_t>(withEdges[idx + 1] * darkenAmount);
+                withEdges[idx + 2] = static_cast<uint8_t>(withEdges[idx + 2] * darkenAmount);
             }
         }
     }
@@ -1187,6 +1212,39 @@ void RenderCartoonStyleWindow(ACG::Renderer* renderer, GUIState& state) {
     ImGui::TextDisabled("(?)");
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip("Apply special cartoon visual effects");
+    }
+    
+    // Cartoon effect parameters (only show when Special Style is enabled)
+    if (state.specialStyle) {
+        ImGui::Separator();
+        ImGui::Text("Post-Processing Parameters");
+        
+        ImGui::SliderInt("Color Levels", &g_cartoonParams.colorLevels, 4, 32);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Number of color levels per channel\nLower = more posterized");
+        }
+        
+        ImGui::SliderInt("Edge Threshold", &g_cartoonParams.edgeThreshold, 50, 500);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Edge detection sensitivity\nLower = more edges detected");
+        }
+        
+        ImGui::SliderFloat("Edge Darkness", &g_cartoonParams.darkenFactor, 0.1f, 1.0f, "%.2f");
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("How much to darken detected edges\nLower = darker outlines");
+        }
+        
+        ImGui::SliderFloat("Highlight Preserve", &g_cartoonParams.highlightThreshold, 150.0f, 255.0f, "%.0f");
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Brightness threshold for highlight preservation\nHigher = more highlights protected from darkening");
+        }
+        
+        if (ImGui::Button("Reset to Defaults")) {
+            g_cartoonParams.colorLevels = 12;
+            g_cartoonParams.edgeThreshold = 150;
+            g_cartoonParams.darkenFactor = 0.5f;
+            g_cartoonParams.highlightThreshold = 200.0f;
+        }
     }
     
     ImGui::End();
