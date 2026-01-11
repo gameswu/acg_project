@@ -1121,6 +1121,12 @@ void RenderCameraWindow(ACG::Renderer* renderer, GUIState& state) {
                                      state.aperture);
             renderer->ResetAccumulation();
         }
+
+        // Motion Blur toggle (第一阶段：仅开关，速度写死在 Renderer 中)
+        if (ImGui::Checkbox("Enable Motion Blur", &state.enableMotionBlur)) {
+            renderer->SetMotionBlurEnabled(state.enableMotionBlur);
+            renderer->ResetAccumulation();
+        }
         
         // ==================== Relativistic Rendering Section ====================
         ImGui::Separator();

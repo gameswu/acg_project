@@ -58,6 +58,8 @@ struct GUIState {
     bool enableDepthOfField = false;
     float focusDistance = 5.0f;
     float aperture = 0.1f;
+    // Motion blur UI toggle
+    bool enableMotionBlur = false;
     
     // Relativistic rendering settings (狭义相对论渲染)
     bool relativisticEnabled = false;

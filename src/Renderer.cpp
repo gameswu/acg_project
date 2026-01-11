@@ -422,6 +422,11 @@ namespace ACG {
             // Batch size affects GPU execution frequency - larger = fewer executions but higher TDR risk
             const int batchSize = m_renderBatchSize; // Samples per GPU execution
             
+            // Save original camera state so we can restore after offline render
+            glm::vec3 origCamPos = m_camera.GetPosition();
+            glm::vec3 origCamTarget = m_camera.GetTarget();
+            glm::vec3 origCamUp = m_camera.GetUp();
+
             for (int sampleIdx = 0; sampleIdx < samplesPerPixel; ++sampleIdx) {
                 // Check if stop was requested
                 if (m_stopRenderRequested) {
@@ -437,7 +442,36 @@ namespace ACG {
                     std::cout.flush();
                 }
                 
-                // Update camera constants with current sample index
+                // Optionally perturb camera along a rotation path to simulate motion blur
+                if (m_enableMotionBlur) {
+                    // t in [0,1]
+                    float t = (samplesPerPixel <= 1) ? 0.0f : static_cast<float>(sampleIdx) / static_cast<float>(samplesPerPixel - 1);
+                    float halfAngleRad = glm::radians(m_motionAngleDegrees) * 0.5f;
+                    float angle = glm::mix(-halfAngleRad, halfAngleRad, t);
+
+                    // Rotate camera position around its target by 'angle' about the world-up axis
+                    glm::vec3 offset = origCamPos - origCamTarget;
+                    glm::mat4 rot = glm::rotate(glm::mat4(1.0f), angle, origCamUp);
+                    glm::vec3 rotatedOffset = glm::vec3(rot * glm::vec4(offset, 1.0f));
+                    glm::vec3 newPos = origCamTarget + rotatedOffset;
+                    m_camera.SetPosition(newPos);
+                    m_camera.SetTarget(origCamTarget);
+                    m_camera.SetUp(origCamUp);
+                }
+
+                // Build camera matrices from possibly-updated camera
+                glm::vec3 pos = m_camera.GetPosition();
+                glm::vec3 dir = m_camera.GetDirection();
+                glm::vec3 right = m_camera.GetRight();
+                glm::vec3 up = m_camera.GetUp();
+
+                glm::mat4 cameraToWorld = glm::mat4(1.0f);
+                cameraToWorld[0] = glm::vec4(right, 0.0f);
+                cameraToWorld[1] = glm::vec4(up, 0.0f);
+                cameraToWorld[2] = glm::vec4(-dir, 0.0f);
+                cameraToWorld[3] = glm::vec4(pos, 1.0f);
+                cameraToWorld = glm::transpose(cameraToWorld);
+
                 CameraConstants cameraConstants;
                 cameraConstants.viewInverse = cameraToWorld;
                 cameraConstants.projInverse = projInverse;

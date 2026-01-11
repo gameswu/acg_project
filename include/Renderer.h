@@ -55,6 +55,9 @@ namespace ACG {
         void SetSunColor(const glm::vec3& color);
         void SetSunIntensity(float intensity);
         void SetDepthOfField(bool enable, float focusDistance, float aperture);
+        // Motion blur control (第一阶段接口)
+        void SetMotionBlurEnabled(bool enable) { m_enableMotionBlur = enable; }
+        bool IsMotionBlurEnabled() const { return m_enableMotionBlur; }
         void ResetAccumulation() { m_accumulatedSamples = 0; }
         int GetAccumulatedSamples() const { return m_accumulatedSamples; }
         int GetSamplesPerPixel() const { return m_samplesPerPixel; }
@@ -229,6 +232,11 @@ namespace ACG {
         bool m_enableDepthOfField = false;
         float m_focusDistance = 5.0f;
         float m_aperture = 0.1f;
+        // Motion blur parameters（摄像机旋转路径实现，角度写死在项目里）
+        bool m_enableMotionBlur = false;
+        // Angular span for camera motion blur (degrees). The camera will sample
+        // rotations from -m_motionAngleDegrees/2 .. +m_motionAngleDegrees/2.
+        float m_motionAngleDegrees = 5.0f; // 默认旋转总角度（度）
         std::atomic<bool> m_isRendering;
         
         // OIDN降噪器
